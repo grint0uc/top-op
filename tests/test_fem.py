@@ -12,7 +12,9 @@ from topop.core.fem import (
     Assembler,
     elasticity_matrix,
     estimate_seconds_per_iter,
+    hex8_center_stress_matrix,
     hex8_stiffness,
+    hex8_strain_matrix,
     interpolation_1d,
     rigid_body_modes,
 )
@@ -112,6 +114,31 @@ def test_patch_test_constant_strain_is_exact():
     ev = np.array([eps[0, 0], eps[1, 1], eps[2, 2], 2 * eps[0, 1], 2 * eps[1, 2], 2 * eps[0, 2]])
     energy = ev @ elasticity_matrix(0.3) @ ev * 0.5**3
     assert np.allclose(asm.element_energies(u_exact), energy, rtol=1e-10)
+
+
+def test_element_stress_of_linear_fields():
+    # u = A x: every element has the strain sym(A) and the stress E D eps at its center,
+    # independent of h; a rigid rotation (antisymmetric A) gives zero stress
+    shape, h = (3, 2, 2), 0.7
+    grid = Grid(origin=(0.3, -0.2, 1.0), h=h, shape=shape)
+    prob = Problem(grid, np.ones(shape, bool), np.zeros(shape, np.int8), Material(E=5.0, nu=0.25))
+    asm = Assembler(prob)  # no supports: every DOF is free
+    X = asm.node_coords_compressed
+    A = np.array([[1e-3, 2e-4, -3e-4], [5e-4, -2e-3, 1e-4], [-4e-4, 3e-4, 1.5e-3]])
+    eps = 0.5 * (A + A.T)
+    ev = np.array([eps[0, 0], eps[1, 1], eps[2, 2], 2 * eps[0, 1], 2 * eps[1, 2], 2 * eps[0, 2]])
+    sig = asm.element_stress((X @ A.T).ravel())
+    assert np.allclose(sig, 5.0 * elasticity_matrix(0.25) @ ev, rtol=1e-12, atol=1e-15)
+    W = A - A.T
+    assert np.abs(asm.element_stress((X @ W.T).ravel())).max() < 1e-14
+    assert np.allclose(hex8_center_stress_matrix(0.25, h), sig_matrix_ref(0.25, h))
+
+
+def sig_matrix_ref(nu: float, h: float) -> np.ndarray:
+    # D B at the center from the mean of B over the 8 Gauss points (B is linear in xi)
+    g = 1 / np.sqrt(3)
+    B = sum(hex8_strain_matrix(np.array(xi)) for xi in itertools.product((-g, g), repeat=3)) / 8
+    return elasticity_matrix(nu) @ B / h
 
 
 def test_multi_case_loads_and_energies():

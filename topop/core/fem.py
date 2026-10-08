@@ -58,6 +58,27 @@ def hex8_stiffness(nu: float) -> np.ndarray:
     return (KE + KE.T) / 2
 
 
+# sigma_vm^2 = s^T VON_MISES_MATRIX s for Voigt stress s = (xx, yy, zz, xy, yz, zx)
+VON_MISES_MATRIX = np.zeros((6, 6))
+VON_MISES_MATRIX[:3, :3] = -0.5
+VON_MISES_MATRIX[[0, 1, 2], [0, 1, 2]] = 1.0
+VON_MISES_MATRIX[[3, 4, 5], [3, 4, 5]] = 3.0
+
+
+def von_mises(sigma6: np.ndarray) -> np.ndarray:
+    """Von Mises stress of Voigt stresses (..., 6) -> (...)."""
+    s = np.asarray(sigma6, dtype=np.float64)
+    xx, yy, zz, xy, yz, zx = (s[..., k] for k in range(6))
+    v = xx * xx + yy * yy + zz * zz - xx * yy - yy * zz - zz * xx
+    v += 3.0 * (xy * xy + yz * yz + zx * zx)
+    return np.sqrt(np.maximum(v, 0.0))
+
+
+def hex8_center_stress_matrix(nu: float, h: float = 1.0) -> np.ndarray:
+    """(6, 24) D B at the element center (xi = 0) of a cube of edge h, for E=1."""
+    return elasticity_matrix(nu) @ hex8_strain_matrix(np.zeros(3)) / h
+
+
 def rigid_body_modes(coords: np.ndarray) -> np.ndarray:
     """(3n, 6): 3 translations and 3 rotations (about the centroid) for nodes at `coords`."""
     c = np.asarray(coords, dtype=np.float64)
@@ -105,6 +126,9 @@ class Assembler:
         self.h = float(grid.h)
         self.KE = hex8_stiffness(problem.material.nu)
         self.KE_h = self.h * self.KE
+        self.E0 = float(problem.material.E)
+        self.S0 = hex8_center_stress_matrix(problem.material.nu, self.h)  # E=1
+        self._KS = np.hstack([self.KE_h, self.E0 * self.S0.T])  # energies and stress, one GEMM
 
         active = np.asarray(problem.active, dtype=bool)
         self.element_ids = np.flatnonzero(active.ravel())
@@ -322,6 +346,78 @@ class Assembler:
             for lo, hi in _chunks(self.n_elements, 32768):  # temporaries stay a few MB
                 ue = u[self.edof[lo:hi]].astype(np.float64)
                 out[lo:hi] += np.einsum("ij,ij->i", ue @ self.KE_h, ue)
+        return out
+
+    def element_stress(self, U_free: np.ndarray, E_e: np.ndarray | None = None) -> np.ndarray:
+        """Voigt stress (xx, yy, zz, xy, yz, zx) at the element centers.
+
+        E_e None -> solid-material stress E0 D B u_e (E0 = material.E); else E_e[e] D B u_e.
+        (n_free,) -> (nel_active, 6); (n_free, n_cases) -> (n_cases, nel_active, 6).
+        """
+        U_free = np.asarray(U_free)
+        U = U_free[:, None] if U_free.ndim == 1 else U_free
+        out = np.empty((U.shape[1], self.n_elements, 6))
+        S = self.S0.T * (self.E0 if E_e is None else 1.0)
+        for c in range(U.shape[1]):
+            u = self.expand(U[:, c])
+            for lo, hi in _chunks(self.n_elements, 32768):
+                out[c, lo:hi] = u[self.edof[lo:hi]].astype(np.float64) @ S
+        if E_e is not None:
+            out *= np.asarray(E_e, dtype=np.float64)[None, :, None]
+        return out[0] if U_free.ndim == 1 else out
+
+    def element_energies_and_stress(self, U_free: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """`element_energies(U_free)` and the solid stress (n_cases, nel, 6) from one gather
+        and one (24 x 30) product per chunk."""
+        U = self.expand(U_free)
+        if U.ndim == 1:
+            U = U[:, None]
+        energies = np.zeros(self.n_elements)
+        sigma = np.empty((U.shape[1], self.n_elements, 6))
+        for c in range(U.shape[1]):
+            u = U[:, c]
+            for lo, hi in _chunks(self.n_elements, 32768):
+                ue = u[self.edof[lo:hi]].astype(np.float64)
+                t = ue @ self._KS
+                energies[lo:hi] += np.einsum("ij,ij->i", t[:, :24], ue)
+                sigma[c, lo:hi] = t[:, 24:]
+        return energies, sigma
+
+    def von_mises_gradient(self, sigma: np.ndarray, weights: np.ndarray) -> np.ndarray:
+        """d/dU_free of sum_e weights[e] * von_mises(sigma[e]) for the solid stress sigma.
+
+        sigma (nel, 6) or (n_cases, nel, 6) from `element_stress(U)`, weights of the same leading
+        shape; returns the shape of U_free. Elements with zero stress contribute nothing.
+        """
+        sig = np.asarray(sigma, dtype=np.float64)
+        single = sig.ndim == 2
+        sig = sig[None] if single else sig
+        w = np.asarray(weights, dtype=np.float64).reshape(sig.shape[:2])
+        vm = von_mises(sig)
+        coef = np.divide(w, vm, out=np.zeros_like(vm), where=vm > 0)
+        S = self.E0 * self.S0  # d sigma / d u_e
+        out = np.zeros((self.n_dof, sig.shape[0]))
+        for c in range(sig.shape[0]):
+            for lo, hi in _chunks(self.n_elements, 32768):
+                ve = (sig[c, lo:hi] @ VON_MISES_MATRIX * coef[c, lo:hi, None]) @ S  # (m, 24)
+                out[:, c] += np.bincount(
+                    self.edof[lo:hi].ravel(), weights=ve.ravel(), minlength=self.n_dof
+                )
+        out = out[self.free]
+        return out[:, 0] if single else out
+
+    def element_cross_energies(self, U_free: np.ndarray, V_free: np.ndarray) -> np.ndarray:
+        """(nel_active,) u_e^T (h KE) v_e summed over load cases (columns of U and V)."""
+        U, V = self.expand(U_free), self.expand(V_free)
+        if U.ndim == 1:
+            U, V = U[:, None], V[:, None]
+        out = np.zeros(self.n_elements)
+        for c in range(U.shape[1]):
+            u, v = U[:, c], V[:, c]
+            for lo, hi in _chunks(self.n_elements, 32768):
+                ue = u[self.edof[lo:hi]].astype(np.float64)
+                ve = v[self.edof[lo:hi]].astype(np.float64)
+                out[lo:hi] += np.einsum("ij,ij->i", ue @ self.KE_h, ve)
         return out
 
     @staticmethod

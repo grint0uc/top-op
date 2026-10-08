@@ -168,3 +168,108 @@ def test_geometric_mg_and_banded_paths_agree():
     assert np.allclose([h.compliance for h in mg.history], c_band, rtol=1e-3)
     assert np.allclose([h.compliance for h in exact.history], c_band, rtol=1e-5)
     assert np.abs(mg.rho - band.rho).max() < 0.02
+
+
+# ---- overhang (AM) filter ---------------------------------------------------------------------
+
+
+def _am_available() -> bool:
+    try:
+        from topop.core.filters import AMFilter  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+needs_am = pytest.mark.skipif(not _am_available(), reason="filters.AMFilter not available")
+
+
+def unsupported_cells(rho: np.ndarray, direction: str) -> int:
+    """Cells with rho > 0.5 whose 5-cell support in the layer below (same cell and its 4 face
+    neighbours) is all < 0.5; the first layer sits on the base plate."""
+    r = np.moveaxis(rho, "xyz".index(direction[1]), 0)
+    if direction[0] == "-":
+        r = r[::-1]
+    solid = r > 0.5
+    below = solid[:-1]
+    sup = below.copy()
+    sup[:, 1:, :] |= below[:, :-1, :]
+    sup[:, :-1, :] |= below[:, 1:, :]
+    sup[:, :, 1:] |= below[:, :, :-1]
+    sup[:, :, :-1] |= below[:, :, 1:]
+    return int((solid[1:] & ~sup).sum())
+
+
+@needs_am
+def test_overhang_filter_gives_a_printable_design():
+    p = cantilever(12, 6, 12)
+    plain = optimize(p, small_params(max_iter=60))
+    res = optimize(p, small_params(max_iter=60, overhang="+z"))
+    assert unsupported_cells(plain.rho, "+z") > 0  # the filter has something to do
+    assert unsupported_cells(res.rho, "+z") == 0
+    assert abs(res.history[-1].volume - 0.3) < 1e-3  # exact (nonlinear) volume in the bisection
+    c = np.array([h.compliance for h in res.history])
+    assert c[-1] < 0.3 * c[0]
+
+
+@needs_am
+@pytest.mark.parametrize("heaviside", [False, True])
+def test_overhang_chain_gradient_matches_finite_differences(heaviside):
+    from topop.core.optimize import SimpModel
+
+    p = cantilever(6, 4, 6)
+    p.passive[3, 2, 2] = 1  # a passive solid supports what is printed on it
+    prm = small_params(overhang="+z", heaviside=heaviside)
+    model = SimpModel(p, prm)
+    model.beta = 4.0 if heaviside else 0.0
+    rng = np.random.default_rng(5)
+    x = np.zeros(p.grid.shape)
+    x[p.free] = rng.uniform(0.2, 0.9, int(p.free.sum()))
+    x[p.passive == 1] = 1.0
+
+    def evaluate(xx):
+        return model.evaluate(model.physical(xx), 3.0)
+
+    r = evaluate(x)
+    fd_c, fd_v = np.empty_like(r.dc), np.empty_like(r.dv)
+    for k, e in enumerate(np.flatnonzero(p.free.ravel())):
+        xx = x.copy()
+        xx.ravel()[e] += 1e-6
+        a = evaluate(xx)
+        xx.ravel()[e] -= 2e-6
+        b = evaluate(xx)
+        fd_c[k] = (a.compliance - b.compliance) / 2e-6
+        fd_v[k] = (a.volume - b.volume) / 2e-6
+    rel = np.abs(fd_c - r.dc) / np.abs(r.dc)
+    assert np.mean(rel < 1e-3) >= 0.95 and np.median(rel) < 1e-5
+    assert np.allclose(fd_v, r.dv, rtol=1e-4, atol=1e-6 * np.abs(r.dv).max())
+
+
+def test_overhang_without_am_filter_raises(monkeypatch):
+    from topop.core import filters
+
+    monkeypatch.delattr(filters, "AMFilter", raising=False)
+    with pytest.raises(NotImplementedError, match="overhang filter not available"):
+        optimize(cantilever(8, 4, 2), small_params(max_iter=2, overhang="+z"))
+
+
+def test_broken_warm_started_solve_is_retried_from_zero():
+    from topop.core.optimize import SimpModel
+
+    p = cantilever(8, 4, 2)
+    model = SimpModel(p, small_params())
+    real, calls = model.solver.solve, []
+
+    def flaky(K, F, x0=None, rigid_modes=None, *, change=None):
+        U, info = real(K, F, x0=x0, rigid_modes=rigid_modes, change=change)
+        calls.append(x0 is not None)
+        if x0 is not None:  # what a CG breakdown looks like: a large residual
+            return U + 1.0, dataclasses.replace(info, residual=0.5)
+        return U, info
+
+    model.solver.solve = flaky
+    xp = model.physical(np.full(p.grid.shape, 0.3))
+    first = model.evaluate(xp, 3.0)
+    second = model.evaluate(xp, 3.0)
+    assert calls == [False, True, False]
+    assert second.compliance == pytest.approx(first.compliance)

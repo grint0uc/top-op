@@ -45,3 +45,18 @@ def tip_loaded_beam(
     p = _box(nelx, nely, nelz, E, nu)
     p.loads = [Load(_plane_nodes(p.grid, ix=nelx), (0.0, -1.0, 0.0))]
     return p
+
+
+def l_bracket(n: int = 40, thickness: int = 4, E: float = 1.0, nu: float = 0.3) -> Problem:
+    """L-bracket (Le et al. 2010): n x n square (x, y) minus its upper-right (3/5 n)^2 corner.
+
+    The top edge of the vertical arm (y = n) is clamped; a total (0,-1,0) is spread over the 4
+    node columns (through the thickness) at the top-right corner of the horizontal arm. The
+    re-entrant corner is at x = y = n - round(3n/5).
+    """
+    p = _box(n, n, thickness, E, nu)
+    arm = n - round(3 * n / 5)
+    p.active[arm:, arm:, :] = False
+    p.supports = [Support(_plane_nodes(p.grid, ix=np.arange(arm + 1), iy=n))]
+    p.loads = [Load(_plane_nodes(p.grid, ix=np.arange(n - 3, n + 1), iy=arm), (0.0, -1.0, 0.0))]
+    return p
