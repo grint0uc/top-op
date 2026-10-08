@@ -1,22 +1,36 @@
 // Mirrors store state into a Viewport (store -> viewport) and viewport edits back (viewport -> store).
 import type { DensityFrame, Selection } from '../api/client';
-import { SUPPORT_COLOR, bboxDiagonal, caseColor, designEntry, facetKey, isPrimitive, selectionAnchor, toPrim } from '../state/derived';
+import {
+  SUPPORT_COLOR,
+  bboxDiagonal,
+  caseColor,
+  designBox,
+  designEntry,
+  designPose,
+  designWorld,
+  domainBox,
+  facetKey,
+  isPrimitive,
+  selectionAnchor,
+  toPrim,
+} from '../state/derived';
 import { IDENTITY } from '../state/defaults';
 import { selectionFaces } from '../state/query';
 import { type State, useStore } from '../state/store';
 import type { DensityGrid } from './DensityView';
 import type { LoadMarker, SupportMarker } from './Markers';
+import type { SymmetryPlane } from './Overlays';
 import type { FaceGroup, Viewport } from './Viewport';
 
 function gridFor(frame: DensityFrame, s: State): DensityGrid {
   const st = s.run.stats ?? s.voxel.stats;
   const [nx, ny, nz] = frame.shape;
   if (st && st.nx === nx && st.ny === ny && st.nz === nz) return { origin: st.origin, h: st.h };
-  // no matching stats: fit the frame to the design bbox (padding cells on every side)
-  const d = designEntry(s);
+  // no matching stats: fit the frame to the (transformed) design bbox (padding cells on every side)
+  const box = designBox(s);
   const pad = s.project.grid.padding;
-  if (!d) return { origin: [0, 0, 0], h: 1 };
-  const { min, max } = d.data.bbox;
+  if (!box) return { origin: [0, 0, 0], h: 1 };
+  const { min, max } = box;
   const h = Math.max(max[0] - min[0], max[1] - min[1], max[2] - min[2]) / Math.max(1, Math.max(nx, ny, nz) - 2 * pad);
   return { origin: [min[0] - pad * h, min[1] - pad * h, min[2] - pad * h], h };
 }
@@ -38,14 +52,18 @@ export function bindViewport(vp: Viewport): () => void {
   // ---- viewport -> store
   vp.primitives.onChange = (p) => store.getState().setPrimitive(p);
   vp.onRefTransform = (id, m) => store.getState().updateRef(id, { transform: m });
+  vp.onDesignTransform = (m) => store.getState().setDesignTransform(m);
 
   // ---- helpers
-  /** Faces a load/support/query selection covers on the design mesh (faces: as given; normal/facets: client preview). */
+  /**
+   * Faces a load/support/query selection covers on the design mesh (faces: as given; facets: the exact ids from the
+   * faces endpoint, approximated until they arrive; normal: client preview in world space).
+   */
   const facesOf = (sel: Selection, s: State, design: NonNullable<ReturnType<typeof designEntry>>): readonly number[] => {
     if (!('mesh_id' in sel) || sel.mesh_id !== design.info.id) return [];
     if (sel.kind === 'faces') return sel.face_ids;
     const table = sel.kind === 'facets' ? (s.facetCache[facetKey(sel.mesh_id, sel.angle_deg)] ?? null) : null;
-    return selectionFaces(sel, design.data, table);
+    return selectionFaces(sel, design.data, table, s.facetFaceCache, designWorld(s) ?? design.data);
   };
 
   const applyFaces = () => {
@@ -74,13 +92,14 @@ export function bindViewport(vp: Viewport): () => void {
     const loads: LoadMarker[] = [];
     const supports: SupportMarker[] = [];
     const committed: { id: string; prim: ReturnType<typeof toPrim>; color: number }[] = [];
+    const pose = designPose(s);
     for (const l of s.project.loads) {
-      const at = selectionAnchor(l.selection, s.meshes, s.facetCache);
+      const at = selectionAnchor(l.selection, s.meshes, s.facetCache, pose);
       if (at) loads.push({ id: l.id, at, force: l.force, color: caseColor(l.case) });
       if (isPrimitive(l.selection)) committed.push({ id: l.id, prim: toPrim(l.selection), color: caseColor(l.case) });
     }
     for (const x of s.project.supports) {
-      const at = selectionAnchor(x.selection, s.meshes, s.facetCache);
+      const at = selectionAnchor(x.selection, s.meshes, s.facetCache, pose);
       if (at) supports.push({ id: x.id, at, color: SUPPORT_COLOR });
       if (isPrimitive(x.selection)) committed.push({ id: x.id, prim: toPrim(x.selection), color: SUPPORT_COLOR });
     }
@@ -109,8 +128,23 @@ export function bindViewport(vp: Viewport): () => void {
     const s = store.getState();
     if (s.selection.primitive) vp.primitives.attachGizmo();
     else if (s.activeItem?.kind === 'ref') vp.setActiveRef(s.activeItem.id);
+    else if (s.activeItem?.kind === 'design') vp.setActiveDesign(true);
     else vp.attachGizmo(null);
   }
+
+  /** Symmetry planes and the overhang base plate, drawn on the domain box (voxel grid, else the transformed design bbox). */
+  const syncOverlays = () => {
+    const s = store.getState();
+    const box = domainBox(s);
+    const near = designBox(s) ?? box; // "center" = the middle of the part, as the server picks the active region's centre
+    const planes: SymmetryPlane[] = [];
+    for (const sym of s.project.params.symmetry ?? []) {
+      const a = 'xyz'.indexOf(sym.axis);
+      const position = sym.position ?? (near ? (near.min[a]! + near.max[a]!) / 2 : 0);
+      planes.push({ axis: sym.axis, position });
+    }
+    vp.overlays.set(box, planes, s.project.params.overhang ?? null);
+  };
 
   // ---- store -> viewport
   watch(
@@ -118,14 +152,26 @@ export function bindViewport(vp: Viewport): () => void {
     (entry) => {
       if (entry) {
         vp.loadDesignMesh(entry.buffer, { meshId: entry.info.id, data: entry.data });
-        vp.markers.setScale(bboxDiagonal(entry.data));
+        vp.setDesignTransform(store.getState().project.design_mesh?.transform ?? IDENTITY);
+        vp.markers.setScale(bboxDiagonal(designWorld(store.getState()) ?? entry.data));
         vp.fitCamera();
         applyFaces();
         applyAppearance();
         syncMarkers();
+        syncGizmoTarget();
+        syncOverlays();
       } else {
         vp.clearDesignMesh();
       }
+    },
+  );
+  watch(
+    (s) => s.project.design_mesh?.transform,
+    (t) => {
+      vp.setDesignTransform(t ?? IDENTITY);
+      applyFaces();
+      syncMarkers();
+      syncOverlays();
     },
   );
   watch((s) => s.project.ref_models, syncRefs);
@@ -140,6 +186,10 @@ export function bindViewport(vp: Viewport): () => void {
     applyFaces();
     syncMarkers();
   });
+  watch((s) => s.facetFaceCache, applyFaces);
+  watch((s) => s.project.params.symmetry, syncOverlays);
+  watch((s) => s.project.params.overhang, syncOverlays);
+  watch((s) => s.voxel.stats, syncOverlays);
   watch((s) => s.selection.primitive, (p) => {
     vp.primitives.setActive(p);
     syncGizmoTarget();
@@ -174,6 +224,10 @@ export function bindViewport(vp: Viewport): () => void {
     vp.density.setThreshold(t);
     reportDensity();
   });
+  watch((s) => (s.colorByStress ? s.stress : null), (st) => {
+    vp.density.setStress(st);
+    reportDensity();
+  });
   watch((s) => s.ghostDesign, applyAppearance);
   watch(
     (s) => s.resultStl,
@@ -188,5 +242,6 @@ export function bindViewport(vp: Viewport): () => void {
     unsubs.forEach((u) => u());
     vp.primitives.onChange = null;
     vp.onRefTransform = null;
+    vp.onDesignTransform = null;
   };
 }

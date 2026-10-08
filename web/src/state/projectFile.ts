@@ -68,10 +68,6 @@ function selection(raw: unknown, where: string): Selection {
   }
 }
 
-function isIdentity(m: readonly number[]): boolean {
-  return m.length === 16 && m.every((v, i) => Math.abs(v - IDENTITY[i]!) < 1e-9);
-}
-
 export function parseProjectFile(json: unknown): ParsedProject {
   if (!isObj(json)) throw new Error('the file is not a JSON object');
   const isExport = isObj(json.project) && isObj(json.run);
@@ -90,11 +86,6 @@ export function parseProjectFile(json: unknown): ParsedProject {
       );
     }
     const transform = p.design_mesh.transform === undefined ? [...IDENTITY] : nums(p.design_mesh.transform, 16, 'design_mesh.transform');
-    if (!isIdentity(transform)) {
-      warnings.push(
-        'The design mesh has a non-identity transform. The viewport draws the design mesh untransformed (unsupported), so markers and picks may not line up with what the server voxelizes.',
-      );
-    }
     design = { mesh_id, transform };
   }
 

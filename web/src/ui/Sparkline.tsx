@@ -6,7 +6,8 @@ interface Props {
   height?: number;
 }
 
-const COLORS = { compliance: '#4f9cf9', volume: '#ffa534', grid: '#2b3038', text: '#9aa1ab' };
+export const SERIES_COLORS = { compliance: '#4f9cf9', volume: '#ffa534', stress: '#ff5a5f' };
+const COLORS = { ...SERIES_COLORS, grid: '#2b3038', text: '#9aa1ab' };
 
 function series(
   g: CanvasRenderingContext2D,
@@ -38,9 +39,13 @@ function series(
   return [rawLo, rawHi];
 }
 
-/** Compliance (log scale) and volume fraction, each normalised to its own range (flat if it moves < 1 %). Plain canvas, no chart lib. */
+/**
+ * Compliance (log scale), volume fraction and, when the run reports it, max von Mises stress, each normalised to its
+ * own range (flat if it moves < 1 %). Plain canvas, no chart lib.
+ */
 export function Sparkline({ history, height = 90 }: Props) {
   const ref = useRef<HTMLCanvasElement>(null);
+  const hasStress = history.some((r) => typeof r.stress_max === 'number');
 
   useEffect(() => {
     const c = ref.current;
@@ -65,7 +70,22 @@ export function Sparkline({ history, height = 90 }: Props) {
     }
     series(g, history.map((r) => r.compliance), COLORS.compliance, w, h, true);
     series(g, history.map((r) => r.volume), COLORS.volume, w, h, false);
-  }, [history, height]);
+    if (hasStress) {
+      // records without a value (stress not evaluated yet) repeat the neighbouring one instead of dropping to 0
+      const first = history.find((r) => typeof r.stress_max === 'number')!.stress_max as number;
+      let prev = first;
+      series(g, history.map((r) => (prev = typeof r.stress_max === 'number' ? r.stress_max : prev)), COLORS.stress, w, h, false);
+    }
+  }, [history, height, hasStress]);
 
-  return <canvas ref={ref} className="sparkline" style={{ height }} data-testid="sparkline" data-points={history.length} />;
+  return (
+    <canvas
+      ref={ref}
+      className="sparkline"
+      style={{ height }}
+      data-testid="sparkline"
+      data-points={history.length}
+      data-series={history.length === 0 ? 0 : hasStress ? 3 : 2}
+    />
+  );
 }

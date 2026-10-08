@@ -2,6 +2,7 @@ import { fileURLToPath } from 'node:url';
 import { expect, type Page } from '@playwright/test';
 
 export const BRACKET = fileURLToPath(new URL('../../examples/bracket.stl', import.meta.url));
+export const BRACKET_STEP = fileURLToPath(new URL('../../examples/bracket.step', import.meta.url));
 
 type StoreState = ReturnType<NonNullable<Window['__topop']>['getState']>;
 
@@ -46,4 +47,14 @@ export async function defineBoundaries(page: Page): Promise<void> {
   await page.getByTestId('add-box').click();
   await page.getByTestId('add-support').click();
   await expect.poll(() => state(page, (s) => s.project.loads.length + s.project.supports.length)).toBe(2);
+}
+
+/** Finishes a short run on the bracket (loads + supports defined, coarse grid) and waits for `done`. */
+export async function runBracket(page: Page, maxIter = 4): Promise<void> {
+  await importBracket(page);
+  await defineBoundaries(page);
+  await page.getByTestId('domain-elements').fill('24');
+  await page.getByTestId('p-max-iter').fill(String(maxIter));
+  await page.getByTestId('run-start').click();
+  await expect.poll(() => state(page, (s) => s.run.status), { timeout: 30_000 }).toBe('done');
 }

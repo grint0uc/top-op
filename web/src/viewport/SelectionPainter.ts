@@ -116,10 +116,15 @@ export class SelectionPainter {
     if (this.removing) this.working.delete(hit.face);
     else this.working.add(hit.face);
     const c = design.data.centroids;
+    // the hit point is in world space, the centroids in mesh space: bring them through the design transform
+    const m = design.mesh.matrixWorld.elements;
     for (let f = 0; f < design.data.nTri; f++) {
-      const dx = c[f * 3]! - p.x;
-      const dy = c[f * 3 + 1]! - p.y;
-      const dz = c[f * 3 + 2]! - p.z;
+      const x = c[f * 3]!;
+      const y = c[f * 3 + 1]!;
+      const z = c[f * 3 + 2]!;
+      const dx = m[0]! * x + m[4]! * y + m[8]! * z + m[12]! - p.x;
+      const dy = m[1]! * x + m[5]! * y + m[9]! * z + m[13]! - p.y;
+      const dz = m[2]! * x + m[6]! * y + m[10]! * z + m[14]! - p.z;
       if (dx * dx + dy * dy + dz * dz <= r2) {
         if (this.removing) this.working.delete(f);
         else this.working.add(f);

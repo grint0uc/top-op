@@ -3,8 +3,10 @@ import { exportProjectJson, fetchMissingMeshes, importDesignMesh, loadProjectFil
 import { type RequiredMesh, designEntry, requiredMeshes } from '../state/derived';
 import { useStore } from '../state/store';
 import { Banner, Btn, Section } from './controls';
+import { DesignTransform } from './DesignTransform';
 import { Sparkline } from './Sparkline';
 
+export const MESH_ACCEPT = '.stl,.step,.stp,model/stl';
 export const IS_MOCK = import.meta.env.VITE_MOCK === '1';
 
 function fileList(f: File): FileList {
@@ -36,7 +38,7 @@ function MissingMeshes({ missing }: { missing: RequiredMesh[] }) {
               </span>
               <input
                 type="file"
-                accept=".stl,model/stl"
+                accept={MESH_ACCEPT}
                 aria-label={`re-upload ${m.label}`}
                 data-testid="reupload-input"
                 onChange={(e) => {
@@ -172,7 +174,7 @@ export function ImportPanel() {
         <input
           ref={input}
           type="file"
-          accept=".stl,model/stl"
+          accept={MESH_ACCEPT}
           data-testid="mesh-file-input"
           className="visually-hidden"
           onChange={(e) => {
@@ -181,7 +183,7 @@ export function ImportPanel() {
           }}
         />
         <Btn variant="primary" onClick={() => input.current?.click()} disabled={busy === 'Upload'} testId="choose-mesh">
-          {busy === 'Upload' ? 'Uploading...' : 'Choose STL'}
+          {busy === 'Upload' ? 'Uploading...' : 'Choose STL / STEP'}
         </Btn>
         <span className="dim">or drop a file anywhere</span>
       </div>
@@ -206,6 +208,16 @@ export function ImportPanel() {
         <dl className="kv" data-testid="mesh-info">
           <dt>Name</dt>
           <dd>{info.name}</dd>
+          <dt>Source</dt>
+          <dd data-testid="mesh-source" data-source={info.source}>
+            {info.source === 'step' ? 'STEP (tessellated)' : 'mesh'}
+          </dd>
+          {info.n_brep_faces != null && (
+            <>
+              <dt>B-rep faces</dt>
+              <dd data-testid="mesh-brep-faces">{info.n_brep_faces.toLocaleString()}</dd>
+            </>
+          )}
           <dt>Faces</dt>
           <dd data-testid="mesh-faces">{info.n_faces.toLocaleString()}</dd>
           <dt>Vertices</dt>
@@ -224,6 +236,7 @@ export function ImportPanel() {
           )}
         </dl>
       )}
+      <DesignTransform />
       {info && !info.is_watertight && (
         <Banner kind="error" testId="watertight-warning">
           Mesh is not watertight. Voxelization may leak or fill incorrectly; repair the STL before optimizing.

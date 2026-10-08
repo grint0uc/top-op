@@ -45,6 +45,11 @@ export class Markers {
     };
   }
 
+  /** Where each load arrow starts (diagnostic: lets e2e check the markers follow the design transform). */
+  arrowOrigins(): number[][] {
+    return this.arrows.children.map((a) => a.position.toArray().map((v) => Math.round(v * 1e4) / 1e4));
+  }
+
   setPoints(xyz: Float32Array | null, color = 0xffd23f): void {
     if (this.points) {
       this.group.remove(this.points);

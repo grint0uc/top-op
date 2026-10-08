@@ -567,7 +567,7 @@ a.btn {
 
 .facet-row {
   display: grid;
-  grid-template-columns: auto 34px 58px auto 1fr auto;
+  grid-template-columns: auto 34px 58px auto auto 1fr auto;
   align-items: center;
   gap: 6px;
   padding: 3px 6px;
@@ -617,4 +617,61 @@ a.btn {
 code {
   font-size: 11px;
   color: var(--fg-dim);
+}
+
+/* ---------- v0.2: stress, facet kinds, constraint tag ---------- */
+.tag {
+  padding: 0 7px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid;
+}
+
+.tag-ok {
+  color: var(--ok);
+  border-color: var(--ok);
+  background: rgba(61, 220, 151, 0.12);
+}
+
+.tag-bad {
+  color: var(--red);
+  border-color: var(--red);
+  background: rgba(255, 90, 95, 0.12);
+}
+
+.ramp {
+  height: 10px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+}
+
+.facet-kind {
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  text-align: center;
+}
+
+.facet-kind.kind-cylinder {
+  color: #7fd0ff;
+  border-color: #2b5f8a;
+}
+
+.facet-kind.kind-plane {
+  color: #9ee3b8;
+  border-color: #2a6a4b;
+}
+
+.badge-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.badge-step {
+  background: #14283f;
+  color: #7fd0ff;
 }

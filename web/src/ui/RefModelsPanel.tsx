@@ -1,45 +1,16 @@
 import { useRef } from 'react';
 import type { RefModel } from '../api/client';
 import { addRefPrimitive, importRefMesh, reuploadRefMesh } from '../state/actions';
-import { IDENTITY } from '../state/defaults';
 import { designEntry } from '../state/derived';
 import { useStore } from '../state/store';
-import { composeTRS, decomposeTRS } from '../state/transform';
-import { Btn, NumField, Section } from './controls';
+import { Btn, Section } from './controls';
+import { PoseFields } from './PoseFields';
+import { MESH_ACCEPT } from './ImportPanel';
 
-const AXES = ['x', 'y', 'z'] as const;
-
-/**
- * Pose of a reference model as numbers. `transform` is the full column-major matrix applied to the mesh's own
- * coordinates (translation * rotation * scale), which is also what the gizmo writes; fields and gizmo edit the same value.
- */
+/** Pose of a reference model: `transform` is the full column-major matrix, the same value the gizmo writes. */
 function RefFields({ r }: { r: RefModel }) {
   const updateRef = useStore((s) => s.updateRef);
-  const { pos, rot, scale } = decomposeTRS(r.transform?.length === 16 ? r.transform : IDENTITY);
-  const set = (p = pos, ro = rot, sc = scale) => updateRef(r.id, { transform: composeTRS(p, ro, sc) });
-  const put = (arr: number[], k: number, v: number) => arr.map((x, i) => (i === k ? v : x));
-  return (
-    <div className="prim-fields" data-testid="ref-fields" onClick={(e) => e.stopPropagation()}>
-      <div className="prim-row">
-        <span>pos</span>
-        {AXES.map((a, k) => (
-          <NumField key={a} value={pos[k]!} testId={`ref-pos-${a}`} onChange={(v) => set(put(pos, k, v))} />
-        ))}
-      </div>
-      <div className="prim-row">
-        <span>rot&deg;</span>
-        {AXES.map((a, k) => (
-          <NumField key={a} value={rot[k]!} step={5} testId={`ref-rot-${a}`} onChange={(v) => set(pos, put(rot, k, v))} />
-        ))}
-      </div>
-      <div className="prim-row">
-        <span>scale</span>
-        {AXES.map((a, k) => (
-          <NumField key={a} value={scale[k]!} min={1e-6} testId={`ref-scale-${a}`} onChange={(v) => set(pos, rot, put(scale, k, v))} />
-        ))}
-      </div>
-    </div>
-  );
+  return <PoseFields prefix="ref" transform={r.transform} onChange={(transform) => updateRef(r.id, { transform })} />;
 }
 
 export function RefModelsPanel() {
@@ -56,7 +27,7 @@ export function RefModelsPanel() {
       <input
         ref={add}
         type="file"
-        accept=".stl,model/stl"
+        accept={MESH_ACCEPT}
         className="visually-hidden"
         data-testid="ref-file-input"
         onChange={(e) => {

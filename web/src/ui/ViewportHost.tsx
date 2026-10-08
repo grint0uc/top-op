@@ -25,7 +25,7 @@ export function ViewportHost() {
       <canvas id="viewport" ref={ref} />
       <SelectionToolbar />
       <div className="hud" data-testid="hud">
-        {hasMesh ? HINTS[tool] : 'Import an STL to begin'}
+        {hasMesh ? HINTS[tool] : 'Import an STL or STEP file to begin'}
       </div>
     </>
   );

@@ -149,10 +149,14 @@ export function normalFaces(data: MeshData, dir: readonly number[], angleDeg: nu
   return out;
 }
 
+/** Key of the exact-faces cache: `${mesh_id}@${angle_deg}#${facet_id}`. */
+export const facetFacesKey = (meshId: string, angleDeg: number, facetId: number): string => `${meshId}@${angleDeg}#${facetId}`;
+
 /**
- * Faces of one facet, reconstructed from what /facets returns (normal, bbox, no face list): faces whose normal is
- * within `angleDeg` of the facet normal and whose centroid lies in the facet bbox. Closed curved groups report a
- * zero normal; for those the bbox alone decides.
+ * Approximate faces of one facet, reconstructed from what /facets returns (normal, bbox, no face list): faces whose
+ * normal is within `angleDeg` of the facet normal and whose centroid lies in the facet bbox. Closed curved groups
+ * report a zero normal; for those the bbox alone decides. Only a stand-in while GET .../facets/{id}/faces is in
+ * flight (or failed): the endpoint returns the exact ids.
  */
 export function facetFaces(data: MeshData, facet: FacetInfo, angleDeg: number): number[] {
   const { min, max } = data.bbox;
@@ -172,24 +176,40 @@ export function facetFaces(data: MeshData, facet: FacetInfo, angleDeg: number): 
   return out;
 }
 
-const memo = new WeakMap<object, { data: MeshData; facets: MeshFacets | null; ids: number[] }>();
+const memo = new WeakMap<object, { data: MeshData; world: MeshData; facets: MeshFacets | null; exact: object; ids: number[] }>();
+const NO_EXACT: Record<string, number[]> = {};
 
-/** Faces to colour for a query selection (plane: none). Memoised per selection object, mesh and facet table. */
-export function selectionFaces(sel: Selection, data: MeshData, table: MeshFacets | null): number[] {
+/**
+ * Faces to colour for a query selection (plane: none). Memoised per selection object, mesh and tables.
+ * `data` is the raw mesh (facet tables and face ids refer to it); `world` the same mesh through the design transform
+ * (a normal query is a world-space direction). Facets use the exact ids from `exact` (the faces endpoint) and fall back
+ * to the bbox reconstruction for facets whose request has not come back.
+ */
+export function selectionFaces(
+  sel: Selection,
+  data: MeshData,
+  table: MeshFacets | null,
+  exact: Record<string, number[]> = NO_EXACT,
+  world: MeshData = data,
+): number[] {
   if (sel.kind !== 'normal' && sel.kind !== 'facets') return [];
   const facets = sel.kind === 'facets' ? table : null; // normal queries do not depend on the table
+  const ex = sel.kind === 'facets' ? exact : NO_EXACT;
   const hit = memo.get(sel);
-  if (hit && hit.data === data && hit.facets === facets) return hit.ids;
+  if (hit && hit.data === data && hit.world === world && hit.facets === facets && hit.exact === ex) return hit.ids;
   let ids: number[];
-  if (sel.kind === 'normal') ids = normalFaces(data, sel.direction, sel.angle_deg, sel.within);
+  if (sel.kind === 'normal') ids = normalFaces(world, sel.direction, sel.angle_deg, sel.within);
   else {
-    const want = new Set(sel.facet_ids);
+    const byId = new Map((facets?.facets ?? []).map((fc) => [fc.id, fc] as const));
     const set = new Set<number>();
-    for (const fc of facets?.facets ?? []) {
-      if (want.has(fc.id)) for (const f of facetFaces(data, fc, sel.angle_deg)) set.add(f);
+    for (const id of sel.facet_ids) {
+      const known = ex[facetFacesKey(sel.mesh_id, sel.angle_deg, id)];
+      const fc = byId.get(id);
+      if (known) for (const f of known) set.add(f);
+      else if (fc) for (const f of facetFaces(data, fc, sel.angle_deg)) set.add(f);
     }
     ids = [...set];
   }
-  memo.set(sel, { data, facets, ids });
+  memo.set(sel, { data, world, facets, exact: ex, ids });
   return ids;
 }

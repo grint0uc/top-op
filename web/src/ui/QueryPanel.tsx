@@ -127,12 +127,30 @@ function FacetRow({ facet, picked }: { facet: FacetInfo; picked: boolean }) {
       <span className="facet-area" title="area">
         {facet.area.toPrecision(4)}
       </span>
-      <span title="normal">n {dirName(facet.normal)}</span>
+      <span className={`facet-kind kind-${facet.kind}`} data-testid="facet-kind" data-kind={facet.kind} title="surface kind">
+        {facet.kind}
+      </span>
+      {facet.kind === 'cylinder' ? (
+        <span title={facet.axis ? `axis ${dirName(facet.axis)}` : 'radius'}>
+          <span data-testid="facet-radius">r {+(facet.radius ?? 0).toPrecision(4)}</span>
+          {facet.axis ? ` ax ${dirName(facet.axis)}` : ''}
+        </span>
+      ) : facet.kind === 'plane' ? (
+        <span title="normal">n {dirName(facet.normal)}</span>
+      ) : (
+        <span />
+      )}
       <span className="dim" title="centroid">
         c ({fmt(facet.centroid)})
       </span>
       <span className="dim" title="triangles">
         {facet.n_faces} tri
+        {facet.brep_face != null && (
+          <span data-testid="facet-brep" title="B-rep face index in the STEP file">
+            {' '}
+            &middot; B-rep #{facet.brep_face}
+          </span>
+        )}
       </span>
     </li>
   );
@@ -142,17 +160,28 @@ function FacetsForm({ form }: { form: QueryForm['facets'] }) {
   const meshId = useStore((s) => s.project.design_mesh?.mesh_id ?? null);
   const table = useStore((s) => (meshId ? s.facetCache[facetKey(meshId, form.angle)] : undefined));
   const ui = useStore((s) => s.queryUi);
+  const step = useStore((s) => (meshId ? s.meshes[meshId]?.info.source === 'step' : false));
+  const nBrep = useStore((s) => (meshId ? s.meshes[meshId]?.info.n_brep_faces : null));
   const [all, setAll] = useState(false);
   const rows = table ? (all ? table.facets : table.facets.slice(0, TOP_FACETS)) : [];
   return (
     <div className="query-form" data-testid="query-facets">
+      {step && (
+        <p className="badge-row" data-testid="facets-source">
+          <span className="badge badge-step" title="The mesh came from a STEP file: facets are its exact B-rep faces, whatever the angle">
+            STEP: ids are B-rep faces
+          </span>
+          {nBrep != null && <span className="dim">{nBrep} faces in the file</span>}
+        </p>
+      )}
       <div className="toolbar-row">
-        <Field label="Coplanarity angle (degrees)">
+        <Field label={step ? 'Coplanarity angle (ignored for STEP)' : 'Coplanarity angle (degrees)'}>
           <NumField
             value={form.angle}
             min={0}
             max={90}
             step={1}
+            disabled={step}
             testId="facets-angle"
             onChange={(angle) => edit((f) => ({ ...f, facets: { angle, ids: [] } }))}
           />

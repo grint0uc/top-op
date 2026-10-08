@@ -106,7 +106,7 @@ test('3. support from the facets query: the largest facet is the plate bottom', 
     [80, 60, 0],
   ]);
 
-  // hovering highlights its faces in the viewport (reconstructed client-side from normal + bbox)
+  // hovering highlights its faces in the viewport (the exact ids of GET /facets/{id}/faces)
   await first.hover();
   await expect.poll(() => state(page, (s) => s.hoverFaces.length)).toBe(facet.n_faces);
   await shot('facets-hover');
@@ -501,4 +501,172 @@ test('12. the built app is also served by the API server itself', async () => {
   test.skip(!(await text(res)).includes('<div id="root">'), 'frontend not built');
   expect(res.status()).toBe(200);
   expect(res.headers()['content-type']).toContain('text/html');
+});
+
+// ---------------------------------------------------------------------------------------------------- contract v0.2
+// These stages continue on the bracket document of the stages above (loads, supports, keep-out cylinder, 24 elements).
+
+test('13. v0.2 params: symmetry y + overhang +z + max_iter 4 -> the progress frames carry a numeric stress_max', async () => {
+  await page.getByTestId('mode-orbit').click();
+  await page.getByTestId('sym-add').click();
+  await page.getByTestId('sym-row').first().getByTestId('sym-axis').selectOption('y'); // the bracket, its loads and the keep-out are symmetric about y = 30
+  await page.getByTestId('p-overhang').selectOption('+z');
+  await page.getByTestId('p-max-iter').fill('4');
+  expect(await state(page, (s) => [s.project.params.symmetry, s.project.params.overhang, s.project.params.max_iter])).toEqual([
+    [{ axis: 'y', position: null }],
+    '+z',
+    4,
+  ]);
+
+  // both are drawn: the mirror plane through the middle of the part, the base plate on the min-z face of the grid
+  const ov = (await viewportStats(page)).overlays;
+  expect(ov.symmetry).toHaveLength(1);
+  expect(ov.symmetry[0]!.axis).toBe('y');
+  expect(ov.symmetry[0]!.position).toBeCloseTo(30, 1);
+  expect(ov.overhang?.dir).toBe('+z');
+  const origin = await state(page, (s) => s.voxel.stats!.origin);
+  expect(ov.overhang!.plateAt).toBeCloseTo(origin[2]!, 3);
+
+  await page.getByTestId('run-start').click();
+  await expect.poll(() => state(page, (s) => s.run.status), { timeout: 120_000 }).toBe('done');
+  const run = await state(page, (s) => ({ error: s.run.error, history: s.run.history }));
+  expect(run.error).toBeNull();
+  expect(run.history).toHaveLength(4);
+  const last = run.history.at(-1)!;
+  expect(typeof last.stress_max).toBe('number');
+  expect(Number.isFinite(last.stress_max)).toBe(true);
+  expect(last.stress_max!).toBeGreaterThan(0);
+  expect(run.history.some((r) => typeof r.stress_max === 'number')).toBe(true);
+  // no stress limit was set: there is no constraint value to tag
+  await expect(page.getByTestId('run-stress')).toBeVisible();
+  await expect(page.getByTestId('run-constraint')).toHaveCount(0);
+  await expect(page.getByTestId('panel-run').getByTestId('sparkline')).toHaveAttribute('data-series', '3');
+  const exported = await (await page.request.get((await page.getByTestId('download-project').getAttribute('href'))!)).json();
+  expect(exported.project.params.symmetry).toEqual([{ axis: 'y', position: null }]);
+  expect(exported.project.params.overhang).toBe('+z');
+  ctx.runId = exported.run.id;
+});
+
+test('14. Color by stress fetches /stress (12 + 4*nx*ny*nz bytes) and recolours the density cells', async () => {
+  const st = await state(page, (s) => s.run.stats!);
+  await expect(page.getByTestId('color-stress')).toBeEnabled();
+  const before = await viewportStats(page);
+  expect(before.densityColorMode).toBe('density');
+  expect(before.densityCount).toBeGreaterThan(0);
+
+  const reply = page.waitForResponse((r) => /\/api\/runs\/[^/]+\/stress$/.test(r.url()));
+  await page.getByTestId('color-stress').check();
+  const res = await reply;
+  expect(res.status()).toBe(200);
+  const body = await res.body();
+  expect(body.length).toBe(12 + 4 * st.nx * st.ny * st.nz);
+  expect([body.readUInt32LE(0), body.readUInt32LE(4), body.readUInt32LE(8)]).toEqual([st.nx, st.ny, st.nz]);
+  const field = new Float32Array(body.buffer.slice(body.byteOffset + 12, body.byteOffset + body.length));
+  expect(field.every((v) => Number.isFinite(v) && v >= 0)).toBe(true);
+  expect(Math.max(...field)).toBeGreaterThan(0);
+
+  await expect.poll(async () => (await viewportStats(page)).densityColorMode).toBe('stress');
+  const after = await viewportStats(page);
+  expect(after.densityCount).toBe(before.densityCount);
+  expect(after.densityColorSum).not.toBeCloseTo(before.densityColorSum, 1);
+  await expect(page.getByTestId('stress-legend')).toBeVisible();
+  expect(await state(page, (s) => s.stress!.max)).toBeCloseTo(Math.max(...field), 4);
+  await shot('run-stress');
+
+  // the threshold slider keeps working on density in stress mode
+  await page.getByTestId('threshold').fill('0.1');
+  const low = (await viewportStats(page)).densityCount;
+  await page.getByTestId('threshold').fill('0.9');
+  expect(low).toBeGreaterThan((await viewportStats(page)).densityCount);
+  await page.getByTestId('threshold').fill('0.5');
+  await page.getByTestId('color-stress').uncheck();
+  await expect.poll(async () => (await viewportStats(page)).densityColorMode).toBe('density');
+});
+
+test('15. Trim to CAD: the trimmed STL download answers 200 and the result mesh loads trimmed', async () => {
+  const link = page.getByTestId('download-stl');
+  await page.getByTestId('trim-cad').check();
+  const href = (await link.getAttribute('href'))!;
+  expect(href).toContain(`/api/runs/${ctx.runId}/result.stl?`);
+  expect(href).toContain('trim=true');
+  const res = await page.request.get(href, { timeout: 120_000 });
+  expect(res.status()).toBe(200);
+  expect((await res.body()).length).toBeGreaterThan(84);
+  const warn = res.headers()['x-topop-warnings']; // present when the trim had to fall back or skip something
+
+  const req = page.waitForRequest((r) => /result\.stl\?.*trim=true/.test(r.url()));
+  await page.getByTestId('load-result').click();
+  await req;
+  await expect.poll(async () => (await viewportStats(page)).result, { timeout: 120_000 }).toBe(true);
+  if (warn) await expect(page.getByTestId('result-warnings')).toContainText(warn.replace(/\s+/g, ' ').trim());
+  else await expect(page.getByTestId('result-warnings')).toHaveCount(0);
+  await shot('result-trimmed');
+
+  await page.getByTestId('trim-cad').uncheck(); // reloads the mesh untrimmed
+  await expect(link).toHaveAttribute('href', /trim=false$/);
+  await expect.poll(async () => (await viewportStats(page)).result).toBe(true);
+  await page.getByTestId('hide-result').click();
+});
+
+test('16. facet list: the 12 mm hole is a cylinder facet (radius ~6) and its highlight is exactly its n_faces triangles', async () => {
+  await page.getByTestId('mode-query').click();
+  await page.getByTestId('query-tab-facets').click();
+  await expect(page.getByTestId('facet-list')).toBeVisible();
+  const more = page.getByTestId('facets-more');
+  if ((await more.count()) > 0 && /Show all/.test(await more.innerText())) await more.click();
+
+  const table = await state(page, (s) => Object.values(s.facetCache).filter((t) => t.angle_deg === 5)[0]!.facets);
+  expect(table.some((f) => f.kind === 'plane')).toBe(true);
+  const hole = table.find((f) => f.kind === 'cylinder' && Math.abs((f.radius ?? 0) - 6) < 0.25);
+  expect(hole, 'a cylinder facet with radius ~6 (the 12 mm through-hole in the wall)').toBeTruthy();
+  expect(Math.abs(hole!.axis![0]!)).toBeCloseTo(1, 3); // along X
+  expect(hole!.brep_face ?? null).toBeNull(); // an STL: no B-rep faces
+  const row = page.locator(`[data-testid="facet-row"][data-facet-id="${hole!.id}"]`);
+  await expect(row.getByTestId('facet-kind')).toHaveText('cylinder');
+  await expect(row.getByTestId('facet-radius')).toHaveText(`r ${+hole!.radius!.toPrecision(4)}`);
+  await expect(page.getByTestId('facets-source')).toHaveCount(0);
+
+  await row.hover();
+  await expect.poll(() => state(page, (s) => s.hoverFaces.length)).toBe(hole!.n_faces);
+  const exact = ((await (await page.request.get(`/api/meshes/${ctx.meshId}/facets/${hole!.id}/faces?angle_deg=5`)).json()) as { face_ids: number[] }).face_ids;
+  expect(exact).toHaveLength(hole!.n_faces);
+  expect(await state(page, (s) => [...s.hoverFaces].sort((a, b) => a - b))).toEqual([...exact].sort((a, b) => a - b));
+  await shot('facets-cylinder');
+  await page.mouse.move(700, 600);
+  await expect.poll(() => state(page, (s) => s.hoverFaces.length)).toBe(0);
+  await page.getByTestId('mode-orbit').click();
+});
+
+test('17. translate the design mesh by (10, 0, 0): the voxel grid origin follows by ~10 and the pose reaches the server', async () => {
+  await expect.poll(() => state(page, (s) => s.voxel.stats?.origin[0] ?? null), { timeout: 60_000 }).not.toBeNull();
+  const x0 = (await state(page, (s) => s.voxel.stats!.origin[0]))!;
+  await expect(page.getByTestId('design-transform')).toBeVisible();
+  await page.getByTestId('design-pos-x').fill('10');
+  await expect.poll(() => state(page, (s) => s.voxel.stats!.origin[0]!), { timeout: 60_000 }).toBeGreaterThan(x0 + 9);
+  const x1 = (await state(page, (s) => s.voxel.stats!.origin[0]))!;
+  expect(x1 - x0).toBeCloseTo(10, 0);
+  const t = await state(page, (s) => s.project.design_mesh!.transform!);
+  expect(t).toHaveLength(16);
+  expect([t[12], t[13], t[14]]).toEqual([10, 0, 0]);
+  expect((await viewportStats(page)).designMatrix[12]).toBeCloseTo(10, 6);
+
+  // the server's copy of the project holds the same matrix (column-major, translation in 12..14)
+  const id = await state(page, (s) => s.projectMeta!.id);
+  const stored = await (await page.request.get(`/api/projects/${id}`)).json();
+  expect(stored.design_mesh.transform[12]).toBeCloseTo(10, 6);
+
+  // picking works in world space: the ray through the screen position of a moved point hits the mesh there
+  const world = [50, 30, 10]; // plate top, local (40, 30, 10)
+  const hit = await page.evaluate(([x, y, z]) => {
+    const vp = window.__topopViewport!;
+    const at = vp.screenPoint([x!, y!, z!]);
+    const h = vp.pickFace(at.x, at.y);
+    return h ? h.point.toArray() : null;
+  }, world);
+  expect(hit).not.toBeNull();
+  world.forEach((v, k) => expect(hit![k]!).toBeCloseTo(v, 0));
+
+  await page.getByTestId('design-reset').click();
+  await expect.poll(() => state(page, (s) => s.voxel.stats!.origin[0]!), { timeout: 60_000 }).toBeCloseTo(x0, 3);
+  expect(await state(page, (s) => s.project.design_mesh!.transform)).toEqual([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
 });

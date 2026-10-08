@@ -1,19 +1,22 @@
 // Live density display: an InstancedMesh of unit cubes (scaled by h) for cells with rho >= threshold,
-// coloured by rho with a viridis ramp. The InstancedMesh is reused between frames; only the instance
-// count and matrices are rewritten. Above POINT_FALLBACK visible cells it switches to Points.
+// coloured by rho with a viridis ramp, or by von Mises stress (inferno ramp) once a stress field is set. The
+// InstancedMesh is reused between frames; only the instance count and matrices are rewritten. Above POINT_FALLBACK
+// visible cells it switches to Points.
 import * as THREE from 'three';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
-import type { DensityFrame } from '../api/client';
+import type { DensityFrame, StressField } from '../api/client';
 import type { Viewport } from './Viewport';
 
 export const POINT_FALLBACK = 300_000;
 
 // 8-stop viridis ramp (matplotlib viridis sampled at i/7)
 const VIRIDIS = [0x440154, 0x46327e, 0x365c8d, 0x277f8e, 0x1fa187, 0x4ac16d, 0x9fda3a, 0xfde725];
+// sequential ramp for stress (matplotlib inferno sampled at i/9): dark = low, bright = high; the legend bar uses the same stops
+export const INFERNO = [0x000004, 0x1b0c41, 0x4a0c6b, 0x781c6d, 0xa52c60, 0xcf4446, 0xed6925, 0xfb9b06, 0xf7d13d, 0xfcffa4];
 
-/** 256-entry rgb lookup in three's linear working space, interpolated between the 8 stops. */
-function buildLut(): Float32Array {
-  const stops = VIRIDIS.map((h) => new THREE.Color(h));
+/** 256-entry rgb lookup in three's linear working space, interpolated between the stops. */
+function buildLut(ramp: readonly number[]): Float32Array {
+  const stops = ramp.map((h) => new THREE.Color(h));
   const lut = new Float32Array(256 * 3);
   const c = new THREE.Color();
   for (let i = 0; i < 256; i++) {
@@ -48,7 +51,11 @@ export class DensityView {
   private frame: DensityFrame | null = null;
   private grid: DensityGrid | null = null;
   private threshold = 0.5;
-  private readonly lut = buildLut();
+  private readonly lut = buildLut(VIRIDIS);
+  private readonly stressLut = buildLut(INFERNO);
+  private stress: StressField | null = null;
+  /** what the cells are coloured by right now (stress only when the field matches the frame's grid) */
+  colorMode: 'density' | 'stress' = 'density';
   private readonly cube = new THREE.BoxGeometry(1, 1, 1);
   private readonly cubeMat = new THREE.MeshStandardMaterial({ roughness: 0.7, metalness: 0 });
   private readonly pointMat = new THREE.PointsMaterial({ size: 2, sizeAttenuation: false, vertexColors: true });
@@ -91,6 +98,23 @@ export class DensityView {
     this.rebuild();
   }
 
+  /** Colour the cells by this per-element field (null: back to density). Ignored while its grid differs from the frame's. */
+  setStress(field: StressField | null): void {
+    if (field === this.stress) return;
+    this.stress = field;
+    this.rebuild();
+  }
+
+  /** Sum of the visible instance colours (diagnostic: lets e2e see that recolouring happened). */
+  colorSum(): number {
+    const attr = this.mode === 'points' ? this.pts?.geometry.getAttribute('color') : this.inst?.instanceColor;
+    if (!attr || this.count === 0) return 0;
+    const arr = attr.array as Float32Array;
+    let sum = 0;
+    for (let i = 0; i < this.count * 3; i++) sum += arr[i]!;
+    return Math.round(sum * 1e3) / 1e3;
+  }
+
   setThreshold(t: number): void {
     if (t === this.threshold) return;
     this.threshold = t;
@@ -113,6 +137,7 @@ export class DensityView {
     if (!f || !g) {
       this.count = 0;
       this.mode = 'none';
+      this.colorMode = 'density';
       this.it = 0;
       this.bounds = null;
       if (this.inst) this.inst.count = 0;
@@ -125,6 +150,12 @@ export class DensityView {
     const cut = Math.max(1, Math.round(this.threshold * 255));
     let n = 0;
     for (let i = 0; i < rho.length; i++) if (rho[i]! >= cut) n++;
+    const sf = this.stress && this.stress.shape[0] === nx && this.stress.shape[1] === ny && this.stress.shape[2] === nz ? this.stress : null;
+    this.colorMode = sf ? 'stress' : 'density';
+    const smax = sf && sf.max > 0 ? sf.max : 1;
+    // lookup row of one cell: its density byte, or its stress scaled to [0, max]
+    const lutRow = (idx: number, v: number): number => (sf ? Math.round(Math.min(1, Math.max(0, sf.data[idx]! / smax)) * 255) : v);
+    const lut = sf ? this.stressLut : this.lut;
     this.it = f.it;
     this.count = n;
     const asPoints = n > POINT_FALLBACK;
@@ -149,9 +180,10 @@ export class DensityView {
       const pts = this.ensurePoints(n);
       const pos = pts.geometry.getAttribute('position') as THREE.BufferAttribute;
       const col = pts.geometry.getAttribute('color') as THREE.BufferAttribute;
-      this.fill(rho, nx, ny, nz, cut, (j, x, y, z, v) => {
+      this.fill(rho, nx, ny, nz, cut, (j, x, y, z, v, idx) => {
         (pos.array as Float32Array).set([ox + h * (x + 0.5), oy + h * (y + 0.5), oz + h * (z + 0.5)], j * 3);
-        (col.array as Float32Array).set(this.lut.subarray(v * 3, v * 3 + 3), j * 3);
+        const k = lutRow(idx, v);
+        (col.array as Float32Array).set(lut.subarray(k * 3, k * 3 + 3), j * 3);
       });
       pos.needsUpdate = true;
       col.needsUpdate = true;
@@ -160,7 +192,7 @@ export class DensityView {
       const inst = this.ensureInstanced(n);
       const mat = inst.instanceMatrix.array as Float32Array;
       const col = inst.instanceColor!.array as Float32Array;
-      this.fill(rho, nx, ny, nz, cut, (j, x, y, z, v) => {
+      this.fill(rho, nx, ny, nz, cut, (j, x, y, z, v, idx) => {
         const o = j * 16;
         mat[o] = h;
         mat[o + 1] = 0;
@@ -178,7 +210,8 @@ export class DensityView {
         mat[o + 13] = oy + h * (y + 0.5);
         mat[o + 14] = oz + h * (z + 0.5);
         mat[o + 15] = 1;
-        col.set(this.lut.subarray(v * 3, v * 3 + 3), j * 3);
+        const k = lutRow(idx, v);
+        col.set(lut.subarray(k * 3, k * 3 + 3), j * 3);
       });
       inst.count = n;
       inst.instanceMatrix.needsUpdate = true;
@@ -194,7 +227,7 @@ export class DensityView {
     ny: number,
     nz: number,
     cut: number,
-    put: (j: number, x: number, y: number, z: number, byte: number) => void,
+    put: (j: number, x: number, y: number, z: number, byte: number, idx: number) => void,
   ): void {
     let j = 0;
     let idx = 0;
@@ -202,7 +235,7 @@ export class DensityView {
       for (let y = 0; y < ny; y++) {
         for (let z = 0; z < nz; z++, idx++) {
           const v = rho[idx]!;
-          if (v >= cut) put(j++, x, y, z, v);
+          if (v >= cut) put(j++, x, y, z, v, idx);
         }
       }
     }

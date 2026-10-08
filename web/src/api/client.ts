@@ -106,10 +106,46 @@ export async function apiGetBuffer(path: string): Promise<ArrayBuffer> {
 export interface ResultOptions {
   threshold: number;
   smooth: number;
+  /** intersect the result with the original CAD (server: `trim=true|false`; omitted -> server default) */
+  trim?: boolean;
+}
+
+/** GET /api/meshes/{id}/facets/{facet_id}/faces */
+export interface FacetFaces {
+  face_ids: number[];
+}
+
+/** The result mesh bytes plus the server's `X-Topop-Warnings` header (e.g. why a CAD trim fell back). */
+export interface ResultMesh {
+  buffer: ArrayBuffer;
+  warnings: string | null;
+}
+
+/** GET /api/runs/{id}/stress: von Mises per element, [ix][iy][iz] (iz fastest), 0 on inactive cells. */
+export interface StressField {
+  shape: [number, number, number];
+  data: Float32Array;
+  max: number;
 }
 
 const enc = encodeURIComponent;
-const resultQuery = (o: ResultOptions) => `threshold=${o.threshold}&smooth=${o.smooth}`;
+const resultQuery = (o: ResultOptions) =>
+  `threshold=${o.threshold}&smooth=${o.smooth}${o.trim === undefined ? '' : `&trim=${o.trim}`}`;
+
+/** Binary layout: u32 nx, u32 ny, u32 nz, f32[nx*ny*nz], little-endian. */
+export function parseStress(buf: ArrayBuffer): StressField {
+  if (buf.byteLength < 12) throw new Error('truncated stress field');
+  const dv = new DataView(buf);
+  const nx = dv.getUint32(0, true);
+  const ny = dv.getUint32(4, true);
+  const nz = dv.getUint32(8, true);
+  const n = nx * ny * nz;
+  if (buf.byteLength < 12 + 4 * n) throw new Error('truncated stress field');
+  const data = new Float32Array(buf, 12, n); // offset 12 is 4-byte aligned
+  let max = 0;
+  for (let i = 0; i < n; i++) if (data[i]! > max) max = data[i]!;
+  return { shape: [nx, ny, nz], data, max };
+}
 
 export const api = {
   // meshes
@@ -121,6 +157,9 @@ export const api = {
   /** Flat u32 array of face pairs [a0, b0, a1, b1, ...]. */
   meshAdjacency: async (id: string) => new Uint32Array(await apiGetBuffer(`/api/meshes/${enc(id)}/adjacency`)),
   meshFacets: (id: string, angleDeg = 5) => apiGet<MeshFacets>(`/api/meshes/${enc(id)}/facets?angle_deg=${angleDeg}`),
+  /** Exact triangle ids of one facet (also for cylinders and STEP B-rep faces). */
+  facetFaces: (id: string, facetId: number, angleDeg = 5) =>
+    apiGet<FacetFaces>(`/api/meshes/${enc(id)}/facets/${facetId}/faces?angle_deg=${angleDeg}`),
   meshPreviewUrl: (id: string, view = 'iso') => `/api/meshes/${enc(id)}/preview.png?view=${enc(view)}`,
 
   // projects
@@ -137,14 +176,20 @@ export const api = {
   getRun: (id: string) => apiGet<RunInfo>(`/api/runs/${enc(id)}`),
   listRuns: () => apiGet<RunInfo[]>('/api/runs'),
   cancelRun: (id: string) => apiPost<RunInfo>(`/api/runs/${enc(id)}/cancel`),
-  resultStl: (id: string, o: ResultOptions) => apiGetBuffer(api.resultStlUrl(id, o)),
+  resultStl: async (id: string, o: ResultOptions): Promise<ResultMesh> => {
+    const res = await fetch(api.resultStlUrl(id, o));
+    if (!res.ok) return fail(res);
+    return { buffer: await res.arrayBuffer(), warnings: res.headers.get('X-Topop-Warnings') };
+  },
+  /** 409 (ApiError.status) while the run has no stress field yet. */
+  runStress: async (id: string) => parseStress(await apiGetBuffer(`/api/runs/${enc(id)}/stress`)),
   resultStlUrl: (id: string, o: ResultOptions) => `/api/runs/${enc(id)}/result.stl?${resultQuery(o)}`,
   resultVtiUrl: (id: string) => `/api/runs/${enc(id)}/result.vti`,
   resultNpzUrl: (id: string) => `/api/runs/${enc(id)}/result.npz`,
   projectJsonUrl: (id: string) => `/api/runs/${enc(id)}/project.json`,
   runExport: (id: string) => apiGet<RunExport>(`/api/runs/${enc(id)}/project.json`),
-  runPreviewUrl: (id: string, o: { threshold: number; view?: string }) =>
-    `/api/runs/${enc(id)}/preview.png?threshold=${o.threshold}&view=${enc(o.view ?? 'iso')}`,
+  runPreviewUrl: (id: string, o: { threshold: number; view?: string; trim?: boolean }) =>
+    `/api/runs/${enc(id)}/preview.png?threshold=${o.threshold}&view=${enc(o.view ?? 'iso')}${o.trim === undefined ? '' : `&trim=${o.trim}`}`,
 };
 
 /** Binary WS frame: [u32 it][u32 nx][u32 ny][u32 nz][u8 rho*255 ...], C-order [ix][iy][iz], little-endian. */

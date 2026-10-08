@@ -7,6 +7,7 @@ import type { GizmoMode, ToolMode } from '../state/store';
 import { DensityView } from './DensityView';
 import { Markers } from './Markers';
 import { type MeshData, parseMeshBuffer } from './meshData';
+import { Overlays, type OverlayInfo } from './Overlays';
 import { Picker, type PickerDeps } from './Picker';
 import { Primitives } from './Primitives';
 import { SelectionPainter, type PainterDeps } from './SelectionPainter';
@@ -22,8 +23,12 @@ export interface DesignMesh {
   meshId: string | null;
   data: MeshData;
   geometry: THREE.BufferGeometry;
+  /** matrix = MeshRef.transform (matrixAutoUpdate off): every raycast and bbox goes through it, so picks are in world space */
   mesh: THREE.Mesh;
   material: THREE.MeshStandardMaterial;
+  /** gizmo proxy sitting at transform * bboxCentre (see RefEntry) */
+  pivot: THREE.Object3D;
+  centre: THREE.Vector3;
 }
 
 export interface FaceGroup {
@@ -58,11 +63,14 @@ export class Viewport {
   readonly primitives: Primitives;
   readonly markers: Markers;
   readonly density: DensityView;
+  readonly overlays: Overlays;
 
   mode: ToolMode = 'orbit';
   design: DesignMesh | null = null;
   /** emitted (column-major Matrix4.toArray) while a reference model is dragged with the gizmo */
   onRefTransform: ((id: string, matrix: number[]) => void) | null = null;
+  /** emitted (column-major Matrix4.toArray) while the design mesh is dragged with the gizmo */
+  onDesignTransform: ((matrix: number[]) => void) | null = null;
   renderCount = 0;
 
   private readonly refs = new Map<string, RefEntry>();
@@ -113,10 +121,11 @@ export class Viewport {
 
     this.markers = new Markers(this);
     this.density = new DensityView(this);
+    this.overlays = new Overlays(this);
     this.primitives = new Primitives(this);
     this.picker = new Picker(this, deps.picker);
     this.painter = new SelectionPainter(this, deps.painter);
-    this.scene.add(this.markers.group, this.density.group);
+    this.scene.add(this.markers.group, this.density.group, this.overlays.group);
 
     this.rebuildGrid(new THREE.Box3(new THREE.Vector3(-50, -50, 0), new THREE.Vector3(50, 50, 0)));
 
@@ -189,9 +198,8 @@ export class Viewport {
 
   // ---------------------------------------------------------------- design mesh
   /**
-   * The design mesh is drawn untransformed: `Project.design_mesh.transform` must be the identity (the GUI never
-   * writes anything else). A non-identity design transform in an imported project.json is unsupported here and
-   * only reported on import (state/projectFile.ts); reference models, in contrast, carry a full matrix (see setRefTransform).
+   * Loads the design mesh untransformed (identity matrix); `setDesignTransform` then applies `design_mesh.transform`
+   * like `setRefTransform` does for reference models.
    */
   loadDesignMesh(buffer: ArrayBuffer, opts: { meshId?: string; data?: MeshData } = {}): THREE.BufferGeometry {
     this.clearDesignMesh();
@@ -229,8 +237,13 @@ export class Viewport {
     });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.name = 'design';
-    this.scene.add(mesh);
-    this.design = { meshId: opts.meshId ?? null, data, geometry, mesh, material };
+    mesh.matrixAutoUpdate = false;
+    const pivot = new THREE.Object3D();
+    pivot.name = 'design-pivot';
+    const centre = geometry.boundingBox!.getCenter(new THREE.Vector3());
+    pivot.position.copy(centre);
+    this.scene.add(mesh, pivot);
+    this.design = { meshId: opts.meshId ?? null, data, geometry, mesh, material, pivot, centre };
     this.appearance = 'solid';
     this.faceHex = new Uint32Array(n).fill(BASE_HEX);
     this.faceNext = new Uint32Array(n);
@@ -241,7 +254,8 @@ export class Viewport {
 
   clearDesignMesh(): void {
     if (!this.design) return;
-    this.scene.remove(this.design.mesh);
+    if (this.gizmoTarget?.object === this.design.pivot) this.attachGizmo(null);
+    this.scene.remove(this.design.mesh, this.design.pivot);
     this.design.geometry.dispose();
     this.design.material.dispose();
     this.design = null;
@@ -294,10 +308,51 @@ export class Viewport {
     }
   }
 
+  /** Applies MeshRef.transform (column-major) to the design mesh; the gizmo proxy and the floor grid follow. */
+  setDesignTransform(matrix: readonly number[]): void {
+    const d = this.design;
+    if (!d || matrix.length !== 16) return;
+    if (d.mesh.matrix.elements.every((v, i) => Math.abs(v - matrix[i]!) < 1e-9)) return;
+    d.mesh.matrix.fromArray(matrix as number[]);
+    d.mesh.matrixWorldNeedsUpdate = true;
+    d.mesh.updateMatrixWorld(true);
+    const pose = d.mesh.matrix.clone().multiply(new THREE.Matrix4().makeTranslation(d.centre.x, d.centre.y, d.centre.z));
+    pose.decompose(d.pivot.position, d.pivot.quaternion, d.pivot.scale);
+    d.pivot.updateMatrixWorld(true);
+    this.rebuildGrid(this.designBox());
+    this.requestRender();
+  }
+
+  /** World-space bbox of the design mesh (its geometry bbox through the transform). */
+  private designBox(): THREE.Box3 {
+    const d = this.design!;
+    return d.geometry.boundingBox!.clone().applyMatrix4(d.mesh.matrix);
+  }
+
+  /** Attach the gizmo to the design mesh (or detach with false); fields and gizmo edit the same matrix. */
+  setActiveDesign(on: boolean): void {
+    const d = this.design;
+    if (!on || !d) {
+      if (d && this.gizmoTarget?.object === d.pivot) this.attachGizmo(null);
+      return;
+    }
+    const emit = () => {
+      d.pivot.updateMatrix();
+      const m = d.pivot.matrix.clone().multiply(new THREE.Matrix4().makeTranslation(-d.centre.x, -d.centre.y, -d.centre.z));
+      d.mesh.matrix.copy(m);
+      d.mesh.matrixWorldNeedsUpdate = true;
+      d.mesh.updateMatrixWorld(true);
+      this.requestRender();
+      this.onDesignTransform?.(m.toArray());
+    };
+    this.attachGizmo(d.pivot, emit, emit);
+  }
+
   /** Raycast the design mesh from a client-space pointer position. */
   pickFace(clientX: number, clientY: number): FaceHit | null {
     const d = this.design;
     if (!d || !d.mesh.visible) return null;
+    d.mesh.updateMatrixWorld();
     const r = this.canvas.getBoundingClientRect();
     this.ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
     this.raycaster.setFromCamera(this.ndc, this.camera);
@@ -305,13 +360,15 @@ export class Viewport {
     if (!hit || hit.faceIndex == null) return null;
     const f = hit.faceIndex;
     const nn = d.data.normals;
-    return { face: f, point: hit.point.clone(), normal: new THREE.Vector3(nn[f * 3], nn[f * 3 + 1], nn[f * 3 + 2]) };
+    const normal = new THREE.Vector3(nn[f * 3], nn[f * 3 + 1], nn[f * 3 + 2]);
+    normal.applyNormalMatrix(new THREE.Matrix3().getNormalMatrix(d.mesh.matrixWorld)).normalize(); // local -> world
+    return { face: f, point: hit.point.clone(), normal };
   }
 
   // ---------------------------------------------------------------- camera
   private contentBox(): THREE.Box3 {
     const box = new THREE.Box3();
-    if (this.design?.geometry.boundingBox) box.copy(this.design.geometry.boundingBox);
+    if (this.design?.geometry.boundingBox) box.copy(this.designBox());
     for (const r of this.refs.values()) box.union(new THREE.Box3().setFromObject(r.mesh));
     if (box.isEmpty()) box.set(new THREE.Vector3(-50, -50, 0), new THREE.Vector3(50, 50, 50));
     return box;
@@ -513,6 +570,11 @@ export class Viewport {
     resolvedPoints: number;
     arrows: number;
     glyphs: number;
+    arrowAt: number[][];
+    designMatrix: number[];
+    overlays: OverlayInfo;
+    densityColorMode: string;
+    densityColorSum: number;
   } {
     return {
       renders: this.renderCount,
@@ -525,6 +587,11 @@ export class Viewport {
       resolvedPoints: this.markers.counts().points,
       arrows: this.markers.counts().arrows,
       glyphs: this.markers.counts().glyphs,
+      arrowAt: this.markers.arrowOrigins(),
+      designMatrix: this.design ? [...this.design.mesh.matrix.elements] : [],
+      overlays: this.overlays.describe(),
+      densityColorMode: this.density.colorMode,
+      densityColorSum: this.density.colorSum(),
     };
   }
 
@@ -537,7 +604,7 @@ export class Viewport {
 
   /** Fraction of canvas pixels that differ from the background with grid/axes/gizmo hidden. */
   coverage(): number {
-    const hidden: THREE.Object3D[] = [this.gizmo.getHelper()];
+    const hidden: THREE.Object3D[] = [this.gizmo.getHelper(), this.overlays.group];
     if (this.grid) hidden.push(this.grid);
     if (this.axes) hidden.push(this.axes);
     const was = hidden.map((o) => o.visible);
@@ -567,6 +634,7 @@ export class Viewport {
     this.primitives.dispose();
     this.markers.dispose();
     this.density.dispose();
+    this.overlays.dispose();
     this.clearDesignMesh();
     for (const id of [...this.refs.keys()]) this.removeRefMesh(id);
     this.gizmo.dispose();

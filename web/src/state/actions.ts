@@ -14,11 +14,11 @@ import {
   openRunStream,
 } from '../api/client';
 import { buildAdjacency, parseMeshBuffer } from '../viewport/meshData';
-import { bboxDiagonal, designEntry, facetKey, isPrimitive, requiredMeshes, toPrim } from './derived';
+import { designBox, designEntry, facetKey, isPrimitive, requiredMeshes, toPrim } from './derived';
 import { IDENTITY } from './defaults';
 import { parseProjectFile } from './projectFile';
 import { primitiveStl, type RefPrimitiveKind } from './primitiveMesh';
-import { type QueryKind, facetFaces, formFromSelection, paddedBox } from './query';
+import { type QueryKind, facetFaces, facetFacesKey, formFromSelection, paddedBox } from './query';
 import { type Prim, type PrimitiveKind, currentSelectionSpec, genId, useStore } from './store';
 import { composeTRS } from './transform';
 
@@ -56,14 +56,33 @@ async function uploadAndLoad(file: File): Promise<MeshInfo> {
   return info;
 }
 
+export const isStepFile = (name: string): boolean => /\.(step|stp)$/i.test(name);
+
+/**
+ * uploadAndLoad, except that a STEP file the server cannot read (400, e.g. the OpenCascade extra is not installed) puts
+ * the server's message in the notice verbatim: it carries the install hint. null = nothing was imported.
+ */
+async function uploadOrExplain(file: File): Promise<MeshInfo | null> {
+  try {
+    return await uploadAndLoad(file);
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 400 && isStepFile(file.name)) {
+      get().setNotice({ kind: 'error', text: e.message });
+      return null;
+    }
+    throw e;
+  }
+}
+
 /** After a design mesh is in the store: brush size, Query form defaults, and the "restored" notice. */
 function designReady(): void {
   const s = get();
   const entry = designEntry(s);
   if (!entry) return;
-  s.setBrushRadius(Math.round((bboxDiagonal(entry.data) / 25) * 10) / 10 || 1);
+  const box = designBox(s) ?? entry.data.bbox;
+  s.setBrushRadius(Math.round((Math.hypot(box.max[0] - box.min[0], box.max[1] - box.min[1], box.max[2] - box.min[2]) / 25) * 10) / 10 || 1);
   if (!s.selection.query) {
-    const { min, max } = entry.data.bbox;
+    const { min, max } = box;
     s.setQueryForm({ ...s.queryForm, plane: { ...s.queryForm.plane, point: [0, 1, 2].map((k) => (min[k]! + max[k]!) / 2) as [number, number, number] } });
   }
   if (s.restored && requiredMeshes(get()).every((m) => m.loaded)) useStore.setState({ restored: false, notice: null });
@@ -74,7 +93,8 @@ export async function importDesignMesh(file: File): Promise<void> {
   await guard('Upload', async () => {
     const before = get();
     const old = before.project.design_mesh?.mesh_id ?? null;
-    const info = await uploadAndLoad(file);
+    const info = await uploadOrExplain(file);
+    if (!info) return;
     let warn: string | null = null;
     if (old === info.id) {
       // same file as the project expects (restored project, or simply re-uploaded): nothing to remap
@@ -97,8 +117,8 @@ export async function importDesignMesh(file: File): Promise<void> {
 
 export async function importRefMesh(file: File): Promise<void> {
   await guard('Upload', async () => {
-    const info = await uploadAndLoad(file);
-    addRefFor(info, info.name);
+    const info = await uploadOrExplain(file);
+    if (info) addRefFor(info, info.name);
   });
 }
 
@@ -118,7 +138,7 @@ export async function addRefPrimitive(kind: RefPrimitiveKind, mode: RefModel['mo
     const label = `${mode === 'keep_out' ? 'Keep-out' : 'Keep-in'} ${kind}`;
     const file = new File([primitiveStl(kind)], `${label.toLowerCase().replace(/\s+/g, '-')}.stl`, { type: 'model/stl' });
     const info = await uploadAndLoad(file);
-    const bbox = designEntry(get())?.data.bbox ?? { min: [-10, -10, -10], max: [10, 10, 10] };
+    const bbox = designBox(get()) ?? { min: [-10, -10, -10], max: [10, 10, 10] };
     const centre = [0, 1, 2].map((k) => (bbox.min[k]! + bbox.max[k]!) / 2);
     const span = Math.max(bbox.max[0]! - bbox.min[0]!, bbox.max[1]! - bbox.min[1]!, bbox.max[2]! - bbox.min[2]!) || 20;
     const edge = span * 0.25;
@@ -132,7 +152,8 @@ export async function addRefPrimitive(kind: RefPrimitiveKind, mode: RefModel['mo
 export async function reuploadRefMesh(refId: string, file: File): Promise<void> {
   await guard('Upload', async () => {
     const expected = get().project.ref_models.find((r) => r.id === refId)?.mesh_id;
-    const info = await uploadAndLoad(file);
+    const info = await uploadOrExplain(file);
+    if (!info) return;
     get().updateRef(refId, { mesh_id: info.id, name: info.name });
     if (expected && expected !== info.id) {
       get().setNotice({ kind: 'warn', text: `"${info.name}" is not the file this reference model was made with (id ${info.id}, expected ${expected}).` });
@@ -196,12 +217,44 @@ export async function fetchFacets(angleDeg?: number): Promise<MeshFacets | null>
   }
 }
 
-/** Facet tables that loads/supports with `facets` selections need (viewport markers, labels), fetched in the background. */
+/** Facet tables and exact faces that loads/supports with `facets` selections need (markers, colours), fetched in the background. */
 async function prefetchFacets(): Promise<void> {
   const p = get().project;
   const angles = new Set<number>();
-  for (const it of [...p.loads, ...p.supports]) if (it.selection.kind === 'facets') angles.add(it.selection.angle_deg);
+  for (const it of [...p.loads, ...p.supports]) {
+    if (it.selection.kind !== 'facets') continue;
+    angles.add(it.selection.angle_deg);
+    prefetchFacetFaces(it.selection);
+  }
   for (const a of angles) await fetchFacets(a);
+}
+
+const facePending = new Map<string, Promise<number[] | null>>();
+
+/**
+ * Exact triangle ids of one facet (GET /api/meshes/{id}/facets/{facet_id}/faces), cached per facet in the store.
+ * Resolves null if the request failed; callers keep their approximation then.
+ */
+export function ensureFacetFaces(meshId: string, angleDeg: number, facetId: number): Promise<number[] | null> {
+  const key = facetFacesKey(meshId, angleDeg, facetId);
+  const hit = get().facetFaceCache[key];
+  if (hit) return Promise.resolve(hit);
+  const inflight = facePending.get(key);
+  if (inflight) return inflight;
+  const p = api
+    .facetFaces(meshId, facetId, angleDeg)
+    .then((r) => {
+      get().putFacetFaces(key, r.face_ids);
+      return r.face_ids;
+    })
+    .catch(() => null)
+    .finally(() => facePending.delete(key));
+  facePending.set(key, p);
+  return p;
+}
+
+function prefetchFacetFaces(sel: { mesh_id: string; angle_deg: number; facet_ids: number[] }): void {
+  for (const id of sel.facet_ids) void ensureFacetFaces(sel.mesh_id, sel.angle_deg, id);
 }
 
 export function setQueryKind(kind: QueryKind): void {
@@ -212,10 +265,9 @@ export function setQueryKind(kind: QueryKind): void {
 /** Toggle the optional `within` box; switching it on fills it from the design bbox padded by one voxel h. */
 export function setNormalWithin(on: boolean): void {
   const s = get();
-  const entry = designEntry(s);
+  const b = designBox(s); // world space: the box clips grid nodes, which sit in the transformed domain
   let box = { min: [0, 0, 0] as [number, number, number], max: [0, 0, 0] as [number, number, number] };
-  if (entry) {
-    const b = entry.data.bbox;
+  if (b) {
     const span = Math.max(b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]);
     const h = s.voxel.stats?.h ?? span / s.project.grid.elements_along_longest;
     box = paddedBox(b, h);
@@ -228,21 +280,40 @@ export function toggleFacet(id: number): void {
     const ids = f.facets.ids.includes(id) ? f.facets.ids.filter((x) => x !== id) : [...f.facets.ids, id];
     return { ...f, facets: { ...f.facets, ids } };
   });
+  const sel = get().selection.query;
+  if (sel?.kind === 'facets') prefetchFacetFaces(sel);
 }
 
-/** Highlight (or un-highlight with null) the faces of a facet row in the viewport. */
+let hoverSeq = 0;
+
+/**
+ * Highlight (or un-highlight with null) the faces of a facet row in the viewport: the exact ids from the faces
+ * endpoint (cached per facet). While that request is in flight the old normal + bbox reconstruction stands in.
+ */
 export function hoverFacet(facet: FacetInfo | null): void {
   const s = get();
   const entry = designEntry(s);
-  if (!facet || !entry) s.setHoverFaces([]);
-  else s.setHoverFaces(facetFaces(entry.data, facet, s.queryForm.facets.angle));
+  const seq = ++hoverSeq;
+  if (!facet || !entry) {
+    s.setHoverFaces([]);
+    return;
+  }
+  const angle = s.queryForm.facets.angle;
+  const cached = s.facetFaceCache[facetFacesKey(entry.info.id, angle, facet.id)];
+  if (cached) {
+    s.setHoverFaces(cached);
+    return;
+  }
+  s.setHoverFaces(facetFaces(entry.data, facet, angle));
+  void ensureFacetFaces(entry.info.id, angle, facet.id).then((ids) => {
+    if (ids && seq === hoverSeq) get().setHoverFaces(ids); // a newer hover (or leaving the row) wins
+  });
 }
 
 // ------------------------------------------------------------------ selection -> loads / supports / primitives
 
 export function addPrimitive(kind: PrimitiveKind): void {
-  const entry = designEntry(get());
-  const { min, max } = entry?.data.bbox ?? { min: [-10, -10, -10], max: [10, 10, 10] };
+  const { min, max } = designBox(get()) ?? { min: [-10, -10, -10], max: [10, 10, 10] };
   const centre = [0, 1, 2].map((k) => (min[k]! + max[k]!) / 2);
   const span = Math.max(max[0]! - min[0]!, max[1]! - min[1]!, max[2]! - min[2]!) || 20;
   const edge = span * 0.25;
@@ -313,7 +384,10 @@ export function reselect(selection: Selection): void {
     s.setQueryForm(formFromSelection(selection, s.queryForm));
     s.setQuerySelection(structuredClone(selection));
     s.setTool('query');
-    if (selection.kind === 'facets') void fetchFacets(selection.angle_deg);
+    if (selection.kind === 'facets') {
+      void fetchFacets(selection.angle_deg);
+      prefetchFacetFaces(selection);
+    }
   }
 }
 
@@ -323,7 +397,7 @@ export function deleteActive(): void {
   if (!a) return;
   if (a.kind === 'load') s.removeLoad(a.id);
   else if (a.kind === 'support') s.removeSupport(a.id);
-  else s.removeRef(a.id);
+  else if (a.kind === 'ref') s.removeRef(a.id);
 }
 
 // ------------------------------------------------------------------ project.json import / export
@@ -557,15 +631,49 @@ export async function stopRun(): Promise<void> {
   });
 }
 
+/** Options of every result request (download link, mesh load): the sliders plus the Trim to CAD switch. */
+export function resultOptions(s: Pick<ReturnType<typeof get>, 'threshold' | 'smoothIterations' | 'trimToCad'>) {
+  return { threshold: s.threshold, smooth: s.smoothIterations, trim: s.trimToCad };
+}
+
 export async function loadResultMesh(): Promise<void> {
   const s = get();
   if (!s.run.id) return;
   const id = s.run.id;
   await guard('Load result', async () => {
-    get().setResultStl(await api.resultStl(id, { threshold: s.threshold, smooth: s.smoothIterations }));
+    const res = await api.resultStl(id, resultOptions(s));
+    get().setResultStl(res.buffer, res.warnings);
   });
 }
 
 export function hideResultMesh(): void {
   get().setResultStl(null);
+}
+
+/** "Trim to CAD": affects the STL link and, when a result mesh is on screen, reloads it trimmed (or untrimmed). */
+export function setTrimToCad(on: boolean): void {
+  get().setTrimToCad(on);
+  if (get().resultStl) void loadResultMesh();
+}
+
+/** "Color by stress": fetches GET /runs/{id}/stress once per run; the density cells are recoloured by it. */
+export async function setColorByStress(on: boolean): Promise<void> {
+  const s = get();
+  if (!on) {
+    s.setColorByStress(false);
+    return;
+  }
+  const id = s.run.id;
+  if (!id) return;
+  s.setColorByStress(true);
+  if (s.stress?.runId === id) return;
+  s.setStressUi({ loading: true, error: null });
+  try {
+    const field = await api.runStress(id);
+    if (get().run.id === id) get().setStress({ runId: id, ...field });
+    get().setStressUi({ loading: false });
+  } catch (e) {
+    get().setColorByStress(false);
+    get().setStressUi({ loading: false, error: message(e) });
+  }
 }

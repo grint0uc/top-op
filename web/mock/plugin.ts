@@ -13,9 +13,12 @@ import {
   boxSTL,
   bboxOf,
   computeFacets,
+  type Facet,
+  facetInfo,
   isWatertight,
   type MeshGeom,
   meshBuffer,
+  numberBrepFaces,
   parseMultipart,
   parseSTL,
   StlError,
@@ -40,6 +43,51 @@ interface StoredMesh {
   info: S['MeshInfo'];
   geom: MeshGeom;
   adjacency: Uint32Array;
+  /** facet tables by angle (a STEP mesh has one: its B-rep faces ignore the angle) */
+  facetCache: Map<number, Facet[]>;
+}
+
+/** Same text as topop.core.step.INSTALL_HINT. */
+const STEP_HINT = 'STEP import needs OpenCascade: run `uv sync --extra step` (or `pip install "topop[step]"`) and retry';
+const isStepUpload = (name: string, data: Buffer): boolean => /\.(step|stp)$/i.test(name) || data.subarray(0, 12).toString('latin1').startsWith('ISO-10303');
+
+/** The mock cannot read STEP: an uploaded STEP file becomes the tessellated example bracket with fake B-rep faces. */
+function fakeStepGeometry(repoRoot: string): MeshGeom {
+  const file = resolve(repoRoot, 'examples', 'bracket.stl');
+  return parseSTL(existsSync(file) ? readFileSync(file) : boxSTL([0, 0, 0], [40, 30, 20]));
+}
+
+function facetsOf(m: StoredMesh, angleDeg: number): Facet[] {
+  const angle = m.info.source === 'step' ? 5 : angleDeg;
+  let f = m.facetCache.get(angle);
+  if (!f) {
+    f = computeFacets(m.geom, m.adjacency, angle);
+    if (m.info.source === 'step') numberBrepFaces(f);
+    m.facetCache.set(angle, f);
+  }
+  return f;
+}
+
+/** Smooth made-up von Mises field: high near the x = min root and the top, 0 in the padding ring (inactive). */
+function stressField(stats: VoxelStats, pad: number): Buffer {
+  const { nx, ny, nz } = stats;
+  const buf = Buffer.alloc(12 + 4 * nx * ny * nz);
+  buf.writeUInt32LE(nx, 0);
+  buf.writeUInt32LE(ny, 4);
+  buf.writeUInt32LE(nz, 8);
+  let o = 12;
+  for (let ix = 0; ix < nx; ix++) {
+    for (let iy = 0; iy < ny; iy++) {
+      for (let iz = 0; iz < nz; iz++, o += 4) {
+        const inPad = ix < pad || iy < pad || iz < pad || ix >= nx - pad || iy >= ny - pad || iz >= nz - pad;
+        if (inPad) continue;
+        const root = (1 - ix / nx) ** 2;
+        const ridge = 0.6 + 0.4 * Math.sin((Math.PI * (iy + 0.5)) / ny);
+        buf.writeFloatLE(2.5 * (0.1 + 0.9 * root) * ridge * (0.5 + 0.5 * ((iz + 0.5) / nz)), o);
+      }
+    }
+  }
+  return buf;
 }
 
 interface Ctx {
@@ -175,7 +223,7 @@ function resolveFake(sel: Selection, mesh: StoredMesh, project: ProjectIn): S['R
       fromFaces(sel.face_ids);
       break;
     case 'facets': {
-      const facets = computeFacets(g, mesh.adjacency, sel.angle_deg);
+      const facets = facetsOf(mesh, sel.angle_deg);
       const picked = facets.filter((f) => sel.facet_ids.includes(f.id));
       if (picked.length) {
         normal = [0, 0, 0].map((_, k) => picked.reduce((s, f) => s + f.normal[k]! * f.area, 0));
@@ -265,6 +313,9 @@ class MockRun {
   private timer: NodeJS.Timeout | null = null;
   private stats: VoxelStats;
   private pad: number;
+  get stressPad(): number {
+    return this.pad;
+  }
 
   constructor(
     id: string,
@@ -337,9 +388,12 @@ class MockRun {
         volume: round4(volfrac + (1 - volfrac) * Math.exp(-it / 6)),
         change: round4(0.2 * Math.exp(-it / 10)),
         t_iter: 0.15,
-        stress_max: null,
-        constraint: null,
+        // stress_max is reported for every run; the constraint only with a stress limit (violated early, met later)
+        stress_max: round4(1 + 2.8 * Math.exp(-it / 15)),
+        constraint: null as number | null,
       };
+      const limit = this.project.params?.stress_limit;
+      if (limit != null) rec.constraint = round4(rec.stress_max / limit - 1);
       this.info.history!.push(rec);
       this.send({ type: 'progress', ...rec });
       // the server sends a frame every `every` iterations plus a final one right before `done`
@@ -420,9 +474,12 @@ export function mockApi(): Plugin {
         if (!ct.startsWith('multipart/form-data')) throw new HttpError(422, 'multipart/form-data required');
         const file = parseMultipart(await c.body(), ct).find((p) => p.name === 'file');
         if (!file) throw new HttpError(422, 'form field "file" missing');
+        const name = file.filename ?? 'mesh.stl';
+        const step = isStepUpload(name, file.data);
+        if (step && /nostep/i.test(name)) throw new HttpError(400, STEP_HINT); // lets e2e see the "extra not installed" answer
         let geom: MeshGeom;
         try {
-          geom = parseSTL(file.data);
+          geom = step ? fakeStepGeometry(repoRoot) : parseSTL(file.data);
         } catch (e) {
           throw new HttpError(400, e instanceof StlError ? e.message : 'could not parse mesh');
         }
@@ -431,15 +488,17 @@ export function mockApi(): Plugin {
         const watertight = isWatertight(geom);
         const info: S['MeshInfo'] = {
           id,
-          name: file.filename ?? 'mesh.stl',
+          name,
           n_faces: geom.tris.length / 3,
           n_vertices: geom.positions.length / 3,
           bbox: bboxOf(geom),
           is_watertight: watertight,
-          source: 'mesh',
+          source: step ? 'step' : 'mesh',
           volume: watertight ? volumeOf(geom) : null,
         };
-        meshes.set(id, { info, geom, adjacency: adjacencyPairs(geom) });
+        const stored: StoredMesh = { info, geom, adjacency: adjacencyPairs(geom), facetCache: new Map() };
+        if (step) info.n_brep_faces = facetsOf(stored, 5).length;
+        meshes.set(id, stored);
         json(c.res, info);
       },
     ],
@@ -463,8 +522,19 @@ export function mockApi(): Plugin {
       (c) => {
         const m = meshOf(c.params[0]!);
         const angle = Number(c.url.searchParams.get('angle_deg') ?? 5);
-        const all = computeFacets(m.geom, m.adjacency, angle);
-        json(c.res, { mesh_id: m.info.id, angle_deg: angle, facets: all.slice(0, 300), n_facets_total: all.length });
+        const all = facetsOf(m, angle);
+        json(c.res, { mesh_id: m.info.id, angle_deg: angle, facets: all.slice(0, 300).map(facetInfo), n_facets_total: all.length });
+      },
+    ],
+    [
+      'GET',
+      /^\/api\/meshes\/([^/]+)\/facets\/(\d+)\/faces$/,
+      (c) => {
+        const m = meshOf(c.params[0]!);
+        const angle = Number(c.url.searchParams.get('angle_deg') ?? 5);
+        const facet = facetsOf(m, angle).find((f) => f.id === Number(c.params[1]));
+        if (!facet) throw new HttpError(404, `unknown facet id ${c.params[1]} (mesh has ${facetsOf(m, angle).length} facets)`);
+        json(c.res, { face_ids: facet.faces });
       },
     ],
     [
@@ -553,12 +623,25 @@ export function mockApi(): Plugin {
         finished(r);
         const [lo, hi] = worldBBox(designMesh(r.project), r.project.design_mesh?.transform);
         const shrink = lo.map((v, k) => (hi[k]! - v) * 0.2);
+        // `trim=true` would intersect with the CAD; the mock has no CAD kernel and says so, as the server does when a trim falls back
+        const warn: Record<string, string> =
+          c.url.searchParams.get('trim') === 'true' ? { 'X-Topop-Warnings': 'mock: trim to CAD not applied (the mock has no CAD kernel); the result is untrimmed' } : {};
         bin(
           c.res,
           boxSTL(lo.map((v, k) => v + shrink[k]!), hi.map((v, k) => v - shrink[k]!)),
           'model/stl',
-          { 'Content-Disposition': `attachment; filename="${r.info.id}.stl"` },
+          { 'Content-Disposition': `attachment; filename="${r.info.id}.stl"`, ...warn },
         );
+      },
+    ],
+    [
+      'GET',
+      /^\/api\/runs\/([^/]+)\/stress$/,
+      (c) => {
+        const r = runOf(c.params[0]!);
+        const { id, status } = r.info;
+        if (status !== 'done' && status !== 'cancelled') throw new HttpError(409, `run ${id} is ${status}; no stress field yet`);
+        bin(c.res, stressField(r.info.stats!, r.stressPad), 'application/octet-stream');
       },
     ],
     [

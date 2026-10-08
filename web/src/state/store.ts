@@ -15,6 +15,7 @@ import type {
   RunInfo,
   RunStatus,
   Selection,
+  StressField,
   SupportSpec,
   VoxelStats,
 } from '../api/client';
@@ -38,10 +39,9 @@ export interface Prim {
 /**
  * ProjectIn with every optional section present.
  *
- * Transforms: `ref_models[].transform` is the full column-major matrix (translation, rotation AND scale) applied
- * to the reference mesh's own coordinates. `design_mesh.transform` must stay the identity: the viewport draws the
- * design mesh untransformed and face selections index the raw mesh, so a non-identity design transform (possible
- * in a hand-written or agent-written project.json) is unsupported in the viewport and only reported on import.
+ * Transforms: `ref_models[].transform` and `design_mesh.transform` are the full column-major matrix (translation,
+ * rotation AND scale) applied to the mesh's own coordinates. The viewport draws the design mesh through its matrix, so
+ * picking, painting and markers work in world space; face ids still index the raw mesh.
  */
 export interface ProjectDoc {
   name: string;
@@ -73,7 +73,7 @@ export interface LoadedRun {
   onServer: boolean | null; // null while checking
 }
 
-export type ActiveItem = { kind: 'load' | 'support' | 'ref'; id: string } | null;
+export type ActiveItem = { kind: 'load' | 'support' | 'ref' | 'design'; id: string } | null;
 export type RunPhase = 'idle' | RunStatus;
 
 export interface RunState {
@@ -92,6 +92,11 @@ export interface VoxelState {
   stats: VoxelStats | null;
   loading: boolean;
   error: string | null;
+}
+
+/** A fetched /stress field and the run it belongs to. */
+export interface StressState extends StressField {
+  runId: string;
 }
 
 export interface PreviewState {
@@ -157,6 +162,8 @@ export interface State {
   queryUi: { loading: boolean; error: string | null };
   /** GET /facets responses keyed `${mesh_id}@${angle_deg}`. */
   facetCache: Record<string, MeshFacets>;
+  /** GET .../facets/{id}/faces responses keyed `${mesh_id}@${angle_deg}#${facet_id}` (exact triangle ids). */
+  facetFaceCache: Record<string, number[]>;
   /** Faces drawn in the hover colour (facet row under the pointer). */
   hoverFaces: number[];
   loadedRun: LoadedRun | null;
@@ -169,6 +176,13 @@ export interface State {
   ghostDesign: boolean;
   densityInfo: { mode: 'none' | 'instanced' | 'points'; count: number; it: number };
   resultStl: ArrayBuffer | null;
+  /** `X-Topop-Warnings` of the last result mesh load */
+  resultWarnings: string | null;
+  /** apply `trim=true` (intersect with the original CAD) to the STL download and the result mesh */
+  trimToCad: boolean;
+  colorByStress: boolean;
+  stress: StressState | null;
+  stressUi: { loading: boolean; error: string | null };
   busy: string | null;
   notice: Notice | null;
 
@@ -191,6 +205,7 @@ export interface State {
   setQueryForm: (f: QueryForm) => void;
   setQueryUi: (patch: Partial<State['queryUi']>) => void;
   putFacets: (key: string, facets: MeshFacets) => void;
+  putFacetFaces: (key: string, ids: number[]) => void;
   setHoverFaces: (ids: number[]) => void;
   setLoadedRun: (r: LoadedRun | null) => void;
   setActiveItem: (a: ActiveItem) => void;
@@ -206,6 +221,8 @@ export interface State {
   setProjectMeta: (m: ProjectMeta | null) => void;
   addMesh: (entry: MeshEntry) => void;
   setDesignMesh: (meshId: string) => void;
+  /** Full column-major matrix of the design mesh (MeshRef.transform). */
+  setDesignTransform: (matrix: number[]) => void;
   /**
    * The design mesh was replaced by a different file (ids are content hashes). Face and facet selections index the
    * old mesh and are dropped; normal/plane/primitive selections are geometry-agnostic and follow the new id.
@@ -232,7 +249,11 @@ export interface State {
   setSmoothIterations: (n: number) => void;
   setGhostDesign: (b: boolean) => void;
   setDensityInfo: (i: State['densityInfo']) => void;
-  setResultStl: (b: ArrayBuffer | null) => void;
+  setResultStl: (b: ArrayBuffer | null, warnings?: string | null) => void;
+  setTrimToCad: (b: boolean) => void;
+  setStress: (s: StressState | null) => void;
+  setColorByStress: (b: boolean) => void;
+  setStressUi: (patch: Partial<State['stressUi']>) => void;
 }
 
 const persisted = loadPersisted();
@@ -254,6 +275,7 @@ export const useStore = create<State>()((set, get) => ({
   queryForm: defaultQueryForm(),
   queryUi: { loading: false, error: null },
   facetCache: {},
+  facetFaceCache: {},
   hoverFaces: [],
   loadedRun: null,
 
@@ -264,6 +286,11 @@ export const useStore = create<State>()((set, get) => ({
   ghostDesign: true,
   densityInfo: { mode: 'none', count: 0, it: 0 },
   resultStl: null,
+  resultWarnings: null,
+  trimToCad: false,
+  colorByStress: false,
+  stress: null,
+  stressUi: { loading: false, error: null },
   busy: null,
   notice: persisted?.project.design_mesh
     ? {
@@ -305,6 +332,7 @@ export const useStore = create<State>()((set, get) => ({
   setQueryForm: (queryForm) => set({ queryForm }),
   setQueryUi: (patch) => set((s) => ({ queryUi: { ...s.queryUi, ...patch } })),
   putFacets: (key, facets) => set((s) => ({ facetCache: { ...s.facetCache, [key]: facets } })),
+  putFacetFaces: (key, ids) => set((s) => ({ facetFaceCache: { ...s.facetFaceCache, [key]: ids } })),
   setHoverFaces: (hoverFaces) => set((s) => (hoverFaces.length === 0 && s.hoverFaces.length === 0 ? s : { hoverFaces })),
   setLoadedRun: (loadedRun) => set({ loadedRun }),
   setActiveItem: (activeItem) => set({ activeItem }),
@@ -321,6 +349,7 @@ export const useStore = create<State>()((set, get) => ({
       queryForm: defaultQueryForm(),
       queryUi: { loading: false, error: null },
       facetCache: {},
+      facetFaceCache: {},
       hoverFaces: [],
       loadedRun: null,
       activeItem: null,
@@ -328,6 +357,10 @@ export const useStore = create<State>()((set, get) => ({
       voxel: { stats: null, loading: false, error: null },
       run: idleRun(),
       resultStl: null,
+      resultWarnings: null,
+      colorByStress: false,
+      stress: null,
+      stressUi: { loading: false, error: null },
       notice: null,
     }),
   setProjectDoc: (project) =>
@@ -343,6 +376,10 @@ export const useStore = create<State>()((set, get) => ({
       voxel: { stats: null, loading: false, error: null },
       run: idleRun(),
       resultStl: null,
+      resultWarnings: null,
+      colorByStress: false,
+      stress: null,
+      stressUi: { loading: false, error: null },
       densityInfo: { mode: 'none', count: 0, it: 0 },
     }),
   setProjectName: (name) => set((s) => ({ project: { ...s.project, name } })),
@@ -362,6 +399,15 @@ export const useStore = create<State>()((set, get) => ({
       hoverFaces: [],
       preview: null,
     })),
+  setDesignTransform: (transform) =>
+    set((s) =>
+      s.project.design_mesh
+        ? {
+            project: { ...s.project, design_mesh: { ...s.project.design_mesh, transform: [...transform] } },
+            preview: null, // resolved points were computed for the old pose
+          }
+        : s,
+    ),
   adoptDesignMesh: (oldId, newId) => {
     let dropped = 0;
     const follow = <T extends { selection: Selection }>(items: T[]): T[] =>
@@ -411,7 +457,16 @@ export const useStore = create<State>()((set, get) => ({
     })),
 
   setVoxel: (patch) => set((s) => ({ voxel: { ...s.voxel, ...patch } })),
-  resetRun: () => set({ run: idleRun(), resultStl: null, densityInfo: { mode: 'none', count: 0, it: 0 } }),
+  resetRun: () =>
+    set({
+      run: idleRun(),
+      resultStl: null,
+      resultWarnings: null,
+      colorByStress: false,
+      stress: null,
+      stressUi: { loading: false, error: null },
+      densityInfo: { mode: 'none', count: 0, it: 0 },
+    }),
   patchRun: (patch) => set((s) => ({ run: { ...s.run, ...patch } })),
   pushProgress: (rec) => set((s) => ({ run: { ...s.run, history: [...s.run.history, rec] } })),
   pushDensity: (f) => set((s) => ({ run: { ...s.run, densityFrame: f, densityFrames: s.run.densityFrames + 1 } })),
@@ -419,7 +474,11 @@ export const useStore = create<State>()((set, get) => ({
   setSmoothIterations: (smoothIterations) => set({ smoothIterations }),
   setGhostDesign: (ghostDesign) => set({ ghostDesign }),
   setDensityInfo: (densityInfo) => set({ densityInfo }),
-  setResultStl: (resultStl) => set({ resultStl }),
+  setResultStl: (resultStl, warnings = null) => set({ resultStl, resultWarnings: resultStl ? warnings : null }),
+  setTrimToCad: (trimToCad) => set({ trimToCad }),
+  setStress: (stress) => set({ stress }),
+  setColorByStress: (colorByStress) => set({ colorByStress }),
+  setStressUi: (patch) => set((s) => ({ stressUi: { ...s.stressUi, ...patch } })),
 }));
 
 // Exposed for Playwright (e2e/*.spec.ts reads window.__topop.getState()); never in production builds.

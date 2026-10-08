@@ -65,6 +65,50 @@ export function NumField({ value, onChange, min, max, step = 'any', disabled, te
   );
 }
 
+interface OptNumFieldProps {
+  value: number | null;
+  onChange: (v: number | null) => void;
+  placeholder?: string;
+  testId?: string;
+  title?: string;
+}
+
+/** Positive number where an empty box means "off" (null), e.g. the stress limit. */
+export function OptNumField({ value, onChange, placeholder, testId, title }: OptNumFieldProps) {
+  const show = (v: number | null) => (v === null ? '' : fmt(v));
+  const [text, setText] = useState(show(value));
+  const focused = useRef(false);
+  useEffect(() => {
+    if (!focused.current) setText(show(value));
+  }, [value]);
+  return (
+    <input
+      type="number"
+      className="num"
+      value={text}
+      min={0}
+      step="any"
+      placeholder={placeholder}
+      title={title}
+      data-testid={testId}
+      onFocus={() => (focused.current = true)}
+      onBlur={() => {
+        focused.current = false;
+        setText(show(value));
+      }}
+      onChange={(e) => {
+        setText(e.target.value);
+        if (e.target.value.trim() === '') {
+          onChange(null);
+          return;
+        }
+        const n = e.target.valueAsNumber;
+        if (Number.isFinite(n) && n > 0) onChange(n);
+      }}
+    />
+  );
+}
+
 export function Field({ label, children, hint }: { label: string; children: ReactNode; hint?: string }) {
   return (
     <label className="field" title={hint}>

@@ -170,9 +170,23 @@ export interface Facet {
   normal: number[];
   centroid: number[];
   bbox: number[][];
+  kind: 'plane' | 'cylinder' | 'other';
+  axis: number[] | null;
+  radius: number | null;
+  brep_face: number | null;
+  /** exact triangle ids (GET /facets/{id}/faces); not part of the wire facet */
+  faces: number[];
+  /** lowest triangle id of the group: discovery order, used for the fake B-rep face numbering */
+  seed: number;
 }
 
-/** Group faces whose normal is within angle_deg of the seed face normal, BFS over the adjacency. */
+/** The wire form of a facet (FacetInfo): everything but the face list. */
+export function facetInfo(f: Facet): Omit<Facet, 'faces' | 'seed'> {
+  const { faces: _faces, seed: _seed, ...info } = f;
+  return info;
+}
+
+/** Group faces whose normal is within angle_deg of the seed face normal, BFS over the adjacency; curved strips are merged into cylinders. */
 export function computeFacets(g: MeshGeom, adj: Uint32Array, angleDeg: number): Facet[] {
   const nT = g.tris.length / 3;
   const nbrs: number[][] = Array.from({ length: nT }, () => []);
@@ -227,11 +241,116 @@ export function computeFacets(g: MeshGeom, adj: Uint32Array, angleDeg: number): 
       normal: nsum.map((v) => v / nl),
       centroid: csum.map((v) => v / (area || 1)),
       bbox: [lo, hi],
+      kind: 'plane',
+      axis: null,
+      radius: null,
+      brep_face: null,
+      faces: [...queue].sort((a, b) => a - b),
+      seed: s,
     });
   }
-  out.sort((a, b) => b.area - a.area);
-  out.forEach((f, i) => (f.id = i));
+  const merged = mergeCurved(g, nbrs, out);
+  merged.sort((a, b) => b.area - a.area);
+  merged.forEach((f, i) => (f.id = i));
+  return merged;
+}
+
+/** B-rep face numbers for a STEP mock: the order the faces were discovered in, which is not the area order of the ids. */
+export function numberBrepFaces(facets: Facet[]): Facet[] {
+  [...facets].sort((a, b) => a.seed - b.seed).forEach((f, i) => (f.brep_face = i));
+  return facets;
+}
+
+/**
+ * Small facets that touch each other with a smoothly turning normal (a tessellated hole or fillet) become one facet:
+ * a cylinder when the strip is perpendicular to a coordinate axis (radius from a circle fit), otherwise `other`.
+ */
+function mergeCurved(g: MeshGeom, nbrs: number[][], facets: Facet[]): Facet[] {
+  const owner = new Int32Array(g.tris.length / 3);
+  facets.forEach((f, i) => f.faces.forEach((t) => (owner[t] = i)));
+  const small = facets.map((f) => f.n_faces <= 4);
+  const parent = facets.map((_, i) => i);
+  const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i]!)));
+  const cosSmooth = Math.cos((12 * Math.PI) / 180);
+  for (let t = 0; t < owner.length; t++) {
+    for (const u of nbrs[t]!) {
+      const a = owner[t]!;
+      const b = owner[u]!;
+      if (a === b || !small[a] || !small[b]) continue;
+      const d = g.normals[t * 3]! * g.normals[u * 3]! + g.normals[t * 3 + 1]! * g.normals[u * 3 + 1]! + g.normals[t * 3 + 2]! * g.normals[u * 3 + 2]!;
+      if (d >= cosSmooth) parent[find(a)] = find(b);
+    }
+  }
+  const groups = new Map<number, number[]>();
+  facets.forEach((_, i) => groups.set(find(i), [...(groups.get(find(i)) ?? []), i]));
+  const out: Facet[] = [];
+  for (const members of groups.values()) {
+    if (members.length < 6) {
+      for (const i of members) out.push(facets[i]!);
+      continue;
+    }
+    const parts = members.map((i) => facets[i]!);
+    const faces = parts.flatMap((f) => f.faces).sort((a, b) => a - b);
+    const area = parts.reduce((s, f) => s + f.area, 0);
+    const centroid = [0, 1, 2].map((k) => parts.reduce((s, f) => s + f.centroid[k]! * f.area, 0) / area);
+    const bbox = [0, 1, 2].map((k) => Math.min(...parts.map((f) => f.bbox[0]![k]!)));
+    const bbox2 = [0, 1, 2].map((k) => Math.max(...parts.map((f) => f.bbox[1]![k]!)));
+    // axis: the coordinate axis the face normals are most perpendicular to
+    const perp = [0, 1, 2].map((a) => faces.reduce((s, t) => s + g.areas[t]! * g.normals[t * 3 + a]! ** 2, 0) / area);
+    const axis = perp.indexOf(Math.min(...perp));
+    let kind: Facet['kind'] = 'other';
+    let radius: number | null = null;
+    let axisVec: number[] | null = null;
+    if (perp[axis]! < 0.02) {
+      const [u, v] = [0, 1, 2].filter((k) => k !== axis) as [number, number];
+      const pts = new Set<number>();
+      faces.forEach((t) => [0, 1, 2].forEach((c) => pts.add(g.tris[t * 3 + c]!)));
+      radius = fitCircle([...pts].map((i) => [g.positions[i * 3 + u]!, g.positions[i * 3 + v]!]));
+      kind = 'cylinder';
+      axisVec = [0, 0, 0].map((_, k) => (k === axis ? 1 : 0));
+    }
+    out.push({
+      id: 0,
+      n_faces: faces.length,
+      area,
+      normal: [0, 0, 0],
+      centroid,
+      bbox: [bbox, bbox2],
+      kind,
+      axis: axisVec,
+      radius,
+      brep_face: null,
+      faces,
+      seed: Math.min(...parts.map((f) => f.seed)),
+    });
+  }
   return out;
+}
+
+/** Kasa least-squares circle through 2D points; returns the radius. */
+function fitCircle(pts: number[][]): number {
+  let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, sxz = 0, syz = 0, sz = 0;
+  for (const [x, y] of pts as [number, number][]) {
+    const z = x * x + y * y;
+    sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; sxz += x * z; syz += y * z; sz += z;
+  }
+  const n = pts.length;
+  // solve [sxx sxy sx; sxy syy sy; sx sy n] [D E F]^T = -[sxz syz sz]^T  (x^2 + y^2 + D x + E y + F = 0)
+  const m = [
+    [sxx, sxy, sx],
+    [sxy, syy, sy],
+    [sx, sy, n],
+  ];
+  const b = [-sxz, -syz, -sz];
+  const det3 = (a: number[][]) =>
+    a[0]![0]! * (a[1]![1]! * a[2]![2]! - a[1]![2]! * a[2]![1]!) -
+    a[0]![1]! * (a[1]![0]! * a[2]![2]! - a[1]![2]! * a[2]![0]!) +
+    a[0]![2]! * (a[1]![0]! * a[2]![1]! - a[1]![1]! * a[2]![0]!);
+  const d = det3(m);
+  if (Math.abs(d) < 1e-12) return 0;
+  const col = (k: number) => m.map((row, r) => row.map((v, c) => (c === k ? b[r]! : v)));
+  const [D, E, F] = [det3(col(0)) / d, det3(col(1)) / d, det3(col(2)) / d];
+  return Math.sqrt(Math.max(0, (D * D) / 4 + (E * E) / 4 - F));
 }
 
 export function boxSTL(lo: number[], hi: number[]): Buffer {

@@ -11,16 +11,17 @@ export function DomainPanel() {
   const loaded = useStore((s) => designEntry(s)?.info.id ?? null);
   const grid = useStore((s) => s.project.grid);
   const refs = useStore((s) => s.project.ref_models);
+  const designTransform = useStore((s) => s.project.design_mesh?.transform);
   const maxIter = useStore((s) => s.project.params.max_iter);
   const voxel = useStore((s) => s.voxel);
   const setGrid = useStore((s) => s.setGrid);
 
-  // debounced: every change to resolution/padding/ref placement re-voxelizes on the server
+  // debounced: every change to resolution/padding/ref placement/design pose re-voxelizes on the server
   useEffect(() => {
     if (!loaded) return;
     const t = setTimeout(() => void runVoxelize(), 400);
     return () => clearTimeout(t);
-  }, [loaded, grid, refs]);
+  }, [loaded, grid, refs, designTransform]);
 
   const st = voxel.stats;
   const level = !st ? 'ok' : st.n_active > RED_ACTIVE ? 'red' : st.n_active > AMBER_ACTIVE ? 'amber' : 'ok';
