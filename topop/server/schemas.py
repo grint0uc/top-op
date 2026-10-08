@@ -209,6 +209,8 @@ class RunInfo(BaseModel):
     history: list[IterationRecord] = Field(default_factory=list)
     stats: VoxelStats | None = None
     error: str | None = None
+    outcome: Literal["converged", "max_iter", "cancelled", "error"] | None = None
+    message: str | None = None  # e.g. "converged after 37 iterations"
 
 
 # ---- WebSocket messages (JSON text frames). Density frames are BINARY frames, see CLAUDE.md. ----

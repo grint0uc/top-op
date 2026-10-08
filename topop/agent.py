@@ -519,6 +519,8 @@ class Session:
             rec.info.status = status
             rec.info.finished_at = now_iso()
             rec.message = message
+            rec.info.message = message
+            rec.info.outcome = outcome
             if status == "error":
                 rec.info.error = message or "run failed"
             if rho is not None:

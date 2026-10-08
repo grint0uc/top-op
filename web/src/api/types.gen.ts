@@ -744,6 +744,16 @@ export interface components {
              * @default null
              */
             error: string | null;
+            /**
+             * Outcome
+             * @default null
+             */
+            outcome: ("converged" | "max_iter" | "cancelled" | "error") | null;
+            /**
+             * Message
+             * @default null
+             */
+            message: string | null;
         };
         /** SupportSpec */
         SupportSpec: {

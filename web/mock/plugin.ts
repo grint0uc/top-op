@@ -287,6 +287,8 @@ class MockRun {
       history: [],
       stats,
       error: null,
+      outcome: null,
+      message: null,
     };
   }
 
@@ -351,6 +353,8 @@ class MockRun {
     this.timer = null;
     this.info.status = status;
     this.info.finished_at = new Date().toISOString();
+    this.info.outcome = status === 'done' ? 'max_iter' : 'cancelled';
+    this.info.message = status === 'done' ? `stopped at max_iter=${this.info.history?.length ?? 0}` : 'cancelled';
     this.send({ type: status, message: status === 'done' ? `stopped at max_iter=${this.info.history?.length ?? 0}` : 'cancelled', run: this.info });
     for (const ws of this.clients) ws.close(1000);
     this.clients.clear();

@@ -122,10 +122,15 @@ class RunManager:
         result = optimize(built.problem, run_params(params), callback, cancel=rec.cancel.is_set)
         status = RESULT_STATUS.get(result.status, "error")
         rho = result.rho if result.history else None
-        self._finish(rec, status, result.message or None, rho=rho)
+        self._finish(rec, status, result.message or None, rho=rho, outcome=result.status)
 
     def _finish(
-        self, rec: RunRecord, status: str, message: str | None, rho: np.ndarray | None = None
+        self,
+        rec: RunRecord,
+        status: str,
+        message: str | None,
+        rho: np.ndarray | None = None,
+        outcome: str | None = None,
     ) -> None:
         final_frame = None
         with rec.lock:
@@ -134,6 +139,8 @@ class RunManager:
             rec.info.status = status
             rec.info.finished_at = now_iso()
             rec.message = message
+            rec.info.message = message
+            rec.info.outcome = outcome or ("cancelled" if status == "cancelled" else "error")
             if status == "error":
                 rec.info.error = message or "run failed"
             if rho is not None:
