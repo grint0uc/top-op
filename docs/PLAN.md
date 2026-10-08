@@ -160,18 +160,19 @@ GET  /api/meshes/{id}/preview.png?view=iso → offscreen render (matplotlib) so 
 GET  /api/runs/{id}/preview.png?threshold=0.5&view=iso → render of the result
 
 POST /api/projects               ProjectIn → Project{id,...}      (full state document, see below)
+GET  /api/projects/{id}          → Project          GET /api/projects → list[Project]
 PUT  /api/projects/{id}          Project  → Project
 POST /api/projects/{id}/voxelize → VoxelStats{nx,ny,nz,h,n_active,n_nodes,n_dof,est_bytes,est_sec_per_iter,warnings[]}
 POST /api/projects/{id}/resolve-selection  Selection → ResolvedNodes{count, xyz: float32 list (capped at 5000 for preview)}
 
 POST /api/runs                   {project_id} → Run{id,status}
 WS   /api/runs/{id}/stream       → ProgressMsg{type:"progress", it, c, vol, change, t_iter} every iteration
-                                   + DensityMsg (binary: [u32 it][u8 rho*255 ... nx*ny*nz]) every k iterations (k=1 for ≤50k elems)
+                                   + DensityMsg (binary, little-endian: [u32 it][u32 nx][u32 ny][u32 nz][u8 rho*255 ...] C-order) every k iterations (k=1 for ≤50k elems)
                                    + {type:"done"|"error"|"cancelled", ...}
-POST /api/runs/{id}/cancel
+POST /api/runs/{id}/cancel       GET /api/runs/{id} → RunInfo      GET /api/runs → list[RunInfo]
 GET  /api/runs/{id}/result.stl?threshold=0.5&smooth=3
 GET  /api/runs/{id}/result.vti   GET /api/runs/{id}/result.npz
-GET  /api/runs/{id}/project.json (project + params + final stats, reloadable)
+GET  /api/runs/{id}/project.json → RunExport{project, run} (reloadable / re-runnable headlessly)
 ```
 
 Project document (pydantic, mirrored to TS via openapi-typescript):

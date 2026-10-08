@@ -1,7 +1,8 @@
 """API contract. pydantic v2. Generates OpenAPI -> web/src/api/types.gen.ts. See CLAUDE.md for conventions."""
+
 from __future__ import annotations
 
-from typing import Annotated, Literal, Union
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
@@ -24,6 +25,7 @@ class MeshInfo(BaseModel):
 
 class FaceSelection(BaseModel):
     """Explicit triangle ids (what the GUI produces by clicking/painting)."""
+
     kind: Literal["faces"] = "faces"
     mesh_id: str
     face_ids: list[int]
@@ -31,6 +33,7 @@ class FaceSelection(BaseModel):
 
 class FacetSelection(BaseModel):
     """Coplanar facet ids from GET /api/meshes/{id}/facets (agent-friendly, stable per angle_deg)."""
+
     kind: Literal["facets"] = "facets"
     mesh_id: str
     facet_ids: list[int]
@@ -39,6 +42,7 @@ class FacetSelection(BaseModel):
 
 class NormalSelection(BaseModel):
     """All surface faces whose normal is within angle_deg of `direction`, optionally clipped to a world bbox."""
+
     kind: Literal["normal"] = "normal"
     mesh_id: str
     direction: Vec3
@@ -48,6 +52,7 @@ class NormalSelection(BaseModel):
 
 class PlaneSelection(BaseModel):
     """Surface grid nodes within `tol` of the plane (no mesh needed). Agent-friendly: 'fix the plane x=0'."""
+
     kind: Literal["plane"] = "plane"
     point: Vec3
     normal: Vec3
@@ -62,7 +67,7 @@ class PrimitiveSelection(BaseModel):
 
 
 Selection = Annotated[
-    Union[FaceSelection, FacetSelection, NormalSelection, PlaneSelection, PrimitiveSelection],
+    FaceSelection | FacetSelection | NormalSelection | PlaneSelection | PrimitiveSelection,
     Field(discriminator="kind"),
 ]
 
@@ -215,7 +220,14 @@ class StatusMsg(BaseModel):
     run: RunInfo | None = None
 
 
-WsMessage = Annotated[Union[ProgressMsg, StatusMsg], Field(discriminator="type")]
+WsMessage = Annotated[ProgressMsg | StatusMsg, Field(discriminator="type")]
+
+
+class RunExport(BaseModel):
+    """GET /api/runs/{id}/project.json: everything needed to reload or re-run headlessly."""
+
+    project: Project
+    run: RunInfo
 
 
 class ErrorResponse(BaseModel):

@@ -1,8 +1,10 @@
 """Problem definition shared by core, server and CLI. Pure numpy. See CLAUDE.md for index conventions."""
+
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import Literal
 
 import numpy as np
 
@@ -79,9 +81,7 @@ class Grid:
         return np.ravel_multi_index((ix, iy, iz), self.shape)
 
     @classmethod
-    def from_bounds(
-        cls, bounds: np.ndarray, elements_along_longest: int, padding: int = 1
-    ) -> "Grid":
+    def from_bounds(cls, bounds: np.ndarray, elements_along_longest: int, padding: int = 1) -> Grid:
         """Fit a grid around (2,3) bounds; `padding` empty voxels on every side."""
         bounds = np.asarray(bounds, dtype=np.float64)
         extent = bounds[1] - bounds[0]

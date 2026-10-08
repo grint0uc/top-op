@@ -19,7 +19,7 @@ Full design: `docs/PLAN.md`. Read it before touching anything non-trivial.
 - `active[ix,iy,iz]` bool: element exists. `passive` int8: 0 free, 1 forced solid, -1 forced void. Passive elements are assembled but excluded from the volume constraint and never updated.
 - Transforms over the wire: 16 floats, **column-major** (three.js `Matrix4.toArray()`); server: `np.asarray(t).reshape(4,4).T` gives the row-major matrix.
 - Primitives: box = unit cube centered at origin scaled by `size`; sphere radius `size[0]`; cylinder axis = local **Y**, radius `size[0]`, height `size[1]` (three.js `CylinderGeometry` convention). Then `transform` applied.
-- Density frames over WebSocket (binary): `u32 it, u32 nx, u32 ny, u32 nz, u8[nx*ny*nz]` C-order, value = round(rho*255). Inactive elements = 0.
+- Density frames over WebSocket (binary): `u32 it, u32 nx, u32 ny, u32 nz, u8[nx*ny*nz]` little-endian, C-order, value = round(rho*255). Inactive elements = 0.
 - Selections (`schemas.Selection`): `faces` (GUI clicks), `facets` (coplanar groups from `/facets`), `normal` (direction + angle), `plane` (grid nodes near a plane), `box|sphere|cylinder`. All resolve server-side to full-grid node ids in `core/selection.py`. Agents (Claude) use the non-`faces` kinds.
 - Agent interface: `topop run case.json` (case = `ProjectIn` JSON with `path` instead of `mesh_id`), `topop describe mesh.stl` (facet table), `topop mcp` (MCP server over the same API). Everything the GUI can do must be reachable through these.
 - Units: none enforced. Whatever the mesh is in. Compliance reported in those units.

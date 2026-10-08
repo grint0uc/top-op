@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "topop"
+dynamic = ["version"]
+description = "3D topology optimization tool: voxel SIMP core, FastAPI server, Three.js frontend"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pyamg",
+    "trimesh",
+    "rtree",
+    "manifold3d",
+    "scikit-image",
+    "networkx",
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "python-multipart",
+    "websockets",
+    "matplotlib",
+    "mcp",
+]
+
+[project.optional-dependencies]
+accel = ["embreex"]
+
+[project.scripts]
+topop = "topop.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-timeout",
+    "httpx",
+    "ruff",
+    "openapi-spec-validator",
+]
+
+[tool.hatch.version]
+path = "topop/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["topop"]
+# built frontend is gitignored but must ship in the wheel
+artifacts = ["topop/server/static/**"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: tests taking more than ~10 s"]
+timeout = 300

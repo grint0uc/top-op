@@ -1,0 +1,33 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# node
+node_modules/
+web/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/
+web/blob-report/
+web/playwright/.cache/
+web/*.tsbuildinfo
+*.log
+
+# build output / generated
+topop/server/static/
+openapi.json
+*.npz
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
