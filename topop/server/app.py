@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -11,15 +14,32 @@ from pydantic import BaseModel, TypeAdapter
 
 from topop import __version__
 from topop.server import routes_meshes, routes_projects, routes_runs
+from topop.server.jobs import RunManager
 from topop.server.schemas import Selection, WsMessage
+from topop.server.store import Store
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Fresh store (data dir from TOPOP_DATA_DIR) and run manager; cancel running jobs on exit."""
+    store = Store()
+    runs = RunManager(store)
+    app.state.store, app.state.runs = store, runs
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(runs.shutdown)
+        app.state.store = app.state.runs = None
+
 
 app = FastAPI(
     title="top-op",
     version=__version__,
     # one schema per model (no Foo-Input / Foo-Output split) so types.gen.ts names stay stable
     separate_input_output_schemas=False,
+    lifespan=lifespan,
 )
 
 

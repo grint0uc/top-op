@@ -1,12 +1,63 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, Response, WebSocket
+import asyncio
+import contextlib
+from typing import Annotated
 
-from topop.server.schemas import ErrorResponse, RunCreate, RunExport, RunInfo
+import numpy as np
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocket
+from starlette.websockets import WebSocketDisconnect
+
+from topop.core.export import density_to_mesh, render_png, to_npz_bytes, to_stl_bytes, to_vti_bytes
+from topop.core.problem import Grid
+from topop.server.build import ProblemInvalid, build_problem
+from topop.server.jobs import CLOSE, RunManager, get_runs, runs_of
+from topop.server.schemas import (
+    ErrorResponse,
+    RunCreate,
+    RunExport,
+    RunInfo,
+    StatusMsg,
+    VoxelStats,
+)
+from topop.server.store import NotFoundError, RunRecord, Store, get_store, store_of
 
 router = APIRouter(prefix="/api", tags=["runs"])
 
 NOT_FOUND = {404: {"model": ErrorResponse}}
+DESIGN_RGB = (0.75, 0.75, 0.78)
+RESULT_RGB = (0.95, 0.55, 0.15)
+PREVIEW_SMOOTH = 3
+
+StoreDep = Annotated[Store, Depends(get_store)]
+RunsDep = Annotated[RunManager, Depends(get_runs)]
+_GONE = object()  # queue marker: the client disconnected
+
+
+def _run(store: Store, run_id: str) -> RunRecord:
+    try:
+        return store.get_run(run_id)
+    except NotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+async def _result(
+    store: Store, run_id: str
+) -> tuple[RunRecord, tuple[np.ndarray, Grid, np.ndarray, np.ndarray]]:
+    """(record, (rho, grid, active, passive)); 409 unless the run finished with a result."""
+    rec = _run(store, run_id)
+    status = rec.info.status
+    if status not in ("done", "cancelled"):
+        raise HTTPException(409, f"run {run_id} is {status}; no result to export")
+    res = await asyncio.to_thread(store.run_result, rec)
+    if res is None:
+        raise HTTPException(409, f"run {run_id} has no density result")
+    return rec, res
+
+
+def _attachment(data: bytes, media_type: str, filename: str) -> Response:
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(data, media_type=media_type, headers=headers)
 
 
 def _binary(media_type: str, description: str) -> dict:
@@ -25,8 +76,27 @@ def _binary(media_type: str, description: str) -> dict:
     responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
     summary="Start a run for a project",
 )
-async def create_run(body: RunCreate) -> RunInfo:
-    raise HTTPException(501, "not implemented")
+async def create_run(body: RunCreate, store: StoreDep, runs: RunsDep) -> RunInfo:
+    try:
+        project = store.get_project(body.project_id)
+    except NotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+    def build():
+        domain = store.get_domain(project)
+        return build_problem(project, domain.meshes_world, domain)
+
+    try:
+        built = await asyncio.to_thread(build)
+    except NotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ProblemInvalid as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except ValueError as exc:  # no design mesh, degenerate geometry
+        raise HTTPException(409, str(exc)) from exc
+    rec = store.new_run(project, built, VoxelStats(**built.stats))
+    runs.start(rec.info.id, built, project.params)
+    return rec.snapshot()
 
 
 @router.websocket("/runs/{id}/stream")
@@ -34,14 +104,54 @@ async def run_stream(websocket: WebSocket, id: str) -> None:
     """Text frames: ProgressMsg / StatusMsg JSON. Binary frames: [u32 it][u32 nx][u32 ny][u32 nz]
     [u8 rho*255 ...] (CLAUDE.md). Not part of OpenAPI; message types are in components.schemas."""
     await websocket.accept()
-    await websocket.close(code=1011, reason="not implemented")
+    store, runs = store_of(websocket.app), runs_of(websocket.app)
+    try:
+        rec = store.get_run(id)
+    except NotFoundError as exc:
+        await websocket.send_json(StatusMsg(type="error", message=str(exc)).model_dump(mode="json"))
+        await websocket.close(code=1008)
+        return
+    queue: asyncio.Queue = asyncio.Queue()
+    info, frame, final = runs.subscribe(rec, asyncio.get_running_loop(), queue)
+    watcher = asyncio.create_task(_watch_disconnect(websocket, queue))
+    try:
+        await websocket.send_json(StatusMsg(type="started", run=info).model_dump(mode="json"))
+        if frame is not None:
+            await websocket.send_bytes(frame)
+        if final is not None:
+            await websocket.send_json(final)
+        else:
+            while (msg := await queue.get()) is not CLOSE:
+                if msg is _GONE:
+                    return
+                if isinstance(msg, bytes):
+                    await websocket.send_bytes(msg)
+                else:
+                    await websocket.send_json(msg)
+        await websocket.close()
+    except (WebSocketDisconnect, RuntimeError, OSError):
+        pass  # client went away
+    finally:
+        watcher.cancel()
+        runs.unsubscribe(rec, queue)
+
+
+async def _watch_disconnect(websocket: WebSocket, queue: asyncio.Queue) -> None:
+    """Drain client frames (ignored) so a disconnect is noticed while the run is quiet."""
+    with contextlib.suppress(Exception):
+        while (await websocket.receive())["type"] != "websocket.disconnect":
+            pass
+    queue.put_nowait(_GONE)
 
 
 @router.post(
     "/runs/{id}/cancel", response_model=RunInfo, responses=NOT_FOUND, summary="Cancel a run"
 )
-async def cancel_run(id: str) -> RunInfo:
-    raise HTTPException(501, "not implemented")
+async def cancel_run(id: str, runs: RunsDep) -> RunInfo:
+    try:
+        return await asyncio.to_thread(runs.cancel, id)
+    except NotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @router.get(
@@ -52,10 +162,20 @@ async def cancel_run(id: str) -> RunInfo:
 )
 async def result_stl(
     id: str,
+    store: StoreDep,
     threshold: float = Query(0.5, ge=0, le=1),
     smooth: int = Query(3, ge=0, le=50),
 ) -> Response:
-    raise HTTPException(501, "not implemented")
+    _, (rho, grid, _, _) = await _result(store, id)
+
+    def work() -> bytes:
+        return to_stl_bytes(density_to_mesh(rho, grid, threshold, smooth))
+
+    try:
+        data = await asyncio.to_thread(work)
+    except ValueError as exc:  # threshold 0
+        raise HTTPException(422, str(exc)) from exc
+    return _attachment(data, "model/stl", f"{id}.stl")
 
 
 @router.get(
@@ -64,8 +184,10 @@ async def result_stl(
     responses=_binary("application/xml", "VTK ImageData with the density field"),
     summary="Export the density field as VTI",
 )
-async def result_vti(id: str) -> Response:
-    raise HTTPException(501, "not implemented")
+async def result_vti(id: str, store: StoreDep) -> Response:
+    _, (rho, grid, _, passive) = await _result(store, id)
+    data = await asyncio.to_thread(to_vti_bytes, rho, passive, grid)
+    return _attachment(data, "application/xml", f"{id}.vti")
 
 
 @router.get(
@@ -74,8 +196,10 @@ async def result_vti(id: str) -> Response:
     responses=_binary("application/octet-stream", "NumPy archive with the density field"),
     summary="Export the density field as NPZ",
 )
-async def result_npz(id: str) -> Response:
-    raise HTTPException(501, "not implemented")
+async def result_npz(id: str, store: StoreDep) -> Response:
+    _, (rho, grid, active, passive) = await _result(store, id)
+    data = await asyncio.to_thread(to_npz_bytes, rho, grid, active, passive)
+    return _attachment(data, "application/octet-stream", f"{id}.npz")
 
 
 @router.get(
@@ -84,18 +208,19 @@ async def result_npz(id: str) -> Response:
     responses=NOT_FOUND,
     summary="Project + run record (reloadable, re-runnable headlessly)",
 )
-async def run_project(id: str) -> RunExport:
-    raise HTTPException(501, "not implemented")
+async def run_project(id: str, store: StoreDep) -> RunExport:
+    rec = _run(store, id)
+    return RunExport(project=rec.project, run=rec.snapshot())
 
 
 @router.get("/runs", response_model=list[RunInfo], summary="List runs")
-async def list_runs() -> list[RunInfo]:
-    raise HTTPException(501, "not implemented")
+async def list_runs(store: StoreDep) -> list[RunInfo]:
+    return [rec.snapshot() for rec in store.list_runs()]
 
 
 @router.get("/runs/{id}", response_model=RunInfo, responses=NOT_FOUND, summary="Run status")
-async def get_run(id: str) -> RunInfo:
-    raise HTTPException(501, "not implemented")
+async def get_run(id: str, store: StoreDep) -> RunInfo:
+    return _run(store, id).snapshot()
 
 
 @router.get(
@@ -105,6 +230,18 @@ async def get_run(id: str) -> RunInfo:
     summary="PNG render of the result so an agent can look at it",
 )
 async def run_preview(
-    id: str, threshold: float = Query(0.5, ge=0, le=1), view: str = Query("iso")
+    id: str, store: StoreDep, threshold: float = Query(0.5, ge=0, le=1), view: str = Query("iso")
 ) -> Response:
-    raise HTTPException(501, "not implemented")
+    rec, (rho, grid, _, _) = await _result(store, id)
+
+    def work() -> bytes:
+        design = store.design_world(rec)
+        result = density_to_mesh(rho, grid, threshold, PREVIEW_SMOOTH)
+        layers = [(design, DESIGN_RGB, 0.15), (result, RESULT_RGB, 1.0)]
+        return render_png([layer for layer in layers if layer[0] is not None], view)
+
+    try:
+        png = await asyncio.to_thread(work)
+    except ValueError as exc:  # unknown view, threshold 0
+        raise HTTPException(422, str(exc)) from exc
+    return Response(png, media_type="image/png")
