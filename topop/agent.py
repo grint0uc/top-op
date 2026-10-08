@@ -1,0 +1,674 @@
+"""Headless top-op session: the one API behind `topop run`, `topop describe` and `topop mcp`.
+
+No HTTP. A `Session` wraps the same `Store` as `topop serve` (same `TOPOP_DATA_DIR` default), so
+meshes, projects and finished runs are shared between the GUI and the agent interface.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import trimesh
+from pydantic import TypeAdapter, ValidationError
+
+from topop.core.export import density_to_mesh, render_png, to_npz_bytes, to_stl_bytes, to_vti_bytes
+from topop.core.optimize import optimize
+from topop.core.problem import IterationInfo
+from topop.core.selection import node_xyz, resolve_selection, resolved_preview
+from topop.core.voxelize import mesh_info as core_mesh_info
+from topop.server.build import ProblemInvalid, build_problem, resolve_project_selections
+from topop.server.routes_runs import DESIGN_RGB, PREVIEW_SMOOTH, RESULT_RGB
+from topop.server.schemas import (
+    FacetInfo,
+    GridSpec,
+    IterationRecord,
+    LoadSpec,
+    MaterialSpec,
+    MeshInfo,
+    ParamsSpec,
+    Project,
+    ProjectIn,
+    RefModel,
+    RunExport,
+    RunInfo,
+    Selection,
+    SupportSpec,
+    VoxelStats,
+)
+from topop.server.store import NotFoundError, RunRecord, Store, now_iso
+
+RESULT_STATUS = {
+    "converged": "done",
+    "max_iter": "done",
+    "cancelled": "cancelled",
+    "error": "error",
+}
+ProgressFn = Callable[[IterationRecord], None]
+_SELECTION = TypeAdapter(Selection)
+_ENVELOPE = {"id", "created_at", "updated_at"}
+_ARRAY_LEAF = re.compile(r"\[\n\s*([^\[\]{}]*?)\n\s*\]")  # array of scalars
+_ARRAY_NEST = re.compile(r"\[\n\s*([^{}]*?)\n\s*\]")  # array of (already flat) arrays
+_FLAT_OBJECT = re.compile(r"\{\n\s*([^{}]*?)\n\s*\}")
+
+
+class ProjectInvalid(ValueError):
+    """The project is not runnable; `issues` lists why (one sentence each)."""
+
+    def __init__(self, issues: list[str]):
+        self.issues = list(issues)
+        super().__init__("project is not runnable: " + "; ".join(self.issues))
+
+
+def pretty_json(obj: Any, width: int = 110) -> str:
+    """`json.dumps(indent=1)` with short flat arrays/objects kept on one line (readable, compact)."""
+
+    def squeeze(m: re.Match) -> str:
+        flat = m.group(0)[0] + re.sub(r",\n\s*", ", ", m.group(1)) + m.group(0)[-1]
+        return flat if len(flat) <= width else m.group(0)
+
+    text = json.dumps(obj, indent=1)
+    for pattern in (_ARRAY_LEAF, _ARRAY_NEST, _FLAT_OBJECT):
+        text = pattern.sub(squeeze, text)
+    return text
+
+
+def explain_validation_error(exc: ValidationError) -> str:
+    """One line per pydantic error: `location: message`."""
+    return "; ".join(
+        f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors(include_url=False)
+    )
+
+
+# ---- selection shorthand ----------------------------------------------------------------------
+
+_AXES = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
+
+
+def _colmajor(m: np.ndarray) -> list[float]:
+    return np.asarray(m, dtype=np.float64).T.ravel().tolist()
+
+
+def _translation(center: Any) -> np.ndarray:
+    m = np.eye(4)
+    m[:3, 3] = np.asarray(center, dtype=np.float64).reshape(3)
+    return m
+
+
+def expand_selection(sel: Mapping[str, Any]) -> dict[str, Any]:
+    """Selection dict with the agent shorthands expanded to the canonical `schemas.Selection`.
+
+    faces/facets/normal: `mesh_id` defaults to "design". Primitives accept box {min, max} or
+    {center, size}, sphere {center, radius}, cylinder {center, radius, height, axis: x|y|z|vector}
+    instead of `transform`/`size`; mixing the shorthand with `transform` is an error.
+    """
+    out = dict(sel)
+    kind = out.get("kind")
+    if kind in ("faces", "facets", "normal"):
+        out.setdefault("mesh_id", "design")
+        return out
+    if kind not in ("box", "sphere", "cylinder"):
+        return out
+    keys = ("min", "max", "center", "radius", "height", "axis")
+    short = {k: out.pop(k) for k in keys if k in out}
+    if not short:
+        return out
+    if "transform" in out:
+        raise ValueError(
+            f"{kind}: use either center/min/max/radius/height/axis or transform, not both"
+        )
+    if kind == "box":
+        if "min" in short or "max" in short:
+            if "min" not in short or "max" not in short or "center" in short or "size" in out:
+                raise ValueError("box: give either {min, max} or {center, size}")
+            lo, hi = (np.asarray(short[k], dtype=np.float64) for k in ("min", "max"))
+            out["size"] = (hi - lo).tolist()
+            short["center"] = ((lo + hi) / 2).tolist()
+        if "center" not in short:
+            raise ValueError("box: give {min, max} or {center, size}")
+        out["transform"] = _colmajor(_translation(short["center"]))
+    elif kind == "sphere":
+        if "center" not in short or "radius" not in short:
+            raise ValueError("sphere: give {center, radius}")
+        r = float(short["radius"])
+        out["size"] = [r, r, r]
+        out["transform"] = _colmajor(_translation(short["center"]))
+    else:
+        if not {"center", "radius", "height", "axis"} <= short.keys():
+            raise ValueError(
+                "cylinder: give {center, radius, height, axis} (axis: x|y|z or vector)"
+            )
+        axis = short["axis"]
+        vec = _AXES.get(axis.lower()) if isinstance(axis, str) else axis
+        if vec is None or np.linalg.norm(np.asarray(vec, dtype=np.float64)) == 0:
+            raise ValueError(
+                f"cylinder axis must be 'x', 'y', 'z' or a non-zero vector, got {axis!r}"
+            )
+        v = np.asarray(vec, dtype=np.float64).reshape(3)
+        rot = trimesh.geometry.align_vectors([0.0, 1.0, 0.0], v / np.linalg.norm(v))
+        out["size"] = [float(short["radius"]), float(short["height"]), float(short["radius"])]
+        out["transform"] = _colmajor(_translation(short["center"]) @ rot)
+    return out
+
+
+def parse_selection(sel: Mapping[str, Any] | Any) -> Any:
+    """dict (shorthand allowed) or an existing selection model -> validated selection model."""
+    if isinstance(sel, Mapping):
+        return _SELECTION.validate_python(expand_selection(sel))
+    return _SELECTION.validate_python(sel)
+
+
+def _rewrite_selection_meshes(body: ProjectIn, remap: Mapping[str, str]) -> None:
+    for item in [*body.loads, *body.supports]:
+        mid = getattr(item.selection, "mesh_id", None)
+        if mid in remap:
+            item.selection.mesh_id = remap[mid]
+
+
+# ---- session ----------------------------------------------------------------------------------
+
+
+@dataclass
+class _Outcome:
+    status: str  # core status: converged | max_iter | cancelled | error
+    message: str
+    wall_seconds: float
+
+
+class Session:
+    def __init__(self, data_dir: str | os.PathLike | None = None):
+        self.store = Store(data_dir)
+        self._lock = threading.RLock()  # project read-modify-write
+        self._run_lock = threading.Lock()  # one optimization at a time per session
+        self._paths: dict[str, str] = {}  # mesh_id -> file it was loaded from
+        self._outcomes: dict[str, _Outcome] = {}
+
+    # ---- meshes -------------------------------------------------------------------------------
+
+    def load_mesh(self, path: str | os.PathLike) -> MeshInfo:
+        p = Path(path).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(f"mesh file not found: {p}")
+        info = self.store.add_mesh(p.read_bytes(), p.name)
+        self._paths[info.id] = str(p.resolve())
+        return info
+
+    def mesh_info(self, mesh_id: str) -> MeshInfo:
+        mesh = self.store.get_mesh(mesh_id)  # NotFoundError
+        name = mesh_id
+        try:
+            name = json.loads((self.store.mesh_dir / f"{mesh_id}.json").read_text())["name"]
+        except (OSError, ValueError, KeyError):
+            pass
+        return MeshInfo(id=mesh_id, name=name, **core_mesh_info(mesh))
+
+    def describe_mesh(self, mesh_id: str, angle_deg: float = 5.0, top: int = 30) -> dict:
+        """MeshInfo + the `top` largest coplanar facets (all if top <= 0): what names faces."""
+        info = self.mesh_info(mesh_id)
+        facets, total = self.store.mesh_facets(mesh_id, float(angle_deg))
+        shown = facets[:top] if top > 0 else facets
+        return {
+            "mesh": info.model_dump(),
+            "angle_deg": float(angle_deg),
+            "n_facets_total": total,
+            "facets": [FacetInfo(**f).model_dump() for f in shown],
+        }
+
+    def preview_mesh(self, mesh_id: str, view: str = "iso") -> bytes:
+        return render_png([(self.store.get_mesh(mesh_id), DESIGN_RGB, 1.0)], view)
+
+    # ---- projects -----------------------------------------------------------------------------
+
+    def _attach(self, ref: Any, base: Path, remap: dict[str, str]) -> None:
+        """Upload `ref.path` (relative to `base`) and set `ref.mesh_id`; the path is kept absolute."""
+        if ref.path:
+            p = Path(ref.path).expanduser()
+            written = ref.path
+            p = p if p.is_absolute() else base / p
+            if p.is_file():
+                info = self.load_mesh(p)
+                remap[written] = remap[str(p)] = info.id
+                ref.mesh_id, ref.path = info.id, str(p.resolve())
+                return
+            if not ref.mesh_id:
+                raise FileNotFoundError(
+                    f"mesh file not found: {p} (paths in a case file are relative to the case file)"
+                )
+        if ref.mesh_id:
+            self.store.get_mesh(ref.mesh_id)  # NotFoundError if it was never uploaded
+
+    def _materialize(self, body: ProjectIn, base: Path | None = None) -> ProjectIn:
+        """Upload every mesh given by `path` and rewrite selections that named a mesh by path."""
+        body = body.model_copy(deep=True)
+        base = base or Path.cwd()
+        remap: dict[str, str] = {}
+        if body.design_mesh is not None:
+            self._attach(body.design_mesh, base, remap)
+        for ref in body.ref_models:
+            self._attach(ref, base, remap)
+        _rewrite_selection_meshes(body, remap)
+        return body
+
+    def create_project(self, body: ProjectIn) -> Project:
+        return self.store.create_project(self._materialize(body))
+
+    def get_project(self, project_id: str) -> Project:
+        return self.store.get_project(project_id)
+
+    def list_projects(self) -> list[Project]:
+        return self.store.list_projects()
+
+    def update_project(self, project_id: str, body: ProjectIn) -> Project:
+        return self.store.update_project(project_id, self._materialize(body))
+
+    def _edit(self, project_id: str, fn: Callable[[ProjectIn], Any]) -> tuple[Project, Any]:
+        with self._lock:
+            body = ProjectIn.model_validate(self.store.get_project(project_id).model_dump())
+            result = fn(body)
+            body = ProjectIn.model_validate(body.model_dump())  # re-validate what fn changed
+            return self.store.update_project(project_id, body), result
+
+    @staticmethod
+    def _fresh_id(prefix: str, taken: set[str]) -> str:
+        n = 1
+        while f"{prefix}{n}" in taken:
+            n += 1
+        return f"{prefix}{n}"
+
+    @staticmethod
+    def _boundary_ids(body: ProjectIn) -> set[str]:
+        return {x.id for x in [*body.loads, *body.supports]}
+
+    def add_load(self, project_id: str, load: LoadSpec) -> LoadSpec:
+        """Append a load. An empty `id` is replaced by `loadN`."""
+
+        def fn(body: ProjectIn) -> LoadSpec:
+            taken = self._boundary_ids(body)
+            spec = load.model_copy(update={"id": load.id or self._fresh_id("load", taken)})
+            if spec.id in taken:
+                raise ValueError(f"id {spec.id!r} is already used by a load or support")
+            body.loads.append(spec)
+            return spec
+
+        return self._edit(project_id, fn)[1]
+
+    def add_support(self, project_id: str, support: SupportSpec) -> SupportSpec:
+        """Append a support. An empty `id` is replaced by `supportN`."""
+
+        def fn(body: ProjectIn) -> SupportSpec:
+            taken = self._boundary_ids(body)
+            spec = support.model_copy(update={"id": support.id or self._fresh_id("support", taken)})
+            if spec.id in taken:
+                raise ValueError(f"id {spec.id!r} is already used by a load or support")
+            body.supports.append(spec)
+            return spec
+
+        return self._edit(project_id, fn)[1]
+
+    def add_ref_model(self, project_id: str, ref: RefModel) -> RefModel:
+        """Append a reference body (keep_in / keep_out). An empty `id` is replaced by `refN`."""
+
+        def fn(body: ProjectIn) -> RefModel:
+            taken = {r.id for r in body.ref_models}
+            spec = ref.model_copy(update={"id": ref.id or self._fresh_id("ref", taken)})
+            if spec.id in taken:
+                raise ValueError(f"reference model id {spec.id!r} already exists")
+            self._attach(spec, Path.cwd(), {})
+            body.ref_models.append(spec)
+            return spec
+
+        return self._edit(project_id, fn)[1]
+
+    def _remove(self, project_id: str, attr: str, item_id: str, what: str) -> Project:
+        def fn(body: ProjectIn) -> None:
+            items = getattr(body, attr)
+            keep = [x for x in items if x.id != item_id]
+            if len(keep) == len(items):
+                known = ", ".join(x.id for x in items) or "none"
+                raise ValueError(f"no {what} with id {item_id!r} (existing: {known})")
+            setattr(body, attr, keep)
+
+        return self._edit(project_id, fn)[0]
+
+    def remove_load(self, project_id: str, load_id: str) -> Project:
+        return self._remove(project_id, "loads", load_id, "load")
+
+    def remove_support(self, project_id: str, support_id: str) -> Project:
+        return self._remove(project_id, "supports", support_id, "support")
+
+    def remove_ref_model(self, project_id: str, ref_id: str) -> Project:
+        return self._remove(project_id, "ref_models", ref_id, "reference model")
+
+    @staticmethod
+    def _merge(current: Any, spec_cls: type, fields: Mapping[str, Any], what: str) -> Any:
+        unknown = sorted(set(fields) - set(spec_cls.model_fields))
+        if unknown:
+            raise ValueError(
+                f"unknown {what} field(s) {unknown}; valid: {sorted(spec_cls.model_fields)}"
+            )
+        given = {k: v for k, v in fields.items() if v is not None}
+        return spec_cls.model_validate({**current.model_dump(), **given})
+
+    def set_params(self, project_id: str, **fields: Any) -> Project:
+        """Merge the given `ParamsSpec` fields (None = leave unchanged)."""
+
+        def fn(body: ProjectIn) -> None:
+            body.params = self._merge(body.params, ParamsSpec, fields, "params")
+
+        return self._edit(project_id, fn)[0]
+
+    def set_grid(self, project_id: str, **fields: Any) -> Project:
+        def fn(body: ProjectIn) -> None:
+            body.grid = self._merge(body.grid, GridSpec, fields, "grid")
+
+        return self._edit(project_id, fn)[0]
+
+    def set_material(self, project_id: str, **fields: Any) -> Project:
+        def fn(body: ProjectIn) -> None:
+            body.material = self._merge(body.material, MaterialSpec, fields, "material")
+
+        return self._edit(project_id, fn)[0]
+
+    # ---- voxelization and selections ------------------------------------------------------------
+
+    def _domain(self, project_id: str):
+        project = self.store.get_project(project_id)
+        try:
+            return project, self.store.get_domain(project)
+        except ValueError as exc:  # no design mesh, degenerate geometry
+            raise ProjectInvalid([str(exc)]) from exc
+
+    def voxel_stats(self, project_id: str) -> VoxelStats:
+        """Grid statistics; warnings include loads/supports that resolve to nothing."""
+        project, domain = self._domain(project_id)
+        _, _, warnings, errors = resolve_project_selections(project, domain)
+        return VoxelStats(**{**domain.stats, "warnings": [*domain.warnings, *warnings, *errors]})
+
+    def boundaries(self, project_id: str) -> dict:
+        """Per load/support: resolved node count and bbox (what the optimizer will actually use)."""
+        project, domain = self._domain(project_id)
+        load_nodes, support_nodes, _, _ = resolve_project_selections(project, domain)
+
+        def row(item: Any, nodes: np.ndarray) -> dict:
+            out = {"id": item.id, "name": item.name, "n_nodes": int(nodes.size)}
+            if nodes.size:
+                xyz = node_xyz(domain.grid, nodes)
+                out["bbox"] = [xyz.min(0).tolist(), xyz.max(0).tolist()]
+            return out
+
+        return {
+            "loads": [
+                {**row(ld, n), "force": ld.force, "case": ld.case}
+                for ld, n in zip(project.loads, load_nodes, strict=True)
+            ],
+            "supports": [
+                {**row(sp, n), "fix": sp.fix}
+                for sp, n in zip(project.supports, support_nodes, strict=True)
+            ],
+        }
+
+    def resolve(
+        self, project_id: str, selection: Mapping[str, Any] | Any, samples: int = 8
+    ) -> dict:
+        """What a selection picks on the project's grid: count, bbox, centroid and a few nodes."""
+        sel = parse_selection(selection)
+        _, domain = self._domain(project_id)
+        nodes = resolve_selection(sel.model_dump(), domain.grid, domain.active, domain.meshes_world)
+        out: dict[str, Any] = {"count": int(nodes.size), "h": float(domain.grid.h)}
+        if nodes.size:
+            xyz = node_xyz(domain.grid, nodes)
+            out["bbox"] = [xyz.min(0).tolist(), xyz.max(0).tolist()]
+            out["centroid"] = xyz.mean(0).tolist()
+            out["sample_xyz"] = resolved_preview(nodes, domain.grid, cap=samples)["xyz"]
+        return out
+
+    # ---- running ------------------------------------------------------------------------------
+
+    def run(
+        self,
+        project_id: str,
+        progress: ProgressFn | None = None,
+        cancel: threading.Event | None = None,
+        max_iter: int | None = None,
+    ) -> RunInfo:
+        """Optimize synchronously; the result is stored (and persisted) like a server run.
+
+        `max_iter` overrides params.max_iter for this run only. ProjectInvalid (a ValueError
+        with `.issues`) if the project is not runnable; MemoryError above the memory cap.
+        """
+        project, domain = self._domain(project_id)
+        if max_iter is not None:
+            params = ParamsSpec.model_validate(
+                {**project.params.model_dump(), "max_iter": max_iter}
+            )
+            project = project.model_copy(update={"params": params})
+        try:
+            built = build_problem(project, domain.meshes_world, domain)
+        except ProblemInvalid as exc:
+            raise ProjectInvalid(exc.issues) from exc
+        rec = self.store.new_run(project, built, VoxelStats(**built.stats))
+        with self._run_lock:
+            if rec.cancel.is_set():  # cancelled while waiting for the previous run
+                self._finish(rec, "cancelled", "cancelled while queued")
+                return rec.snapshot()
+            with rec.lock:
+                rec.info.status = "running"
+
+            def callback(info: IterationInfo, rho: np.ndarray) -> bool:
+                record = IterationRecord(
+                    it=int(info.it),
+                    compliance=float(info.compliance),
+                    volume=float(info.volume),
+                    change=float(info.change),
+                    t_iter=float(info.t_iter),
+                )
+                with rec.lock:
+                    rec.info.history.append(record)
+                if progress is not None:
+                    progress(record)
+                return not self._cancelled(rec, cancel)
+
+            t0 = time.perf_counter()
+            try:
+                result = optimize(
+                    built.problem,
+                    built.params,
+                    callback,
+                    cancel=lambda: self._cancelled(rec, cancel),
+                )
+            except MemoryError as exc:
+                msg = str(exc) or "out of memory; lower the resolution"
+                self._finish(rec, "error", msg, time.perf_counter() - t0, outcome="error")
+                raise MemoryError(msg) from exc
+            except Exception as exc:
+                self._finish(rec, "error", str(exc) or type(exc).__name__, outcome="error")
+                raise
+            rho = result.rho if result.history else None
+            self._finish(
+                rec,
+                RESULT_STATUS.get(result.status, "error"),
+                result.message,
+                time.perf_counter() - t0,
+                rho=rho,
+                outcome=result.status,
+            )
+        return rec.snapshot()
+
+    @staticmethod
+    def _cancelled(rec: RunRecord, extra: threading.Event | None) -> bool:
+        return rec.cancel.is_set() or (extra is not None and extra.is_set())
+
+    def _finish(
+        self,
+        rec: RunRecord,
+        status: str,
+        message: str | None,
+        wall: float = 0.0,
+        rho: np.ndarray | None = None,
+        outcome: str = "cancelled",
+    ) -> None:
+        with rec.lock:
+            rec.info.status = status
+            rec.info.finished_at = now_iso()
+            rec.message = message
+            if status == "error":
+                rec.info.error = message or "run failed"
+            if rho is not None:
+                rec.rho = rho
+        self._outcomes[rec.info.id] = _Outcome(outcome, message or "", wall)
+        self.store.persist_run(rec)
+
+    def cancel(self, run_id: str) -> RunInfo:
+        """Stop a run after its current iteration (callable from another thread)."""
+        rec = self.store.get_run(run_id)
+        rec.cancel.set()
+        return rec.snapshot()
+
+    def get_run(self, run_id: str) -> RunInfo:
+        return self.store.get_run(run_id).snapshot()
+
+    def list_runs(self) -> list[RunInfo]:
+        return [r.snapshot() for r in self.store.list_runs()]
+
+    def run_outcome(self, run_id: str) -> dict:
+        """How a run of this session ended: converged | max_iter | cancelled | error, message, wall s."""
+        o = self._outcomes.get(run_id)
+        return (
+            {}
+            if o is None
+            else {"outcome": o.status, "message": o.message, "wall_s": o.wall_seconds}
+        )
+
+    # ---- results ------------------------------------------------------------------------------
+
+    def _result(
+        self, run_id: str
+    ) -> tuple[RunRecord, tuple[np.ndarray, Any, np.ndarray, np.ndarray]]:
+        rec = self.store.get_run(run_id)
+        if rec.info.status not in ("done", "cancelled"):
+            raise ValueError(f"run {run_id} is {rec.info.status}; no result to export")
+        res = self.store.run_result(rec)
+        if res is None:
+            raise ValueError(f"run {run_id} has no density result")
+        return rec, res
+
+    @staticmethod
+    def _isosurface(rho: np.ndarray, grid: Any, threshold: float, smooth: int) -> trimesh.Trimesh:
+        mesh = density_to_mesh(rho, grid, threshold, int(smooth))  # ValueError if threshold <= 0
+        if not len(mesh.faces):
+            raise ValueError(
+                f"no material above threshold {threshold} (max density {float(np.max(rho)):.3f}); "
+                "lower the threshold"
+            )
+        return mesh
+
+    def result_stl(self, run_id: str, threshold: float = 0.5, smooth: int = 0) -> bytes:
+        _, (rho, grid, _, _) = self._result(run_id)
+        return to_stl_bytes(self._isosurface(rho, grid, threshold, smooth))
+
+    def result_png(self, run_id: str, threshold: float = 0.5, view: str = "iso") -> bytes:
+        """The result in orange over the ghosted design mesh."""
+        rec, (rho, grid, _, _) = self._result(run_id)
+        design = self.store.design_world(rec)
+        result = self._isosurface(rho, grid, threshold, PREVIEW_SMOOTH)
+        layers = [(design, DESIGN_RGB, 0.15), (result, RESULT_RGB, 1.0)]
+        return render_png([layer for layer in layers if layer[0] is not None], view)
+
+    def result_vti(self, run_id: str) -> bytes:
+        _, (rho, grid, _, passive) = self._result(run_id)
+        return to_vti_bytes(rho, passive, grid)
+
+    def result_npz(self, run_id: str) -> bytes:
+        _, (rho, grid, active, passive) = self._result(run_id)
+        return to_npz_bytes(rho, grid, active, passive)
+
+    def export(self, run_id: str) -> RunExport:
+        rec = self.store.get_run(run_id)
+        return RunExport(project=rec.project, run=rec.snapshot())
+
+    def write_outputs(
+        self, run_id: str, out_dir: str | os.PathLike, threshold: float = 0.5, smooth: int = 0
+    ) -> dict[str, dict[str, str]]:
+        """result.stl, result.png (iso), result.vti, density.npz, run.json into `out_dir`.
+
+        Returns {"files": {name: path}, "errors": {name: why}}; a file that cannot be made (e.g. a
+        threshold above every density) is reported, the others are still written.
+        """
+        out = Path(out_dir).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        makers = {
+            "result.stl": lambda: self.result_stl(run_id, threshold, smooth),
+            "result.png": lambda: self.result_png(run_id, threshold, "iso"),
+            "result.vti": lambda: self.result_vti(run_id),
+            "density.npz": lambda: self.result_npz(run_id),
+            "run.json": lambda: pretty_json(self.export(run_id).model_dump(mode="json")).encode(),
+        }
+        files: dict[str, str] = {}
+        errors: dict[str, str] = {}
+        for name, make in makers.items():
+            try:
+                (out / name).write_bytes(make())
+                files[name] = str(out / name)
+            except ValueError as exc:
+                errors[name] = str(exc)
+        return {"files": files, "errors": errors}
+
+    # ---- case files ---------------------------------------------------------------------------
+
+    def load_case(self, path: str | os.PathLike) -> Project:
+        """Read a case file (a `ProjectIn`, or a run.json), upload its meshes, store the project.
+
+        `design_mesh.path` / `ref_models[].path` are relative to the case file. Selection
+        shorthands (see `expand_selection`) are accepted.
+        """
+        p = Path(path).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(f"case file not found: {p}")
+        raw = json.loads(p.read_text())
+        if isinstance(raw, dict) and isinstance(raw.get("project"), dict) and "run" in raw:
+            raw = raw["project"]  # a run.json written by `topop run`
+        if not isinstance(raw, dict):
+            raise ValueError("a case file must be a JSON object (ProjectIn)")  # noqa: TRY004
+        for key in ("loads", "supports"):
+            for item in raw.get(key) or []:
+                if isinstance(item, dict) and isinstance(item.get("selection"), dict):
+                    item["selection"] = expand_selection(item["selection"])
+        body = ProjectIn.model_validate(raw)
+        return self.store.create_project(self._materialize(body, p.resolve().parent))
+
+    def save_case(self, project_id: str, path: str | os.PathLike) -> str:
+        """Write the project as a case file; mesh `path`s are relative to the case file."""
+        project = self.store.get_project(project_id)
+        body = ProjectIn.model_validate(project.model_dump(exclude=_ENVELOPE))
+        out = Path(path).expanduser().resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        for ref in [r for r in (body.design_mesh, *body.ref_models) if r is not None]:
+            src = ref.path or (self._paths.get(ref.mesh_id) if ref.mesh_id else None)
+            if src:
+                try:
+                    rel = os.path.relpath(src, out.parent)
+                except ValueError:  # different drive
+                    rel = str(src)
+                ref.path = str(src) if rel.startswith("..") else rel
+        body_json = body.model_dump(mode="json", exclude_none=True)
+        out.write_text(pretty_json(body_json) + "\n")
+        return str(out)
+
+
+__all__ = [
+    "NotFoundError",
+    "ProjectInvalid",
+    "Session",
+    "expand_selection",
+    "explain_validation_error",
+    "parse_selection",
+    "pretty_json",
+]

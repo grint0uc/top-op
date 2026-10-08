@@ -1,0 +1,39 @@
+{
+  "name": "bracket",
+  "design_mesh": {"path": "bracket.stl"},
+  "ref_models": [
+    {
+      "id": "slot",
+      "name": "cable slot through the plate (keep out)",
+      "path": "cantilever.stl",
+      "mode": "keep_out",
+      "transform": [0.25, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 1, 0, 22, 25, -5, 1]
+    }
+  ],
+  "grid": {"elements_along_longest": 40},
+  "material": {"E": 1.0, "nu": 0.3},
+  "params": {"volfrac": 0.3, "penal": 3, "rmin": 2, "max_iter": 40},
+  "supports": [
+    {
+      "id": "base",
+      "name": "plate bottom (facet 0)",
+      "selection": {"kind": "facets", "mesh_id": "design", "facet_ids": [0], "angle_deg": 5},
+      "fix": [true, true, true]
+    }
+  ],
+  "loads": [
+    {
+      "id": "push",
+      "name": "wall outer face (x=0), z>=45",
+      "selection": {
+        "kind": "normal",
+        "mesh_id": "design",
+        "direction": [-1, 0, 0],
+        "angle_deg": 10,
+        "within": [[-2, -2, 43], [2, 62, 62]]
+      },
+      "force": [100, 0, 0],
+      "case": 0
+    }
+  ]
+}

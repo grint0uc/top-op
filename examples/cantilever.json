@@ -1,0 +1,30 @@
+{
+  "name": "cantilever",
+  "design_mesh": {"path": "cantilever.stl"},
+  "grid": {"elements_along_longest": 30},
+  "material": {"E": 1.0, "nu": 0.3},
+  "params": {"volfrac": 0.3, "penal": 3, "rmin": 1.5, "max_iter": 60},
+  "supports": [
+    {
+      "id": "wall",
+      "name": "fixed end x=0",
+      "selection": {"kind": "plane", "point": [0, 0, 0], "normal": [1, 0, 0]},
+      "fix": [true, true, true]
+    }
+  ],
+  "loads": [
+    {
+      "id": "tip",
+      "name": "tip load, top face x>=50",
+      "selection": {
+        "kind": "normal",
+        "mesh_id": "design",
+        "direction": [0, 0, 1],
+        "angle_deg": 10,
+        "within": [[48, -2, 18], [62, 22, 22]]
+      },
+      "force": [0, 0, -1],
+      "case": 0
+    }
+  ]
+}
