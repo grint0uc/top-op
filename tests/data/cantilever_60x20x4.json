@@ -1,0 +1,9 @@
+{
+  "problem": "cantilever(60, 20, 4)",
+  "params": "cantilever_params()",
+  "compliance": 96.78771969255807,
+  "iterations": 100,
+  "status": "max_iter",
+  "volume": 0.2999999992199998,
+  "seconds_per_iteration_when_generated": 0.5765978274600002
+}
