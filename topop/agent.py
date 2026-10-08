@@ -23,9 +23,13 @@ from pydantic import TypeAdapter, ValidationError
 from topop.core.export import density_to_mesh, render_png, to_npz_bytes, to_stl_bytes, to_vti_bytes
 from topop.core.optimize import optimize
 from topop.core.problem import IterationInfo
-from topop.core.selection import node_xyz, resolve_selection, resolved_preview
-from topop.core.voxelize import mesh_info as core_mesh_info
-from topop.server.build import ProblemInvalid, build_problem, resolve_project_selections
+from topop.core.selection import node_xyz, resolved_preview
+from topop.server.build import (
+    ProblemInvalid,
+    build_problem,
+    resolve_project_selections,
+    resolve_sel,
+)
 from topop.server.routes_runs import DESIGN_RGB, PREVIEW_SMOOTH, RESULT_RGB
 from topop.server.schemas import (
     FacetInfo,
@@ -202,16 +206,13 @@ class Session:
         return info
 
     def mesh_info(self, mesh_id: str) -> MeshInfo:
-        mesh = self.store.get_mesh(mesh_id)  # NotFoundError
-        name = mesh_id
-        try:
-            name = json.loads((self.store.mesh_dir / f"{mesh_id}.json").read_text())["name"]
-        except (OSError, ValueError, KeyError):
-            pass
-        return MeshInfo(id=mesh_id, name=name, **core_mesh_info(mesh))
+        return self.store.mesh_info(mesh_id)  # NotFoundError
 
     def describe_mesh(self, mesh_id: str, angle_deg: float = 5.0, top: int = 30) -> dict:
-        """MeshInfo + the `top` largest coplanar facets (all if top <= 0): what names faces."""
+        """MeshInfo + the `top` largest coplanar facets (all if top <= 0): what names faces.
+
+        STEP meshes list their B-rep faces instead (exact; `angle_deg` is ignored).
+        """
         info = self.mesh_info(mesh_id)
         facets, total = self.store.mesh_facets(mesh_id, float(angle_deg))
         shown = facets[:top] if top > 0 else facets
@@ -421,7 +422,7 @@ class Session:
         """What a selection picks on the project's grid: count, bbox, centroid and a few nodes."""
         sel = parse_selection(selection)
         _, domain = self._domain(project_id)
-        nodes = resolve_selection(sel.model_dump(), domain.grid, domain.active, domain.meshes_world)
+        nodes = resolve_sel(sel.model_dump(), domain)
         out: dict[str, Any] = {"count": int(nodes.size), "h": float(domain.grid.h)}
         if nodes.size:
             xyz = node_xyz(domain.grid, nodes)

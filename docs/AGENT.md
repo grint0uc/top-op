@@ -51,12 +51,22 @@ them. Canonical primitive form (what is stored, what the GUI writes): `transform
 Reference bodies (`add_ref_model`, any loaded mesh + `transform`): `keep_in` = forced solid (extends the domain),
 `keep_out` = forced void (clearance).
 
+## STEP input (optional extra)
+
+With `uv sync --extra examples` (OpenCascade via `cadquery`), `load_mesh` and case-file `path`s also take `.step` / `.stp`
+(mm as OpenCascade reports them, no rescaling). The file is tessellated once and cached; `describe_mesh` then lists
+the **B-rep faces** as facets: `id` is the rank by exact area (descending), `brep_face` the face's index in the STEP file,
+`kind` is `plane` / `cylinder` / `other`, and cylinders carry their exact `radius` and `axis`, so "the Ø12 hole" is the
+`cylinder` facet with `radius` 6 and no guessing. `{"kind":"facets","facet_ids":[..]}` selects those faces exactly;
+`angle_deg` is ignored, and ids are stable for a given file (they do not renumber like mesh facets). `normal`, `plane`
+and the primitives work on the tessellation as for any mesh. Without the extra, uploading a STEP file fails with the install hint.
+
 ## Pitfalls
 
 - **`within` boxes**: grid nodes sit up to h/2 outside the true surface and `within` clips strictly on node coordinates.
   Pad a box derived from the mesh bbox by one voxel `h` per side (`h` is in `voxel_stats`, about longest side / elements)
   and re-check after changing the resolution (h changes). Prefer `facets` or `plane` when a whole face will do.
-- Facet ids are ranks by area for a given `angle_deg`; a changed angle renumbers them. Curved groups have normal 0.
+- Facet ids are ranks by area for a given `angle_deg`; a changed angle renumbers them (STEP meshes: B-rep faces, never). Curved groups have normal 0.
 - Always check the node counts before running; "resolves to zero nodes" blocks the run. Supports must stop all rigid motion.
 - Size: keep `n_active` <= about 150k on a 16 GB machine (`est_bytes` and `est_sec_per_iter` in `voxel_stats`, about 30 KB per element).
   Debug at 30-40 elements along the longest side, refine to 60-100 at the end. Above the memory cap `run` fails fast (exit 3).

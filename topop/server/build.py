@@ -13,7 +13,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -21,6 +21,7 @@ import trimesh
 
 from topop.core.problem import Grid, Load, Material, Problem, RunParams, Support
 from topop.core.selection import resolve_selection
+from topop.core.step import facet_triangles
 from topop.core.voxelize import apply_transform, build_domain, domain_stats, transform_matrix
 from topop.server.schemas import MaterialSpec, ParamsSpec, ProjectIn
 
@@ -166,6 +167,27 @@ def build_domain_from_project(
     return BuiltDomain(grid, active, passive, stats, warnings, meshes_world)
 
 
+def step_facets_to_faces(sel: Mapping, meshes: Mapping[str, trimesh.Trimesh]) -> Mapping:
+    """A `facets` selection on a STEP-sourced mesh -> the equivalent `faces` selection.
+
+    Facet ids of a STEP mesh are B-rep faces (`/facets` table), not angle-grouped triangles, so
+    `core.selection` must never see them. Any other selection is returned unchanged.
+    """
+    if sel.get("kind") != "facets":
+        return sel
+    mesh = meshes.get(sel.get("mesh_id"))
+    tris = None if mesh is None else facet_triangles(mesh, sel.get("facet_ids", []))
+    if tris is None:
+        return sel
+    return {"kind": "faces", "mesh_id": sel["mesh_id"], "face_ids": tris.tolist()}
+
+
+def resolve_sel(sel: Mapping, domain: BuiltDomain) -> np.ndarray:
+    """`core.selection.resolve_selection` on the domain, STEP-aware. The one entry point to use."""
+    meshes = domain.meshes_world
+    return resolve_selection(step_facets_to_faces(sel, meshes), domain.grid, domain.active, meshes)
+
+
 def _label(kind: str, item) -> str:
     return f"{kind} {item.name or item.id!r}"
 
@@ -179,9 +201,7 @@ def resolve_project_selections(
 
     def resolve(kind: str, item) -> np.ndarray:
         try:
-            nodes = resolve_selection(
-                item.selection.model_dump(), domain.grid, domain.active, domain.meshes_world
-            )
+            nodes = resolve_sel(item.selection.model_dump(), domain)
         except ValueError as exc:
             errors.append(f"{_label(kind, item)}: {exc}")
             return np.zeros(0, dtype=np.int64)

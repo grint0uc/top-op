@@ -1,14 +1,23 @@
-"""Generate examples/cantilever.stl and examples/bracket.stl (units: mm, min corner at origin).
+"""Generate examples/cantilever.stl, bracket.stl and bracket.step (units: mm, min corner at origin).
+
+bracket.step is the same part as bracket.stl plus a 3 mm fillet on the inner plate-wall edge; it
+needs cadquery (`uv sync --extra examples`) and is skipped without it.
 
 Run: uv run python examples/make_examples.py
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
 import trimesh
+
+try:
+    import cadquery as cq
+except ImportError:  # optional extra
+    cq = None
 
 OUT = Path(__file__).parent
 SECTIONS = 64  # cylinder facets
@@ -53,6 +62,31 @@ def make_bracket() -> trimesh.Trimesh:
     return trimesh.boolean.difference([body, *cutters], engine="manifold")
 
 
+def make_bracket_step() -> cq.Workplane:
+    plate = cq.Workplane("XY").box(80, 60, 10, centered=False)
+    wall = cq.Workplane("XY").box(10, 60, 60, centered=False)
+    # 3 mm blend on the inner plate-wall edge (x=10, z=10, along Y): the one curved non-hole face
+    body = plate.union(wall).edges(cq.selectors.BoxSelector((9, -1, 9), (11, 61, 11))).fillet(3)
+    cutters = [
+        cq.Solid.makeCylinder(3, 30, cq.Vector(x, y, -10), cq.Vector(0, 0, 1))
+        for x in (20, 72)
+        for y in (8, 52)
+    ]
+    cutters.append(cq.Solid.makeCylinder(6, 30, cq.Vector(-10, 30, 35), cq.Vector(1, 0, 0)))
+    return body.cut(cq.Compound.makeCompound(cutters))
+
+
+def write_step(shape: cq.Workplane, name: str) -> None:
+    solid = shape.val()
+    assert solid.isValid(), f"{name} is not a valid solid"
+    path = OUT / name
+    cq.exporters.export(shape, str(path))
+    # pin the header timestamp so regenerating the file does not change it
+    text = re.sub(r"(FILE_NAME\('[^']*',')[^']*'", r"\g<1>2000-01-01T00:00:00'", path.read_text())
+    path.write_text(text)
+    print(f"{name}: {len(solid.Faces())} B-rep faces, volume {solid.Volume():.1f}")
+
+
 def write(mesh: trimesh.Trimesh, name: str) -> None:
     assert mesh.is_watertight, f"{name} is not watertight"
     assert mesh.is_winding_consistent and mesh.volume > 0, f"{name} has bad winding"
@@ -65,3 +99,7 @@ def write(mesh: trimesh.Trimesh, name: str) -> None:
 if __name__ == "__main__":
     write(make_cantilever(), "cantilever.stl")
     write(make_bracket(), "bracket.stl")
+    if cq is None:
+        print("bracket.step skipped: cadquery is not installed (uv sync --extra examples)")
+    else:
+        write_step(make_bracket_step(), "bracket.step")

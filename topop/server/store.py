@@ -10,6 +10,7 @@ import re
 import threading
 import uuid
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,8 @@ from fastapi import Request
 from topop.core.export import from_npz_bytes, to_npz_bytes
 from topop.core.problem import Grid
 from topop.core.selection import compute_facets
+from topop.core.selection import facet_faces as mesh_facet_faces
+from topop.core.step import META_FACETS, StepMesh, facet_triangles, is_step, load_step
 from topop.core.voxelize import load_mesh, mesh_info
 from topop.server.build import (
     BuiltDomain,
@@ -103,14 +106,24 @@ class Store:
     # ---- meshes ---------------------------------------------------------------------------------
 
     def add_mesh(self, data: bytes, filename: str) -> MeshInfo:
-        """Store an upload; id = sha256 prefix of the bytes, so re-uploads get the same id."""
-        ext = Path(filename).suffix.lower().lstrip(".")
+        """Store an upload; id = sha256 prefix of the bytes, so re-uploads get the same id.
+
+        STEP files (by extension or header) are tessellated once; the original bytes, an STL and
+        `{id}.brep.npz` (exact tessellation + B-rep face table) are kept so `get_mesh` never
+        tessellates again.
+        """
+        step = is_step(filename) or is_step(data)
+        ext = "step" if step else Path(filename).suffix.lower().lstrip(".")
         if not ext:
-            raise ValueError(f"cannot tell the file type of {filename!r}; use .stl/.obj/.3mf/.ply")
+            raise ValueError(
+                f"cannot tell the file type of {filename!r}; use .stl/.obj/.3mf/.ply/.step"
+            )
         mesh_id = hashlib.sha256(data).hexdigest()[:16]
         with self._lock:
             mesh = self._meshes.get(mesh_id)
-        if mesh is None:
+        if mesh is None and step:
+            mesh = self._store_step(mesh_id, data)
+        elif mesh is None:
             mesh = load_mesh(data, ext)  # ValueError on bad input, before anything is written
             path = self.mesh_dir / f"{mesh_id}.{ext}"
             if not path.exists():
@@ -122,7 +135,44 @@ class Store:
             self._meshes.move_to_end(mesh_id)
             while len(self._meshes) > MESH_CACHE:
                 self._meshes.popitem(last=False)
-        return MeshInfo(id=mesh_id, name=filename, **mesh_info(mesh))
+        return self._info(mesh_id, filename, mesh)
+
+    def _store_step(self, mesh_id: str, data: bytes) -> trimesh.Trimesh:
+        cached = self._read_step_cache(mesh_id)
+        if cached is not None:
+            return cached.mesh
+        sm = self._tessellate(data)
+        self._write_step_files(mesh_id, data, sm)
+        return sm.mesh
+
+    @staticmethod
+    def _tessellate(data: bytes) -> StepMesh:
+        try:
+            return load_step(data)
+        except ImportError as exc:  # the OpenCascade extra is missing: report it like bad input
+            raise ValueError(str(exc)) from exc
+
+    def _write_step_files(self, mesh_id: str, data: bytes, sm: StepMesh) -> None:
+        _write_atomic(self.mesh_dir / f"{mesh_id}.step", data)
+        _write_atomic(self.mesh_dir / f"{mesh_id}.stl", bytes(sm.mesh.export(file_type="stl")))
+        # last: its presence marks a complete cache
+        _write_atomic(self.mesh_dir / f"{mesh_id}.brep.npz", sm.to_npz_bytes())
+
+    def _read_step_cache(self, mesh_id: str) -> StepMesh | None:
+        try:
+            return StepMesh.from_npz_bytes((self.mesh_dir / f"{mesh_id}.brep.npz").read_bytes())
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _info(mesh_id: str, name: str, mesh: trimesh.Trimesh) -> MeshInfo:
+        facets = mesh.metadata.get(META_FACETS)
+        step = {} if facets is None else {"source": "step", "n_brep_faces": len(facets)}
+        return MeshInfo(id=mesh_id, name=name, **mesh_info(mesh), **step)
+
+    def mesh_info(self, mesh_id: str) -> MeshInfo:
+        name = self._mesh_meta(mesh_id).get("name", mesh_id)
+        return self._info(mesh_id, name, self.get_mesh(mesh_id))
 
     def _mesh_meta(self, mesh_id: str) -> dict:
         if not _MESH_ID.fullmatch(mesh_id):
@@ -131,6 +181,21 @@ class Store:
             return json.loads((self.mesh_dir / f"{mesh_id}.json").read_text())
         except (OSError, ValueError) as exc:
             raise NotFoundError(f"mesh {mesh_id} not found (upload it again)") from exc
+
+    def _load_from_disk(self, mesh_id: str, file_type: str) -> trimesh.Trimesh:
+        if file_type == "step":
+            cached = self._read_step_cache(mesh_id)
+            if cached is not None:
+                return cached.mesh
+        try:
+            data = (self.mesh_dir / f"{mesh_id}.{file_type}").read_bytes()
+        except OSError as exc:
+            raise NotFoundError(f"mesh {mesh_id} not found (upload it again)") from exc
+        if file_type != "step":
+            return load_mesh(data, file_type)
+        sm = self._tessellate(data)  # cache lost or damaged: tessellate the original again
+        self._write_step_files(mesh_id, data, sm)
+        return sm.mesh
 
     def get_mesh(self, mesh_id: str) -> trimesh.Trimesh:
         """The processed mesh every face-serving endpoint uses (face ids agree). Read-only."""
@@ -144,13 +209,7 @@ class Store:
             with self._lock:
                 if mesh_id in self._meshes:
                     return self._meshes[mesh_id]
-            meta = self._mesh_meta(mesh_id)
-            path = self.mesh_dir / f"{mesh_id}.{meta['file_type']}"
-            try:
-                data = path.read_bytes()
-            except OSError as exc:
-                raise NotFoundError(f"mesh {mesh_id} not found (upload it again)") from exc
-            mesh = load_mesh(data, meta["file_type"])
+            mesh = self._load_from_disk(mesh_id, self._mesh_meta(mesh_id)["file_type"])
             with self._lock:
                 self._meshes[mesh_id] = mesh
                 while len(self._meshes) > MESH_CACHE:
@@ -158,20 +217,36 @@ class Store:
             return mesh
 
     def mesh_facets(self, mesh_id: str, angle_deg: float) -> tuple[list[dict], int]:
-        """(facets sorted by area, total count). Cached per (mesh, angle)."""
+        """(facets sorted by area, total count). Cached per (mesh, angle).
+
+        STEP meshes list their B-rep faces (exact kind/radius/axis, `brep_face` set) and ignore
+        the angle.
+        """
+        mesh = self.get_mesh(mesh_id)
+        step_facets = mesh.metadata.get(META_FACETS)
+        if step_facets is not None:
+            return step_facets, len(step_facets)
         key = (mesh_id, float(angle_deg))
         with self._lock:
             hit = self._facets.get(key)
             if hit is not None:
                 self._facets.move_to_end(key)
                 return hit
-        facets, _ = compute_facets(self.get_mesh(mesh_id), float(angle_deg))
+        facets, _ = compute_facets(mesh, float(angle_deg))
         out = (facets, len(facets))
         with self._lock:
             self._facets[key] = out
             while len(self._facets) > FACET_CACHE:
                 self._facets.popitem(last=False)
         return out
+
+    def facet_faces(
+        self, mesh_id: str, facet_ids: Sequence[int], angle_deg: float = 5.0
+    ) -> np.ndarray:
+        """Triangle ids of the given facets (ids as listed by `mesh_facets`). ValueError if unknown."""
+        mesh = self.get_mesh(mesh_id)
+        tris = facet_triangles(mesh, facet_ids)
+        return tris if tris is not None else mesh_facet_faces(mesh, float(angle_deg), facet_ids)
 
     # ---- projects -------------------------------------------------------------------------------
 
