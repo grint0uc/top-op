@@ -8,6 +8,12 @@
   them: pyamg smoothed aggregation, whose aggregates/prolongators are kept for up to `reuse` solves
   while the operators and smoothers are refreshed from the new matrix.
 
+The geometric V-cycle is SPD only while the Chebyshev upper bound covers lambda_max(D^-1 A) of
+every level: modes above (1 + lo) * lmax are amplified and CG breaks down. lmax is a fresh Lanczos
+estimate on every refresh (`GeometricMG._lmax`). If CG still breaks down, `solve` restarts from
+zero, then retries with Gershgorin bounds (SPD by construction), then Jacobi-PCG; `SolveInfo.method`
+says which one produced the result.
+
 Reusing a whole hierarchy (stale fine/coarse operators) does not work for SIMP: void elements
 change stiffness by up to 1e7 between iterations and CG needs 600 to >2000 iterations; reusing
 only the prolongators costs a few extra CG iterations. See docs/PERF.md.
@@ -55,6 +61,14 @@ DEFAULT_REUSE = 20
 CHANGE_TIGHT, CHANGE_LOOSE = 0.02, 0.1
 COARSE_DENSE_MAX = 3000
 PAR_MIN_NNZ = 200_000  # below this a level runs serially (thread hand-off costs ~50 us)
+# Chebyshev upper bound = LMAX_BOOST * (largest Ritz value + its residual) after LANCZOS_STEPS
+# Lanczos steps. That estimate was >= 0.967 lambda_max(D^-1 A) on every level of the L-bracket
+# stress run (0.937 at 6 steps, 0.998 at 10); the cycle stays SPD down to 1 / 1.21 = 0.826.
+LANCZOS_STEPS = 8
+LMAX_BOOST = 1.1
+# fallback chain of a broken-down geometric-MG CG, in escalation order (SolveInfo.method)
+GMG_METHODS = ("gmg", "gmg-restart", "gmg-safe", "jacobi-pcg")
+JACOBI_MAXITER_FACTOR = 5  # Jacobi-PCG (last resort) gets this many times `maxiter`
 
 
 @dataclass
@@ -63,7 +77,7 @@ class SolveInfo:
     iterations: int  # CG iterations summed over load cases (0 for direct)
     residual: float  # max over cases of ||F - K U|| / ||F||
     time: float
-    method: str = ""  # band | splu | gmg | sa
+    method: str = ""  # band | splu | gmg | sa | a GMG fallback (GMG_METHODS)
     rtol: float = 0.0  # CG tolerance used (0 for direct)
     setup_time: float = 0.0  # factorization / hierarchy refresh part of `time`
 
@@ -243,6 +257,17 @@ def _csr_rows(M: sp.csr_matrix, lo: int, hi: int) -> sp.csr_matrix:
     )
 
 
+def _jacobi_gershgorin(A: sp.csr_matrix) -> float:
+    """Upper bound of lambda_max(D^-1 A): the smaller max row sum of D^-1 |A| and D^-1/2 |A| D^-1/2
+    (both similar to D^-1 A up to signs, and any induced norm bounds the spectral radius)."""
+    d = A.diagonal().astype(np.float64)
+    absA = abs(A).astype(np.float64)
+    s = 1.0 / np.sqrt(np.where(d > 0, d, np.inf))
+    g1 = absA @ np.ones(A.shape[0]) * s * s
+    g2 = s * (absA @ s)
+    return max(float(min(g1.max(initial=0.0), g2.max(initial=0.0))), 1e-12)
+
+
 def _galerkin(R: sp.csr_matrix, A: sp.csr_matrix, P: sp.csr_matrix, threads: int) -> sp.csr_matrix:
     """R A P as (R_j A) P over row blocks j of R in threads (scipy's SpGEMM releases the GIL).
 
@@ -260,7 +285,10 @@ class GeometricMG:
     """V-cycle preconditioner on fixed prolongators; `update(K)` refreshes the operators.
 
     Level 0 stays in K's dtype (float32 runs smooth in float32), coarser levels are float64.
-    Smoother: Chebyshev of `degree` on D^-1 A over [lo * lmax, lmax], lmax = 1.1 * power estimate.
+    Smoother: Chebyshev of `degree` on D^-1 A over [lo * lmax, lmax], lmax = 1.1 * Lanczos estimate
+    of lambda_max (`make_safe`: Gershgorin bound). Same polynomial before and after the coarse
+    correction and R = P^T, so the cycle is symmetric; it is positive definite while every level's
+    lambda_max(D^-1 A) <= (1 + lo) * lmax.
     """
 
     def __init__(
@@ -276,7 +304,7 @@ class GeometricMG:
         self.degree = int(degree)
         self.lo = float(lo)
         self.threads = default_threads() if threads is None else max(1, int(threads))
-        self._eig_vecs: list[np.ndarray | None] = [None] * len(self.P)
+        self._start: dict[int, np.ndarray] = {}  # fixed random Lanczos start vector per level
         self.levels: list[dict] = []
         self.coarse = None
 
@@ -301,7 +329,7 @@ class GeometricMG:
             n = A.shape[0]
             for name in ("x", "r", "y", "d", "dn", "b"):
                 L[name] = np.empty(n, dtype=A.dtype)
-            L["lmax"] = 1.1 * self._power(lvl, blk, dinv, L)
+            L["lmax"] = LMAX_BOOST * self._lmax(lvl, blk, dinv, L)
             levels.append(L)
             A = _galerkin(R, A, P, th)
             if A.dtype != np.float64:
@@ -310,24 +338,53 @@ class GeometricMG:
         self.coarse = self._factor_coarse(A)
         self.coarse_n = A.shape[0]
 
-    def _power(self, lvl: int, blk: _Blocks, dinv: np.ndarray, L: dict, its: int = 8) -> float:
+    def _lmax(self, lvl: int, blk: _Blocks, dinv: np.ndarray, L: dict) -> float:
+        """lambda_max(D^-1 A) from above in practice: largest Ritz value + its residual norm.
+
+        Lanczos on D^-1/2 A D^-1/2 (three-term recurrence, no stored basis) from a fixed random
+        start. Not warm-started: the previous solve's dominant vector is often localized on a
+        void/solid interface that has since moved, and iterating from it found half of
+        lambda_max on the L-bracket stress run (solver breakdown, see tests/test_solver.py).
+        """
         n = dinv.size
-        v = self._eig_vecs[lvl]
-        if v is None or v.size != n:
-            v = np.random.default_rng(lvl).random(n).astype(dinv.dtype)
-        y = L["y"]
-        lam = 1.0
-        for k in range(its if self._eig_vecs[lvl] is None else max(4, its // 2)):
-            nv = float(np.linalg.norm(v))
-            if nv == 0:
+        steps = min(LANCZOS_STEPS, n)
+        if steps == 0:
+            return 1.0
+        q = self._start.get(lvl)
+        if q is None or q.size != n or q.dtype != dinv.dtype:
+            v = np.random.default_rng(lvl).standard_normal(n)
+            q = self._start[lvl] = (v / np.linalg.norm(v)).astype(dinv.dtype)
+        s = np.sqrt(dinv)
+        # the V-cycle's level buffers are free until its first call; no temporaries
+        w, y, bufs = L["d"], L["y"], (L["x"], L["r"])
+        axpy = sl.blas.get_blas_funcs("axpy", (y,))
+        alpha, beta = np.zeros(steps), np.zeros(steps)
+        q_prev = None
+        for j in range(steps):
+            np.multiply(s, q, out=w)
+            blk.matvec(w, y)
+            y *= s
+            alpha[j] = a = float(q @ y)
+            axpy(q, y, a=-a)
+            if q_prev is not None:
+                axpy(q_prev, y, a=-beta[j - 1])
+            beta[j] = b = float(np.linalg.norm(y))
+            if not b > 1e-10 * abs(a):  # invariant subspace: the Ritz values are exact
+                steps = j + 1
                 break
-            v = v / nv
-            blk.matvec(v, y)
-            w = dinv * y
-            lam = float(np.linalg.norm(w))
-            v = w
-        self._eig_vecs[lvl] = v
-        return max(lam, 1e-12)
+            # bufs[j % 2] holds q_prev (already used) from step 2 on
+            q_prev, q = q, np.multiply(y, 1.0 / b, out=bufs[j % 2])
+        if steps == 1:
+            return max(alpha[0] + beta[0], 1e-12)
+        vals, vecs = sl.eigh_tridiagonal(alpha[:steps], beta[: steps - 1])
+        i = int(np.argmax(vals))
+        return max(float(vals[i] + abs(beta[steps - 1] * vecs[-1, i])), 1e-12)
+
+    def make_safe(self) -> None:
+        """Chebyshev bounds from Gershgorin's theorem until the next `update`: never below
+        lambda_max, so the cycle is SPD by construction (1.3-2x loose: weaker smoothing)."""
+        for L in self.levels:
+            L["lmax"] = _jacobi_gershgorin(L["A"].A)
 
     @staticmethod
     def _factor_coarse(A: sp.csr_matrix):
@@ -633,7 +690,7 @@ class LinearSolver:
             rtol = self.rtol_for(change)
             X0 = None if x0 is None else np.asarray(x0).reshape(Fm.shape)
             if method == "gmg":
-                U, its, setup = self._gmg(K, Fm, X0, rtol)
+                U, its, setup, method = self._gmg(K, Fm, X0, rtol)
             else:
                 U, its, setup = self._amg(K, Fm, X0, rigid_modes, rtol)
         self.last_method = method
@@ -672,40 +729,44 @@ class LinearSolver:
         b: np.ndarray,
         x0: np.ndarray | None,
         rtol: float,
-    ) -> tuple[np.ndarray, int]:
+        maxiter: int | None = None,
+    ) -> tuple[np.ndarray, int, str, float]:
+        """(x, iterations, status, |r|/|b|); status converged | maxiter | breakdown, the last when
+        p.Ap <= 0 or r.z <= 0 (or NaN): K or M is not SPD and CG cannot continue."""
+        maxiter = self.maxiter if maxiter is None else maxiter
         bnorm = float(np.linalg.norm(b))
         if bnorm == 0.0:
-            return np.zeros_like(b), 0
+            return np.zeros_like(b), 0, "converged", 0.0
         x = np.zeros_like(b) if x0 is None else np.array(x0, dtype=np.float64)
         r = b - matvec(x) if x0 is not None else b.copy()
         stop = rtol * bnorm
-        if float(np.linalg.norm(r)) <= stop:
-            return x, 0
+        rn = float(np.linalg.norm(r))
+        if rn <= stop:
+            return x, 0, "converged", rn / bnorm
         z = M(r)
         p = z.copy()
         rz = float(r @ z)
-        for it in range(1, self.maxiter + 1):
+        for it in range(1, maxiter + 1):
             q = matvec(p)
             pq = float(p @ q)
-            if not pq > 0 or not rz > 0:
-                warnings.warn("CG breakdown (matrix or preconditioner not SPD)", stacklevel=4)
-                return x, it
+            if not (pq > 0 and rz > 0):
+                return x, it, "breakdown", rn / bnorm
             alpha = rz / pq
             x += alpha * p
             r -= alpha * q
-            if float(np.linalg.norm(r)) <= stop:
-                return x, it
+            rn = float(np.linalg.norm(r))
+            if rn <= stop:
+                return x, it, "converged", rn / bnorm
             z = M(r)
             rz_new = float(r @ z)
             p *= rz_new / rz
             p += z
             rz = rz_new
-        warnings.warn(f"CG did not reach rtol={rtol} in {self.maxiter} iterations", stacklevel=4)
-        return x, self.maxiter
+        return x, maxiter, "maxiter", rn / bnorm
 
     def _gmg(
         self, K: sp.spmatrix, F: np.ndarray, X0: np.ndarray | None, rtol: float
-    ) -> tuple[np.ndarray, int, float]:
+    ) -> tuple[np.ndarray, int, float, str]:
         t0 = time.perf_counter()
         if self._mg is None:
             self._mg = GeometricMG(
@@ -723,13 +784,55 @@ class LinearSolver:
             return blk.matvec64(v, yb).copy()
 
         U = np.zeros(F.shape, dtype=np.float64)
-        total = 0
+        total, level = 0, 0
         for c in range(F.shape[1]):
             b = np.asarray(F[:, c], dtype=np.float64)
             x0 = None if X0 is None else np.asarray(X0[:, c], dtype=np.float64)
-            U[:, c], its = self._pcg(matvec, mg, b, x0, rtol)
+            U[:, c], its, lvl = self._gmg_case(K, matvec, mg, b, x0, rtol)
             total += its
-        return U, total, setup
+            level = max(level, lvl)
+        return U, total, setup, GMG_METHODS[level]
+
+    def _gmg_case(self, K, matvec, mg: GeometricMG, b, x0, rtol) -> tuple[np.ndarray, int, int]:
+        """One load case. CG that breaks down (or stalls) escalates through GMG_METHODS: restart
+        from zero, Gershgorin smoother bounds, Jacobi-PCG. (x, its, index into GMG_METHODS)."""
+        x, its, status, res = self._pcg(matvec, mg, b, x0, rtol)
+        if status == "converged":
+            return x, its, 0
+        best = (res, x)
+        if status == "breakdown" and x0 is not None:  # same V-cycle, Krylov space from zero
+            x, n, status, res = self._pcg(matvec, mg, b, None, rtol)
+            its += n
+            if status == "converged":
+                return x, its, 1
+            best = min(best, (res, x), key=lambda t: t[0])
+        what = "broke down" if status == "breakdown" else f"did not converge in {self.maxiter} its"
+        warnings.warn(
+            f"multigrid CG {what} (rel. residual {best[0]:.1e}); retrying with Gershgorin smoother "
+            "bounds",
+            stacklevel=5,
+        )
+        mg.make_safe()
+        x, n, status, res = self._pcg(matvec, mg, b, None, rtol)
+        its += n
+        if status == "converged":
+            return x, its, 2
+        best = min(best, (res, x), key=lambda t: t[0])
+        warnings.warn(
+            f"multigrid CG with Gershgorin bounds: {status}; falling back to Jacobi-PCG",
+            stacklevel=5,
+        )
+        d = K.diagonal().astype(np.float64)
+        dinv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
+        maxiter = JACOBI_MAXITER_FACTOR * self.maxiter
+        x, n, status, res = self._pcg(matvec, lambda r: dinv * r, b, None, rtol, maxiter)
+        its += n
+        if status != "converged":
+            res, x = min(best, (res, x), key=lambda t: t[0])
+            warnings.warn(
+                f"CG did not reach rtol={rtol} (best rel. residual {res:.1e})", stacklevel=5
+            )
+        return x, its, 3
 
     def _amg(
         self,
