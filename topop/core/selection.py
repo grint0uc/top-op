@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import trimesh
@@ -78,14 +78,18 @@ def faces_from_normal(
 # is within angle_deg of the group's area-weighted mean normal and within 2*angle_deg of the seed
 # normal, so growth stops on fillets and spheres (curved surfaces fragment into thin strips).
 # B: Phase-A groups that are *strips* (see `_STRIP_AREA_RATIO`) are chained into curved regions
-# through "smooth" adjacencies (mean normals within 3*angle_deg) and each region is tested
-# against a cylinder model. Strips are split into cylinder-like and sphere-like ones by their
-# discrete bending tensor sum(theta_e * len_e * e e^T) over their smooth mesh edges: on a
-# cylinder every bend is around the axis (rank 1), on a sphere it is isotropic. Only like joins
-# like, so a capsule's barrel and caps end up in different regions. A fitted cylinder then sheds
-# boundary faces that leave its surface (`_peel`) and takes back connected faces that lie on it
-# (`_grab`), so the tolerance of Phase A does not blur where a fillet starts. Strips that are no
-# cylinder become "other", one facet per smoothly connected patch.
+# through "smooth" adjacencies (mean normals within 3*angle_deg) or "regular" ones (equal steps
+# between equal flat strips of a coarse tessellation, see `_regular_pairs`) and each region is
+# tested against a cylinder model. Strips are split into cylinder-like and sphere-like ones by
+# their discrete bending tensor sum(theta_e * len_e * e e^T) over their smooth or regular mesh
+# edges: on a cylinder every bend is around the axis (rank 1), on a sphere it is isotropic. Only
+# like joins like, so a capsule's barrel and caps end up in different regions. A fitted cylinder
+# then sheds boundary faces that leave its surface (`_peel`) and takes back connected faces that
+# lie on it (`_grab`), so the tolerance of Phase A does not blur where a fillet starts.
+# Adjacent cylinders on one axis line merge (a seam or a change of tessellation density splits a
+# region). Strips that are no cylinder become "other", one facet per smoothly connected patch. A
+# mostly sphere-like patch that fits a sphere becomes a "sphere" and grabs the connected faces
+# that lie on it (`_grab_sphere`: rows of a coarse sphere that Phase B could not chain).
 
 _SMOOTH_FACTOR = 3.0  # strips chain when their mean normals differ by <= 3 * angle_deg
 # A Phase-A group is a strip (a fragment of a curved surface) when it has a smooth neighbour
@@ -97,6 +101,15 @@ _CYL_RESIDUAL = 0.02  # max rms radial residual of the circle fit, relative to t
 _CYL_MIN_GROUPS = 3  # a cylinder region needs >= 3 Phase-A groups (2 planes at 10 deg are no arc)
 _CYL_MIN_TURN = 4.0  # ... and normals turning by >= 4 * angle_deg (3 planks at 6 deg are no arc)
 _BIG_FLAT = 0.1  # in a region that is no cylinder, flat groups with >= 10 % of its area are planes
+# Coarse tessellation: flat strips chain across steps above 3 * angle_deg up to this many degrees
+# when the steps, hinge lengths and strip areas agree within _REGULAR_TOL. 37 deg: a 10-gon (36)
+# is still a cylinder, an octagon (45) and anything coarser stay planes.
+_REGULAR_MAX_STEP = 37.0
+_REGULAR_TOL = 0.2
+_MERGE_AXIS_DEG = 10.0  # adjacent cylinders merge: axes within max(3 * angle_deg, 10 deg), and
+_MERGE_TOL = 0.05  # radii within 5 %, axis lines (sphere centres) within 5 % of the radius
+_SPH_RESIDUAL = 0.02  # max rms radial residual of the sphere fit, relative to the radius
+_SPH_INLIERS = 0.95  # share of faces whose normal is within angle_deg of (centroid - centre)
 # A face this thin (altitude / sqrt(total area)) whose normal disagrees with all its neighbours
 # has a noise normal (float32 STL rounding tilts it 1 deg at ~4e-6): it joins any group, unweighted.
 _SLIVER = 1e-4
@@ -215,7 +228,7 @@ def _fit_cylinder(mesh: trimesh.Trimesh, faces: np.ndarray, angle_deg: float) ->
         return None
     w, v = np.linalg.eigh((n * a[:, None]).T @ n)
     axis = v[:, 0]
-    if w[1] < tot * np.radians(_CYL_MIN_TURN * angle_deg) ** 2 / 12:  # spread t: ~t^2/12
+    if w[1] < tot * _min_spread(angle_deg):
         return None
     na = np.abs(n @ axis)
     if np.sqrt(np.sum(a * na**2) / tot) > np.sin(np.radians(angle_deg)):
@@ -307,6 +320,270 @@ def _grab(
     return np.concatenate(taken) if taken else np.zeros(0, dtype=np.int64)
 
 
+def _min_spread(angle_deg: float) -> float:
+    """Variance of normals turning uniformly by _CYL_MIN_TURN * angle_deg (t^2 / 12)."""
+    return float(np.radians(_CYL_MIN_TURN * angle_deg) ** 2 / 12)
+
+
+def _normal_spread(second: np.ndarray, first: np.ndarray, tot: np.ndarray | float) -> np.ndarray:
+    """Middle eigenvalue of the area-weighted covariance of unit normals, from sum(a n n^T)
+    (...,3,3), sum(a n) (...,3) and sum(a): how far the normals turn in their second direction
+    (t^2 / 12 for a uniform turn by t). The least one is ~0 for any cap (normals near a mean)."""
+    tot = np.asarray(tot, dtype=np.float64)[..., None, None]
+    mean = first[..., :, None] / tot
+    return np.linalg.eigvalsh(second / tot - mean * np.swapaxes(mean, -1, -2))[..., 1]
+
+
+def _close(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    return np.abs(x - y) <= _REGULAR_TOL * np.maximum(np.abs(x), np.abs(y))
+
+
+def _regular_pairs(
+    gp: np.ndarray,
+    phi: np.ndarray,
+    hinge: np.ndarray,
+    bend: np.ndarray,
+    g_area: np.ndarray,
+    g_flat: np.ndarray,
+    lo: float,
+) -> np.ndarray:
+    """Mask over the group pairs `gp`: steps of a coarsely tessellated curve. A pair A-B of flat
+    groups at lo < phi <= _REGULAR_MAX_STEP qualifies when the chain continues on B's (or A's)
+    other side, B-C, with the same step, hinge length (shared edge length) and bend sign, and
+    A, B, C have the same area (equal hinges and areas: equal strip widths). A feature edge
+    between two flats has no such continuation, nor has a chamfer between flats of other widths.
+    `phi`, `hinge`, `bend` (+1 convex, -1 concave, 0 mixed) are per pair."""
+    ok = np.zeros(len(gp), dtype=bool)
+    idx = np.flatnonzero(
+        (phi > lo)
+        & (phi <= np.radians(_REGULAR_MAX_STEP))
+        & (bend != 0)
+        & g_flat[gp[:, 0]]
+        & g_flat[gp[:, 1]]
+    )
+    # incidences (centre group, other group, pair) with both groups of about the same area,
+    # grouped by centre; a centre with k incidences is the middle of k(k-1)/2 candidate chains
+    c = np.concatenate([gp[idx, 0], gp[idx, 1]])
+    o = np.concatenate([gp[idx, 1], gp[idx, 0]])
+    p = np.concatenate([idx, idx])
+    keep = _close(g_area[c], g_area[o])
+    c, o, p = c[keep], o[keep], p[keep]
+    srt = np.lexsort((p, c))
+    c, o, p = c[srt], o[srt], p[srt]
+    for off in range(1, len(c)):
+        i = np.flatnonzero(c[:-off] == c[off:])
+        if i.size == 0:
+            break
+        a, b = p[i], p[i + off]
+        good = (
+            _close(phi[a], phi[b])
+            & _close(hinge[a], hinge[b])
+            & (bend[a] == bend[b])
+            & _close(g_area[o[i]], g_area[o[i + off]])
+        )
+        ok[a[good]] = True
+        ok[b[good]] = True
+    return ok
+
+
+class _Sphere(NamedTuple):
+    center: np.ndarray
+    radius: float
+    resid: float  # rms radial residual / radius
+    sign: float  # +1 normals point away from the centre, -1 towards it (a pocket)
+
+
+def _fit_sphere(
+    mesh: trimesh.Trimesh, faces: np.ndarray, unreliable: np.ndarray, angle_deg: float
+) -> _Sphere | None:
+    """Algebraic least squares |x|^2 + a.x + b = 0 on the vertices. None unless the normals turn
+    by >= _CYL_MIN_TURN * angle_deg both ways (`_normal_spread`), the rms radial residual is <=
+    _SPH_RESIDUAL * radius and the face normals point along (centroid - centre), all outwards
+    or all inwards, within angle_deg on >= _SPH_INLIERS of the reliable faces."""
+    n = np.asarray(mesh.face_normals)[faces]
+    a = np.asarray(mesh.area_faces)[faces]
+    tot = float(a.sum())
+    if not tot > 0 or _normal_spread((n * a[:, None]).T @ n, a @ n, tot) < _min_spread(angle_deg):
+        return None
+    pts = np.asarray(mesh.vertices)[np.unique(np.asarray(mesh.faces)[faces])]
+    mean = pts.mean(0)
+    q = pts - mean
+    scale = float(np.sqrt(np.mean(np.einsum("ij,ij->i", q, q))))
+    if not scale > 0:
+        return None
+    q /= scale
+    lhs = np.concatenate([2 * q, np.ones((len(q), 1))], 1)
+    sol, *_ = np.linalg.lstsq(lhs, np.einsum("ij,ij->i", q, q), rcond=None)
+    c = sol[:3]
+    r2 = float(sol[3] + c @ c)
+    if not r2 > 0:
+        return None
+    r = np.sqrt(r2)
+    resid = float(np.sqrt(np.mean((np.linalg.norm(q - c, axis=1) - r) ** 2)) / r)
+    if resid > _SPH_RESIDUAL:
+        return None
+    center = mean + scale * c
+    d = np.asarray(mesh.triangles_center)[faces] - center
+    dn = np.linalg.norm(d, axis=1)
+    cos = np.divide(np.einsum("ij,ij->i", d, n), dn, out=np.zeros(len(d)), where=dn > 0)
+    sign = 1.0 if np.sum(a * cos) >= 0 else -1.0
+    ok = (sign * cos >= np.cos(np.radians(angle_deg)))[~unreliable]
+    if ok.size and ok.mean() < _SPH_INLIERS:
+        return None
+    return _Sphere(center, float(scale * r), resid, sign)
+
+
+def _grab_sphere(
+    mesh: trimesh.Trimesh,
+    adj: sparse.csr_matrix,
+    faces: np.ndarray,
+    sph: _Sphere,
+    free: np.ndarray,
+    unreliable: np.ndarray,
+    angle_deg: float,
+) -> np.ndarray:
+    """Faces of `free` connected to the sphere that lie on it: every vertex within
+    max(4 * rms residual, 1e-3) * radius of the surface, normal within angle_deg of the radial
+    direction at the centroid. On a coarse sphere the rows near the poles or steps between
+    unequal bands do not chain in Phase B and end up as small planes, cylinders or patches."""
+    tol = max(4 * sph.resid, 1e-3) * sph.radius
+    cos_n = np.cos(np.radians(angle_deg))
+    normals = np.asarray(mesh.face_normals)
+    seen = np.zeros(len(mesh.faces), dtype=bool)
+    seen[faces] = True
+    front, taken = faces, []
+    while front.size:
+        nb = np.unique(adj[front].indices)
+        nb = nb[free[nb] & ~seen[nb]]
+        seen[nb] = True
+        r = np.linalg.norm(np.asarray(mesh.triangles)[nb] - sph.center, axis=2)
+        d = np.asarray(mesh.triangles_center)[nb] - sph.center
+        dn = np.linalg.norm(d, axis=1)
+        cos = np.divide(
+            np.einsum("ij,ij->i", d, normals[nb]), dn, out=np.zeros(len(nb)), where=dn > 0
+        )
+        ok = np.all(np.abs(r - sph.radius) <= tol, axis=1) & (
+            (sph.sign * cos >= cos_n) | unreliable[nb]
+        )
+        front = nb[ok]
+        taken.append(front)
+    return np.concatenate(taken) if taken else np.zeros(0, dtype=np.int64)
+
+
+def _same_cylinder(p: _Cylinder, q: _Cylinder, angle_deg: float) -> bool:
+    tol = np.cos(np.radians(max(_SMOOTH_FACTOR * angle_deg, _MERGE_AXIS_DEG)))
+    if abs(float(p.axis @ q.axis)) < tol:
+        return False
+    if abs(p.radius - q.radius) > _MERGE_TOL * max(p.radius, q.radius):
+        return False
+    d = q.center - p.center
+    off = max(np.linalg.norm(d - (d @ p.axis) * p.axis), np.linalg.norm(d - (d @ q.axis) * q.axis))
+    return bool(off <= _MERGE_TOL * min(p.radius, q.radius))
+
+
+def _same_sphere(p: _Sphere, q: _Sphere) -> bool:
+    r = min(p.radius, q.radius)
+    return bool(
+        abs(p.radius - q.radius) <= _MERGE_TOL * max(p.radius, q.radius)
+        and np.linalg.norm(p.center - q.center) <= _MERGE_TOL * r
+    )
+
+
+def _merge_adjacent(
+    adj: np.ndarray,
+    owner: np.ndarray,
+    items: list[tuple[np.ndarray, Any]],
+    same: Callable[[Any, Any], bool],
+    refit: Callable[[np.ndarray], Any],
+) -> tuple[list[tuple[np.ndarray, Any]], np.ndarray]:
+    """Transitively merge items (faces, fit) that share a mesh edge, `same` their fits and refit
+    as one (`refit(faces)` not None). `owner`: item id per face or -1. Pairs are visited in id
+    order and a merged item keeps the lower id, so the result is deterministic."""
+    if len(items) < 2:
+        return items, owner
+    oa, ob = owner[adj[:, 0]], owner[adj[:, 1]]
+    m = (oa >= 0) & (ob >= 0) & (oa != ob)
+    root = list(range(len(items)))
+
+    def find(i: int) -> int:
+        while root[i] != i:
+            root[i] = root[root[i]]
+            i = root[i]
+        return i
+
+    faces = [f for f, _ in items]
+    fits = [g for _, g in items]
+    for a, b in np.unique(np.sort(np.stack([oa[m], ob[m]], 1), axis=1), axis=0).tolist():
+        ra, rb = find(a), find(b)
+        if ra == rb or not same(items[a][1], items[b][1]):
+            continue
+        union = np.union1d(faces[ra], faces[rb])
+        fit = refit(union)
+        if fit is None:
+            continue
+        lo, hi = min(ra, rb), max(ra, rb)
+        root[hi] = lo
+        faces[lo], fits[lo] = union, fit
+    roots = sorted({find(i) for i in range(len(items))})
+    if len(roots) == len(items):
+        return items, owner
+    new = np.empty(len(items), dtype=np.int64)
+    new[roots] = np.arange(len(roots))
+    remap = new[[find(i) for i in range(len(items))]]
+    owner = np.where(owner >= 0, remap[np.maximum(owner, 0)], -1)
+    return [(faces[r], fits[r]) for r in roots], owner
+
+
+def _find_spheres(
+    mesh: trimesh.Trimesh,
+    patch: np.ndarray,
+    oth: np.ndarray,
+    doubly: np.ndarray,
+    unreliable: np.ndarray,
+    angle_deg: float,
+) -> tuple[list[tuple[np.ndarray, _Sphere]], np.ndarray]:
+    """Sphere fits of the "other" patches (`patch` label per face, used where `oth`) and the
+    sphere id per face (-1 elsewhere). Only patches with >= 4 faces, normals that turn both ways
+    and at least half of their area `doubly` curved (Phase-B groups with an isotropic bending
+    tensor) are fitted: any two coaxial circles lie on a sphere, so a cone, a countersink or a
+    torus band (singly curved: rank-1 bending) would pass the residual and normal tests."""
+    sph_of_face = np.full(len(mesh.faces), -1, dtype=np.int64)
+    ids = np.flatnonzero(oth)
+    if ids.size < 4:
+        return [], sph_of_face
+    _, lbl, cnt = np.unique(patch[ids], return_inverse=True, return_counts=True)
+    lbl = lbl.ravel()
+    big = cnt[lbl] >= 4
+    ids, lbl = ids[big], lbl[big]
+    if ids.size == 0:
+        return [], sph_of_face
+    _, lbl = np.unique(lbl, return_inverse=True)
+    lbl = lbl.ravel()
+    k = int(lbl.max()) + 1
+    n = np.asarray(mesh.face_normals)[ids]
+    a = np.asarray(mesh.area_faces)[ids]
+    tens = np.zeros((k, 3, 3))
+    for i in range(3):
+        for j in range(i, 3):
+            tens[:, i, j] = tens[:, j, i] = np.bincount(
+                lbl, weights=a * n[:, i] * n[:, j], minlength=k
+            )
+    tot = np.bincount(lbl, weights=a, minlength=k)
+    turns = (_normal_spread(tens, _bincount3(lbl, a, n, k), tot) >= _min_spread(angle_deg)) & (
+        np.bincount(lbl, weights=a * doubly[ids], minlength=k) >= 0.5 * tot
+    )
+    order = np.argsort(lbl, kind="stable")
+    starts = np.searchsorted(lbl[order], np.arange(k + 1))
+    spheres: list[tuple[np.ndarray, _Sphere]] = []
+    for g in np.flatnonzero(turns).tolist():
+        faces = ids[order[starts[g] : starts[g + 1]]]
+        fit = _fit_sphere(mesh, faces, unreliable[faces], angle_deg)
+        if fit is not None:
+            sph_of_face[faces] = len(spheres)
+            spheres.append((faces, fit))
+    return spheres, sph_of_face
+
+
 def _segment(mesh: trimesh.Trimesh, angle_deg: float) -> _Segmentation:
     n = len(mesh.faces)
     if n == 0:
@@ -335,22 +612,33 @@ def _segment(mesh: trimesh.Trimesh, angle_deg: float) -> _Segmentation:
     g_n = np.divide(g_sum, g_len[:, None], out=np.zeros_like(g_sum), where=g_len[:, None] > 0)
     g_flat = g_len >= np.cos(np.radians(angle_deg / 2)) * g_area
 
-    # ---- phase B: smooth group adjacency, strips, bending tensors
+    # ---- phase B: smooth and regular group adjacency, strips, bending tensors
+    ev = np.asarray(mesh.face_adjacency_edges, dtype=np.int64).reshape(-1, 2)
+    vec = np.asarray(mesh.vertices)[ev[:, 1]] - np.asarray(mesh.vertices)[ev[:, 0]]
+    elen = np.linalg.norm(vec, axis=1)
+    convex_e = np.asarray(mesh.face_adjacency_convex, dtype=bool)
     la, lb = lab[adj[:, 0]], lab[adj[:, 1]]
     cross = la != lb
-    gp = np.unique(np.sort(np.stack([la[cross], lb[cross]], 1), axis=1), axis=0)
+    keys, pinv = np.unique(
+        (np.minimum(la, lb) * ng + np.maximum(la, lb))[cross], return_inverse=True
+    )
+    pinv = pinv.ravel()
+    gp = np.stack([keys // ng, keys % ng], 1)  # sorted pairs of adjacent groups
     phi = np.arccos(np.clip(np.einsum("ij,ij->i", g_n[gp[:, 0]], g_n[gp[:, 1]]), -1, 1))
-    gp = gp[(phi <= smooth) & (g_area[gp[:, 0]] > 0) & (g_area[gp[:, 1]] > 0)]
+    hinge = np.bincount(pinv, weights=elen[cross], minlength=len(gp))
+    signed = np.where(convex_e, elen, -elen)[cross]
+    bend_sign = np.sign(np.bincount(pinv, weights=signed, minlength=len(gp)))
+    reg = _regular_pairs(gp, phi, hinge, bend_sign, g_area, g_flat, smooth)
+    reg_edge = np.zeros(len(adj), dtype=bool)  # mesh edges between regular pairs
+    reg_edge[cross] = reg[pinv]
+    gp = gp[((phi <= smooth) | reg) & (g_area[gp[:, 0]] > 0) & (g_area[gp[:, 1]] > 0)]
     nbr_area = np.zeros(ng)
     np.maximum.at(nbr_area, gp[:, 0], g_area[gp[:, 1]])
     np.maximum.at(nbr_area, gp[:, 1], g_area[gp[:, 0]])
     strip = (nbr_area > 0) & (g_area <= _STRIP_AREA_RATIO * nbr_area)
 
-    ev = np.asarray(mesh.face_adjacency_edges, dtype=np.int64).reshape(-1, 2)
-    vec = np.asarray(mesh.vertices)[ev[:, 1]] - np.asarray(mesh.vertices)[ev[:, 0]]
-    elen = np.linalg.norm(vec, axis=1)
     rel = ~unreliable[adj[:, 0]] & ~unreliable[adj[:, 1]]
-    bend = (theta > 0) & (theta <= smooth) & (elen > 0) & rel
+    bend = (theta > 0) & ((theta <= smooth) | reg_edge) & (elen > 0) & rel
     e = vec[bend] / elen[bend, None]
     w = (theta * elen)[bend]
     bcross = cross[bend]
@@ -369,7 +657,7 @@ def _segment(mesh: trimesh.Trimesh, angle_deg: float) -> _Segmentation:
     cyl_like = (lam[:, 2] > 0) & (lam[:, 1] <= _CYL_ANISOTROPY * lam[:, 2])
     # +1 convex, -1 concave: a convex and a concave fillet that meet tangentially (an S-curve)
     # are two cylinders, not one
-    convex = np.asarray(mesh.face_adjacency_convex, dtype=bool)[bend]
+    convex = convex_e[bend]
     g_convex = np.sign(per_group(np.where(convex, w, -w)))
 
     sa, sb = gp[:, 0], gp[:, 1]
@@ -438,14 +726,58 @@ def _segment(mesh: trimesh.Trimesh, angle_deg: float) -> _Segmentation:
             face_kind[extra] = 1
             cyl_of_face[extra] = c
             cylinders[c] = (faces, _fit_cylinder(mesh, faces, angle_deg) or fit)
-    # "other" faces: one facet per smoothly connected patch
+    cylinders, cyl_of_face = _merge_adjacent(
+        adj,
+        cyl_of_face,
+        cylinders,
+        lambda p, q: _same_cylinder(p, q, angle_deg),
+        lambda f: _fit_cylinder(mesh, f, angle_deg),
+    )
+    # "other" faces: one facet per smoothly connected patch, a sphere where one fits
     oth = face_kind == 2
-    sm = oth[adj[:, 0]] & oth[adj[:, 1]] & ((theta <= smooth) | ~rel)
+    sm = oth[adj[:, 0]] & oth[adj[:, 1]] & ((theta <= smooth) | ~rel | reg_edge)
     other_comp = _components(n, adj[sm])
+    doubly = (~cyl_like & (lam[:, 2] > 0))[lab]
+    spheres, sph_of_face = _find_spheres(mesh, other_comp, oth, doubly, unreliable, angle_deg)
+    face_kind[sph_of_face >= 0] = 3
+    lost = np.zeros(len(cylinders), dtype=bool)  # cylinders that gave faces to a sphere
+    grabbed = False
+    for s, (faces, sph) in enumerate(spheres):
+        extra = _grab_sphere(mesh, fadj, faces, sph, face_kind != 3, unreliable, angle_deg)
+        if extra.size:
+            grabbed = True
+            lost[cyl_of_face[extra][cyl_of_face[extra] >= 0]] = True
+            faces = np.union1d(faces, extra)
+            face_kind[extra], sph_of_face[extra], cyl_of_face[extra] = 3, s, -1
+            spheres[s] = (faces, _fit_sphere(mesh, faces, unreliable[faces], angle_deg) or sph)
+    if lost.any():  # what is left of them is refitted, or "other"
+        kept: list[tuple[np.ndarray, _Cylinder]] = []
+        for c, (faces, fit) in enumerate(cylinders):
+            if lost[c]:
+                faces = np.flatnonzero(cyl_of_face == c)
+                fit = _fit_cylinder(mesh, faces, angle_deg) if faces.size else None
+                if fit is None:
+                    face_kind[faces], cyl_of_face[faces] = 2, -1
+                    continue
+            cyl_of_face[faces] = len(kept)  # <= c: later cylinders keep their old ids so far
+            kept.append((faces, fit))
+        cylinders = kept
+    spheres, sph_of_face = _merge_adjacent(
+        adj,
+        sph_of_face,
+        spheres,
+        _same_sphere,
+        lambda f: _fit_sphere(mesh, f, unreliable[f], angle_deg),
+    )
+    oth = face_kind == 2
+    if grabbed:
+        sm = oth[adj[:, 0]] & oth[adj[:, 1]] & ((theta <= smooth) | ~rel | reg_edge)
+        other_comp = _components(n, adj[sm])
 
-    # final label: planes keep their group, cylinders their region, others their patch
+    # final label: planes keep their group, cylinders their region, spheres and others their patch
     key = np.where(face_kind == 0, lab, np.where(face_kind == 1, ng + cyl_of_face, 0))
-    key[oth] = ng + len(cylinders) + other_comp[oth]
+    key[face_kind == 3] = ng + len(cylinders) + sph_of_face[face_kind == 3]
+    key[oth] = ng + len(cylinders) + len(spheres) + other_comp[oth]
     _, final = np.unique(key, return_inverse=True)
     final = final.ravel()
     nf = int(final.max()) + 1
@@ -466,6 +798,8 @@ def _segment(mesh: trimesh.Trimesh, angle_deg: float) -> _Segmentation:
     f_kind[final] = face_kind
     f_cyl = np.full(nf, -1, dtype=np.int64)
     f_cyl[final] = cyl_of_face
+    f_sph = np.full(nf, -1, dtype=np.int64)
+    f_sph[final] = sph_of_face
 
     total = max(float(f_area.sum()), np.finfo(float).tiny)
     rank_order = np.lexsort((first, -np.round(f_area / total, 9)))
@@ -481,13 +815,16 @@ def _segment(mesh: trimesh.Trimesh, angle_deg: float) -> _Segmentation:
             "normal": f_n[g].tolist() if k == 0 else [0.0, 0.0, 0.0],
             "centroid": f_c[g].tolist(),
             "bbox": [f_min[g].tolist(), f_max[g].tolist()],
-            "kind": ("plane", "cylinder", "other")[k],
+            "kind": ("plane", "cylinder", "other", "sphere")[k],
             "axis": None,
             "radius": None,
         }
         if k == 1:
             fit = cylinders[int(f_cyl[g])][1]
             info.update(axis=fit.axis.tolist(), radius=fit.radius, centroid=fit.center.tolist())
+        elif k == 3:
+            sph = spheres[int(f_sph[g])][1]
+            info.update(radius=sph.radius, centroid=sph.center.tolist())
         out.append(info)
     return _Segmentation(rank[final], tuple(out))
 
@@ -509,7 +846,7 @@ def _segmentation(mesh: trimesh.Trimesh, angle_deg: float) -> _Segmentation:
 
 
 def compute_facets(mesh: trimesh.Trimesh, angle_deg: float = 5.0) -> tuple[list[dict], np.ndarray]:
-    """Planar / cylindrical / other face groups as `FacetInfo` dicts + face_to_facet.
+    """Planar / cylindrical / spherical / other face groups as `FacetInfo` dicts + face_to_facet.
 
     Order: area descending (rounded to 1e-9 of the total area), ties by lowest face id. Every
     criterion is invariant under rigid transforms, so ids listed for a raw mesh stay valid after

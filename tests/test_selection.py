@@ -221,6 +221,7 @@ def test_compute_facets_bracket(bracket):
         @ trimesh.transformations.rotation_matrix(0.9, [1, 1, 0])
     )
     assert np.array_equal(compute_facets(moved)[1], f2f)
+    _assert_invariant(mesh, facets, f2f)
     # the holes are one cylinder each at any angle (the old pure chaining split the Ø6 holes,
     # 5.6° between sections, into 64 strips at 5° and merged them at 10°)
     coarse, f2f_coarse = compute_facets(mesh, angle_deg=10)
@@ -229,13 +230,13 @@ def test_compute_facets_bracket(bracket):
 
 
 def test_facets_capsule():
-    """Barrel = one cylinder; the hemispheres stay apart from it and are one 'other' each."""
+    """Barrel = one cylinder; the hemispheres stay apart from it and are one sphere each."""
     tilt = trimesh.transformations.rotation_matrix(0.7, [1, 2, 0])
     mesh = trimesh.creation.capsule(height=2.0, radius=1.0, transform=tilt)  # 64 x 32 sections
     facets, _ = compute_facets(mesh)
     for f in facets:
         FacetInfo(**f)
-    assert _kinds(facets) == {"cylinder": 1, "other": 2}
+    assert _kinds(facets) == {"cylinder": 1, "sphere": 2}
     (barrel,) = [f for f in facets if f["kind"] == "cylinder"]
     assert barrel["radius"] == pytest.approx(1.0, abs=1e-3)
     assert _parallel(barrel["axis"], tilt[:3, 2], 0.1)
@@ -245,18 +246,205 @@ def test_facets_capsule():
     faces = facet_faces(mesh, 5.0, [barrel["id"]])
     z = (mesh.vertices[mesh.faces[faces]] @ tilt[:3, 2]).ravel()
     assert np.all(np.abs(z) <= 1.0 + 1e-9)
-    for cap in (f for f in facets if f["kind"] == "other"):
+    caps = sorted(
+        (f for f in facets if f["kind"] == "sphere"), key=lambda f: f["centroid"] @ tilt[:3, 2]
+    )
+    for cap, z in zip(caps, (-1.0, 1.0)):  # centres at -+height/2 on the axis
         assert cap["area"] == pytest.approx(2 * np.pi, rel=2e-2)
+        assert cap["radius"] == pytest.approx(1.0, abs=1e-3)
+        assert np.allclose(cap["centroid"], z * tilt[:3, 2], atol=1e-3)
         assert cap["normal"] == [0.0, 0.0, 0.0] and cap["axis"] is None
 
 
 def test_facets_icosphere():
     mesh = trimesh.creation.icosphere(4)
     facets, _ = compute_facets(mesh)
-    assert len(facets) <= 3
-    biggest_triangle = mesh.area_faces.max()
-    assert all(f["area"] <= biggest_triangle * (1 + 1e-9) for f in facets if f["kind"] == "plane")
-    assert facets[0]["kind"] == "other" and facets[0]["area"] > 0.99 * mesh.area
+    assert [f["kind"] for f in facets] == ["sphere"]
+    (ball,) = facets
+    FacetInfo(**ball)
+    assert ball["n_faces"] == len(mesh.faces) and ball["area"] == pytest.approx(mesh.area)
+    assert ball["radius"] == pytest.approx(1.0, abs=1e-9)
+    assert np.allclose(ball["centroid"], 0, atol=1e-9)
+    assert ball["normal"] == [0.0, 0.0, 0.0] and ball["axis"] is None
+
+
+@pytest.mark.parametrize("count", [[16, 16], [10, 32], [8, 16]])
+def test_facets_uv_sphere(count):
+    """[10, 32] has 20 deg latitude steps between bands of unequal area, which chain neither as
+    smooth nor as regular strips: the fitted sphere grabs the rows that lie on it."""
+    mesh = trimesh.creation.uv_sphere(radius=2.0, count=count)
+    mesh.apply_translation([1, 2, 3])
+    facets, _ = compute_facets(mesh)
+    assert [f["kind"] for f in facets] == ["sphere"]
+    assert facets[0]["radius"] == pytest.approx(2.0, abs=1e-6)
+    assert np.allclose(facets[0]["centroid"], [1, 2, 3], atol=1e-6)
+
+
+def test_facets_spherical_pocket_and_dome():
+    """Concave (normals towards the centre) and shallow (a +-20 deg cap) spheres."""
+    box = trimesh.creation.box(extents=(30, 30, 30))
+    ball = trimesh.creation.icosphere(3, radius=10)
+    ball.apply_translation((0, 0, 15))
+    pocket = trimesh.boolean.difference([box, ball], engine="manifold")
+    h = 10 * np.cos(np.radians(20))
+    below = trimesh.creation.box(extents=(30, 30, 30))
+    below.apply_translation((0, 0, h - 15))
+    cap = trimesh.boolean.difference(
+        [trimesh.creation.icosphere(4, radius=10), below], engine="manifold"
+    )
+    slab = trimesh.creation.box(extents=(30, 30, 10))
+    slab.apply_translation((0, 0, h - 5))
+    dome = trimesh.boolean.union([slab, cap], engine="manifold")
+    for mesh, center in ((pocket, (0, 0, 15)), (dome, (0, 0, 0))):
+        facets, _ = compute_facets(mesh)
+        assert _kinds(facets) == {"plane": 6, "sphere": 1}
+        (sph,) = [f for f in facets if f["kind"] == "sphere"]
+        assert sph["radius"] == pytest.approx(10, rel=2e-2)
+        assert np.allclose(sph["centroid"], center, atol=0.2)
+
+
+def test_facets_torus_and_cone_are_no_spheres():
+    """Any two coaxial circles lie on a sphere, so torus bands and cones pass a residual test;
+    they are singly curved (rank-1 bending) and stay 'other'."""
+    facets, _ = compute_facets(trimesh.creation.torus(major_radius=5, minor_radius=1))
+    assert _kinds(facets) == {"other": 1}
+    coarse, _ = compute_facets(trimesh.creation.torus(5, 1, 16, 8))  # 22.5 deg minor steps
+    assert set(_kinds(coarse)) == {"other"}
+    facets, _ = compute_facets(trimesh.creation.cone(radius=3, height=6))
+    assert _kinds(facets) == {"other": 1, "plane": 1}
+    (base,) = [f for f in facets if f["kind"] == "plane"]
+    assert np.allclose(base["normal"], [0, 0, -1]) and base["area"] == pytest.approx(
+        0.5 * 32 * 9 * np.sin(2 * np.pi / 32)
+    )
+
+
+@pytest.mark.parametrize("sections", [10, 12, 16, 24])
+def test_facets_coarse_cylinder(sections):
+    """Section steps above 3 * angle_deg (up to 36 deg at 10 sections) are one cylinder."""
+    tilt = trimesh.transformations.rotation_matrix(0.4, [1, -1, 2])
+    mesh = trimesh.creation.cylinder(radius=5, height=20, sections=sections, transform=tilt)
+    facets, _ = compute_facets(mesh)
+    assert _kinds(facets) == {"cylinder": 1, "plane": 2}
+    (cyl,) = [f for f in facets if f["kind"] == "cylinder"]
+    assert cyl["n_faces"] == 2 * sections
+    assert cyl["radius"] == pytest.approx(5, abs=1e-6)
+    assert _parallel(cyl["axis"], tilt[:3, 2], 1e-3)
+    assert np.allclose(cyl["centroid"], 0, atol=1e-6)
+
+
+@pytest.mark.parametrize("sections", [6, 8, 9])
+def test_facets_polygonal_prism_stays_planar(sections):
+    """40 deg steps (9 sections) and coarser are a polygonal prism, one plane per side: the
+    coarse-tessellation limit is _REGULAR_MAX_STEP = 37 deg, i.e. >= 10 sections per turn."""
+    mesh = trimesh.creation.cylinder(radius=5, height=20, sections=sections)
+    assert _kinds(compute_facets(mesh)[0]) == {"plane": sections + 2}
+
+
+def _prism(angles: np.ndarray, r: float = 5.0, h: float = 20.0) -> trimesh.Trimesh:
+    """Closed prism over the polygon with vertices at `angles` on a circle (cap fans)."""
+    k = len(angles)
+    ring = np.stack([r * np.cos(angles), r * np.sin(angles)], 1)
+    lo, hi = np.c_[ring, np.full(k, -h / 2)], np.c_[ring, np.full(k, h / 2)]
+    v = np.concatenate([lo, hi, [[0, 0, -h / 2], [0, 0, h / 2]]])
+    f = []
+    for i in range(k):
+        j = (i + 1) % k
+        f += [[i, j, k + j], [i, k + j, k + i], [2 * k, j, i], [2 * k + 1, k + i, k + j]]
+    return trimesh.Trimesh(v, np.array(f))
+
+
+def test_facets_cylinder_seam_merges():
+    """Half the barrel in 22.5 deg steps, half in 11.25: the step between the halves is neither
+    smooth nor regular, so they are two regions, merged as one cylinder (same axis and radius)."""
+    ang = np.concatenate([np.linspace(0, np.pi, 9)[:-1], np.linspace(np.pi, 2 * np.pi, 17)[:-1]])
+    mesh = _prism(ang)
+    assert mesh.is_watertight
+    facets, _ = compute_facets(mesh)
+    assert _kinds(facets) == {"cylinder": 1, "plane": 2}
+    (cyl,) = [f for f in facets if f["kind"] == "cylinder"]
+    assert cyl["n_faces"] == 2 * 24 and cyl["radius"] == pytest.approx(5, abs=1e-6)
+    assert _parallel(cyl["axis"], [0, 0, 1], 1e-3)
+
+
+def _extrude(profile: list, depth: float = 30.0) -> trimesh.Trimesh:
+    from manifold3d import CrossSection
+
+    m = CrossSection([profile]).extrude(depth).to_mesh()
+    return trimesh.Trimesh(np.asarray(m.vert_properties)[:, :3], np.asarray(m.tri_verts))
+
+
+def test_facets_chamfer_and_feature_edges():
+    """Flats with equal steps are a tessellated curve only if they are equally wide and bend the
+    same way: a chamfer, a double chamfer and a corrugated sheet stay planes."""
+    box = trimesh.creation.box(extents=(40, 30, 20))
+    cut = trimesh.creation.box(extents=(60, 10 * np.sqrt(2), 10 * np.sqrt(2)))
+    cut.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 4, [1, 0, 0]))
+    cut.apply_translation((0, 15, 10))
+    facets, _ = compute_facets(trimesh.boolean.difference([box, cut], engine="manifold"))
+    assert _kinds(facets) == {"plane": 7}
+    area = {tuple(np.round(f["normal"], 6)): f["area"] for f in facets}
+    s = round(np.sqrt(0.5), 6)
+    assert area[(0, 0, 1)] == pytest.approx(40 * 20)  # flat, chamfer, flat
+    assert area[(0, s, s)] == pytest.approx(40 * 10 * np.sqrt(2))
+    assert area[(0, 1, 0)] == pytest.approx(40 * 10)
+
+    # widths 30, 8, 30 at two 20 deg steps
+    d = [np.array([np.cos(np.radians(a)), -np.sin(np.radians(a))]) for a in (0, 20, 40)]
+    p1 = np.array([0.0, 30.0]) + 30 * d[0]
+    p2 = p1 + 8 * d[1]
+    p3 = p2 + 30 * d[2]
+    profile = [[0, 0], [p3[0], 0], p3.tolist(), p2.tolist(), p1.tolist(), [0, 30]]
+    assert _kinds(compute_facets(_extrude(profile))[0]) == {"plane": 8}
+
+    # 12 equal flats at +-15 deg: 30 deg steps, alternately convex and concave
+    x = np.arange(13) * 10.0
+    y = 5 + np.where(np.arange(13) % 2, 10 * np.tan(np.radians(15)), 0.0)
+    profile = [[0, 0], [120, 0], *np.stack([x, y], 1)[::-1].tolist()]
+    assert _kinds(compute_facets(_extrude(profile, 40))[0]) == {"plane": 12 + 5}
+
+
+def _assert_invariant(mesh: trimesh.Trimesh, facets: list[dict], f2f: np.ndarray) -> None:
+    """Same facets after a uniform scale (same ids) and a face shuffle (same partition)."""
+    scaled = mesh.copy()
+    scaled.apply_scale(37.5)
+    s_facets, s_f2f = compute_facets(scaled)
+    assert np.array_equal(s_f2f, f2f)
+    assert [f["kind"] for f in s_facets] == [f["kind"] for f in facets]
+    for a, b in zip(s_facets, facets):
+        assert (a["radius"] is None) == (b["radius"] is None)
+        if a["radius"] is not None:
+            assert a["radius"] == pytest.approx(37.5 * b["radius"], rel=1e-9)
+    perm = np.random.default_rng(0).permutation(len(mesh.faces))
+    shuffled = trimesh.Trimesh(mesh.vertices, np.asarray(mesh.faces)[perm], process=False)
+    sh_facets, sh_f2f = compute_facets(shuffled)
+    back = np.empty_like(sh_f2f)
+    back[perm] = sh_f2f  # facet of each original face
+    pairs = np.unique(np.stack([back, f2f], 1), axis=0)
+    assert len(pairs) == len(facets) == len(sh_facets)
+    assert sorted((f["kind"], round(f["area"], 6)) for f in sh_facets) == sorted(
+        (f["kind"], round(f["area"], 6)) for f in facets
+    )
+
+
+@pytest.mark.parametrize("shape", ["cylinder16", "seam", "uv_sphere", "capsule", "torus"])
+def test_facets_invariant(shape):
+    mesh = {
+        "cylinder16": lambda: trimesh.creation.cylinder(radius=5, height=20, sections=16),
+        "seam": lambda: _prism(
+            np.concatenate([np.linspace(0, np.pi, 9)[:-1], np.linspace(np.pi, 2 * np.pi, 17)[:-1]])
+        ),
+        "uv_sphere": lambda: trimesh.creation.uv_sphere(count=[10, 32]),
+        "capsule": lambda: trimesh.creation.capsule(height=2.0, radius=1.0),
+        "torus": lambda: trimesh.creation.torus(5, 1, 16, 8),
+    }[shape]()
+    facets, f2f = compute_facets(mesh)
+    moved = mesh.copy()
+    moved.apply_transform(
+        trimesh.transformations.translation_matrix([3, -7, 11])
+        @ trimesh.transformations.rotation_matrix(0.9, [1, 1, 0])
+    )
+    assert np.array_equal(compute_facets(moved)[1], f2f)
+    _assert_invariant(mesh, facets, f2f)
 
 
 def _rounded_edge_box(a=40.0, b=30.0, c=20.0, r=5.0, sections=64) -> trimesh.Trimesh:
@@ -271,9 +459,10 @@ def _rounded_edge_box(a=40.0, b=30.0, c=20.0, r=5.0, sections=64) -> trimesh.Tri
     return trimesh.boolean.union([lower, front, rod], engine="manifold")
 
 
-@pytest.mark.parametrize("sections", [32, 64, 128])
+@pytest.mark.parametrize("sections", [12, 16, 32, 64, 128])
 def test_facets_rounded_edge(sections):
-    """The fillet does not chain the top and back faces together, and is one cylinder."""
+    """The fillet does not chain the top and back faces together, and is one cylinder (also at
+    30 and 22.5 deg steps: 3 and 4 regular strips)."""
     mesh = _rounded_edge_box(sections=sections)
     assert mesh.is_watertight
     facets, _ = compute_facets(mesh)
@@ -287,21 +476,19 @@ def test_facets_rounded_edge(sections):
     assert rnd["radius"] == pytest.approx(5, abs=0.05)
     assert _parallel(rnd["axis"], [1, 0, 0])
     assert np.allclose(rnd["centroid"], [20, 25, 15], atol=1e-6)
-    assert rnd["area"] == pytest.approx(np.pi / 2 * 5 * 40, rel=1e-2)
+    # all of the inscribed quarter polygon (pi / 2 * 5 * 40 minus 1.1 % at 12 sections)
+    assert rnd["area"] == pytest.approx(sections / 4 * 10 * np.sin(np.pi / sections) * 40, rel=1e-6)
 
 
 def test_facets_s_curve():
     """A convex and a concave fillet meeting tangentially are two cylinders, not one."""
-    from manifold3d import CrossSection
 
     def arc(cx, cy, a0, a1):
         t = np.radians(np.linspace(a0, a1, 17))[1:]
         return np.stack([cx + 10 * np.cos(t), cy + 10 * np.sin(t)], 1).tolist()
 
     profile = [[0, 0], [100, 0], [100, 10], [70, 10], *arc(70, 20, -90, -180), *arc(50, 20, 0, 90)]
-    m = CrossSection([[*profile, [0, 30]]]).extrude(30).to_mesh()
-    mesh = trimesh.Trimesh(np.asarray(m.vert_properties)[:, :3], np.asarray(m.tri_verts))
-    facets, _ = compute_facets(mesh)
+    facets, _ = compute_facets(_extrude([*profile, [0, 30]]))
     cyl = sorted((f for f in facets if f["kind"] == "cylinder"), key=lambda f: f["centroid"])
     assert len(cyl) == 2
     for f, x in zip(cyl, (50, 70)):
