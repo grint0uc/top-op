@@ -9,6 +9,7 @@ import trimesh
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 
 from topop.core.export import render_png
+from topop.core.voxelize import mesh_info
 from topop.server.schemas import ErrorResponse, FacetInfo, MeshFacets, MeshInfo
 from topop.server.store import NotFoundError, Store, get_store
 
@@ -59,6 +60,20 @@ async def upload_mesh(file: Annotated[UploadFile, File()], store: StoreDep) -> M
         return await asyncio.to_thread(store.add_mesh, data, file.filename or "mesh.stl")
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@router.get(
+    "/meshes/{id}",
+    response_model=MeshInfo,
+    responses={404: {"model": ErrorResponse}},
+    summary="Mesh info by id",
+)
+async def mesh_get(id: str, store: StoreDep) -> MeshInfo:
+    def info(mesh: trimesh.Trimesh) -> MeshInfo:
+        meta = store._mesh_meta(id)
+        return MeshInfo(id=id, name=meta.get("name", id), **mesh_info(mesh))
+
+    return await _with_mesh(store, id, info)
 
 
 @router.get(

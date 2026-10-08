@@ -47,7 +47,9 @@ class NormalSelection(BaseModel):
     mesh_id: str
     direction: Vec3
     angle_deg: float = 10.0
-    within: list[Vec3] | None = None  # [[xmin,ymin,zmin],[xmax,ymax,zmax]]
+    # [[xmin,ymin,zmin],[xmax,ymax,zmax]], clips strictly on grid-node coordinates. Grid nodes
+    # sit up to h/2 outside the surface, so pad a box derived from the mesh bbox by one voxel h.
+    within: list[Vec3] | None = None
 
 
 class PlaneSelection(BaseModel):

@@ -385,3 +385,13 @@ def test_run_error_is_reported(api: TestClient, cantilever: Path, monkeypatch):
     info = api.get(f"/api/runs/{rid}").json()
     assert info["status"] == "error" and "lower the resolution" in info["error"]
     assert api.get(f"/api/runs/{rid}/result.npz").status_code == 409
+
+
+def test_mesh_get_info(client, examples_dir):
+    with open(examples_dir / "cantilever.stl", "rb") as fh:
+        up = client.post("/api/meshes", files={"file": ("cantilever.stl", fh, "model/stl")})
+    assert up.status_code == 200
+    mid = up.json()["id"]
+    r = client.get(f"/api/meshes/{mid}")
+    assert r.status_code == 200 and r.json()["n_faces"] == up.json()["n_faces"]
+    assert client.get("/api/meshes/0000000000000000").status_code == 404
