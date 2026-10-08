@@ -395,7 +395,7 @@ export interface components {
         };
         /**
          * FacetFaces
-         * @description Triangle ids (of GET /meshes/{id}/buffer) that make up one facet.
+         * @description Triangle ids (in GET /meshes/{id}/buffer order) that make up one facet.
          */
         FacetFaces: {
             /** Face Ids */
@@ -420,7 +420,7 @@ export interface components {
              * @default other
              * @enum {string}
              */
-            kind: "plane" | "cylinder" | "other";
+            kind: "plane" | "cylinder" | "sphere" | "other";
             /** Axis */
             axis?: number[] | null;
             /** Radius */

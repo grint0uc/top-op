@@ -334,7 +334,6 @@ facets, `trim_to_design` (manifold boolean). This pass exposes them through the 
 | MCP | 27 tools. `set_params` takes the v0.2 fields (`stress_limit=0` and `overhang="none"` clear them), `export_stl` / `export_files` / `result_preview` take `trim`, `run` reports `stress_max` and `constraint`, new `facet_faces` and `result_stress_summary`; docstrings and `docs/AGENT.md` explain symmetry, overhang, stress, trim and cylinder facets. |
 
 Deferred or open:
-- `FacetFaces` (response of the facet-faces endpoint) is defined in `routes_meshes.py`, not in `schemas.py`; move it there at the next contract revision.
 - Solver: the CG breakdown on warm-started adjoint solves is fixed (Lanczos bound for the Chebyshev smoother, see `docs/PERF.md`); +5 % per iteration at 100k.
 - Stress constraint: stable on the L-bracket only with `stress_pnorm=16` and `move=0.05`; p=8 or move >= 0.1 oscillates 12-18 % over the limit. The GUI defaults do not change automatically.
 - Facets: surfaces tessellated with section steps > 3x the angle tolerance (e.g. a 16-section sphere) can split into narrow per-meridian "cylinders".

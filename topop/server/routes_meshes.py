@@ -7,10 +7,9 @@ from typing import Annotated
 import numpy as np
 import trimesh
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
-from pydantic import BaseModel
 
 from topop.core.export import render_png
-from topop.server.schemas import ErrorResponse, FacetInfo, MeshFacets, MeshInfo
+from topop.server.schemas import ErrorResponse, FacetFaces, FacetInfo, MeshFacets, MeshInfo
 from topop.server.store import NotFoundError, Store, get_store
 
 router = APIRouter(prefix="/api", tags=["meshes"])
@@ -20,12 +19,6 @@ MAX_FACETS = 300
 MESH_RGB = (0.75, 0.75, 0.78)
 
 StoreDep = Annotated[Store, Depends(get_store)]
-
-
-class FacetFaces(BaseModel):
-    """Triangle ids (of GET /meshes/{id}/buffer) that make up one facet."""
-
-    face_ids: list[int]
 
 
 async def _with_mesh[T](store: Store, mesh_id: str, fn: Callable[[trimesh.Trimesh], T]) -> T:

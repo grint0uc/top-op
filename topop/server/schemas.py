@@ -83,10 +83,16 @@ class FacetInfo(BaseModel):
     normal: Vec3  # [0,0,0] when not planar
     centroid: Vec3
     bbox: list[Vec3]
-    kind: Literal["plane", "cylinder", "other"] = "other"
+    kind: Literal["plane", "cylinder", "sphere", "other"] = "other"
     axis: Vec3 | None = None  # cylinder axis direction
-    radius: float | None = None  # cylinder radius
+    radius: float | None = None  # cylinder or sphere radius (sphere: centroid = center)
     brep_face: int | None = None  # B-rep face index when the mesh came from STEP
+
+
+class FacetFaces(BaseModel):
+    """Triangle ids (in GET /meshes/{id}/buffer order) that make up one facet."""
+
+    face_ids: list[int]
 
 
 class MeshFacets(BaseModel):
