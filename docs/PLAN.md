@@ -334,10 +334,6 @@ facets, `trim_to_design` (manifold boolean). This pass exposes them through the 
 | MCP | 27 tools. `set_params` takes the v0.2 fields (`stress_limit=0` and `overhang="none"` clear them), `export_stl` / `export_files` / `result_preview` take `trim`, `run` reports `stress_max` and `constraint`, new `facet_faces` and `result_stress_summary`; docstrings and `docs/AGENT.md` explain symmetry, overhang, stress, trim and cylinder facets. |
 
 Deferred or open:
-- **AMFilter ignores the first active layer.** `core/filters.py` sets `xi[0] = x[0]` on layer 0 of the grid, which is the empty padding layer
-  (`GridSpec.padding` defaults to 1), so every real layer sees an unsupported (zero) layer below. With `overhang` set the printed density
-  collapses (the bracket at `--overhang +z` ends at volume 0.016 against volfrac 0.3 and "converges" with change 0 after 5 iterations).
-  The base plate should be the first layer holding active cells. Until then the overhang tests only check plumbing.
 - `FacetFaces` (response of the facet-faces endpoint) is defined in `routes_meshes.py`, not in `schemas.py`; move it there at the next contract revision.
 - Stress is the relaxed voxel stress `rho^0.5 * sigma_vm(solid)`; sharp corners and the clamped face overshoot. No stress-based remeshing or smoothing.
 - `trim=true` needs a closed, consistently oriented design mesh; otherwise it warns and returns the untrimmed surface. Trimming a ~200k-triangle surface takes under 5 s (`tests/test_export.py`).

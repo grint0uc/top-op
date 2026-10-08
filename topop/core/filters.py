@@ -90,6 +90,9 @@ class AMFilter:
         self._flip = direction[0] == "-"
         # Internal frame: build axis first (contiguous layers), base plate at layer 0.
         self._act = self._to_canon(self.active)
+        # Base plate = first layer holding an active cell (padding layers below it are empty).
+        has = self._act.reshape(self._act.shape[0], -1).any(axis=1)
+        self._k0 = int(np.argmax(has)) if has.any() else 0
         self._xi: np.ndarray | None = None
         self._dxi_dx: np.ndarray | None = None
         self._dxi_dn: np.ndarray | None = None  # dxi/dsmax * dsmax/dN without the R^(P-1) factor
@@ -131,9 +134,10 @@ class AMFilter:
         xi = np.empty_like(xa)
         dxi_dx = np.zeros_like(xa)
         dxi_dn = np.zeros_like(xa)
-        xi[0] = xa[0]
-        dxi_dx[0] = act[0]
-        for k in range(1, xa.shape[0]):
+        k0 = self._k0
+        xi[: k0 + 1] = xa[: k0 + 1]
+        dxi_dx[: k0 + 1] = act[: k0 + 1]
+        for k in range(k0 + 1, xa.shape[0]):
             m, _, t = self._support_powers(xi[k - 1])
             s = m ** (P / Q) * t ** (1.0 / Q)
             d = xa[k] - s
@@ -155,7 +159,8 @@ class AMFilter:
         g = self._to_canon(np.asarray(g_out, dtype=np.float64).reshape(self.shape)).copy()
         dx = np.empty_like(g)
         n_a, n_b = g.shape[1:]
-        for k in range(g.shape[0] - 1, 0, -1):
+        k0 = self._k0
+        for k in range(g.shape[0] - 1, k0, -1):
             dx[k] = g[k] * dxi_dx[k]
             w = g[k] * dxi_dn[k]
             _, rp1, _ = self._support_powers(xi[k - 1])
@@ -163,5 +168,5 @@ class AMFilter:
             for view, contrib in zip(self._support_slices(gpad), rp1 * w):
                 view += contrib  # transpose of the support gather
             g[k - 1] += np.where(xi[k - 1] > 0.0, gpad[1:-1, 1:-1], 0.0)
-        dx[0] = g[0] * dxi_dx[0]
+        dx[: k0 + 1] = g[: k0 + 1] * dxi_dx[: k0 + 1]
         return self._from_canon(dx)

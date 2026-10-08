@@ -99,9 +99,8 @@ and the primitives work on the tessellation as for any mesh. Without the extra, 
   Pad a box derived from the mesh bbox by one voxel `h` per side (`h` is in `voxel_stats`, about longest side / elements)
   and re-check after changing the resolution (h changes). Prefer `facets` or `plane` when a whole face will do.
 - Facet ids are ranks by area for a given `angle_deg`; a changed angle renumbers them (STEP meshes: B-rep faces, never). Cylinders and other curved groups have normal 0: use `kind`, `radius` and `axis`.
-- `overhang`: watch `volume` in the first iterations. If it sits far below `volfrac` and never recovers (the printed density
-  is near 0, the run "converges" with `change` 0), the filter found no supported base plate: known issue, see the open
-  items in docs/PLAN.md (Status v0.2).
+- `overhang`: the base plate is the first grid layer that holds active cells along the build axis; cells of a keep-in
+  body floating above a gap are unsupported by construction and will be removed.
 - Always check the node counts before running; "resolves to zero nodes" blocks the run. Supports must stop all rigid motion.
 - Size: keep `n_active` <= about 150k on a 16 GB machine (`est_bytes` and `est_sec_per_iter` in `voxel_stats`, about 30 KB per element).
   Debug at 30-40 elements along the longest side, refine to 60-100 at the end. Above the memory cap `run` fails fast (exit 3).

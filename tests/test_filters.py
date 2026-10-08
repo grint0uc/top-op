@@ -253,3 +253,36 @@ def test_am_filter_timing_60_cubed():
     print(f"AMFilter 60^3 apply + backprop: {dt:.3f} s")
     assert np.all(np.isfinite(g))
     assert dt <= 3.0  # target 1.5 s; slack so CI does not flake
+
+
+def test_am_base_plate_is_first_active_layer():
+    """Padded domains: layer 0 is empty padding; the first active layer is the base plate."""
+    from topop.core.filters import AMFilter
+
+    active = np.zeros((6, 6, 9), dtype=bool)
+    active[1:5, 1:5, 2:7] = True  # solid block floating two layers above the grid bottom
+    x = active.astype(np.float64)
+    xi = AMFilter(active, "+z").apply(x)
+    assert xi[active].min() > 0.99  # a solid block on the plate is fully printable
+    # gradient still consistent with padding present
+    f = AMFilter(active, "+z")
+    rng = np.random.default_rng(3)
+    xr = np.where(active, rng.random(active.shape), 0.0)
+    w = np.where(active, rng.random(active.shape), 0.0)
+    f.apply(xr)
+    g = f.backprop(w)
+    for _ in range(10):
+        i = tuple(
+            c[0] for c in np.nonzero(active * (rng.random(active.shape) > 0.9)) if c.size
+        ) or (2, 2, 4)
+        if len(i) != 3:
+            i = (2, 2, 4)
+        h = 1e-6
+        xp, xm = xr.copy(), xr.copy()
+        xp[i] += h
+        xm[i] -= h
+        fd = (
+            np.sum(w * AMFilter(active, "+z").apply(xp))
+            - np.sum(w * AMFilter(active, "+z").apply(xm))
+        ) / (2 * h)
+        assert abs(fd - g[i]) <= 1e-6 * max(1.0, abs(fd))
