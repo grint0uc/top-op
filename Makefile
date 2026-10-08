@@ -1,4 +1,4 @@
-.PHONY: install test test-fast lint build dev e2e e2e-mock e2e-real types
+.PHONY: install test test-fast lint check build dev e2e e2e-mock e2e-real types
 
 install:
 	uv sync --all-groups
@@ -15,7 +15,10 @@ lint:
 	uv run ruff format --check .
 	cd web && npm run typecheck
 
-# Vite writes to ../topop/server/static (see web/vite.config.ts)
+# pre-commit gate; `lint` already ends with the web typecheck (`cd web && npm run typecheck`)
+check: lint test-fast
+
+# Vite writes to ../topop/server/static (see web/vite.config.ts); that directory is committed
 build:
 	cd web && npm run build
 

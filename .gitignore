@@ -22,10 +22,10 @@ web/playwright/.cache/
 web/*.tsbuildinfo
 *.log
 
-# build output / generated
-topop/server/static/
+# generated (the built frontend, topop/server/static/, is committed)
 openapi.json
 *.npz
+out/
 
 # editors / os
 .DS_Store

@@ -20,20 +20,25 @@ function series(
   const lo = Math.min(...v);
   const hi = Math.max(...v);
   const span = hi - lo || 1;
+  // A series that barely moves (volume under OC sits exactly on volfrac) would autoscale rounding noise into a
+  // mountain range: judge on the raw values and draw it flat in the middle of its band instead.
+  const rawLo = Math.min(...vals);
+  const rawHi = Math.max(...vals);
+  const flat = rawHi - rawLo <= 0.01 * Math.max(...vals.map(Math.abs));
   g.strokeStyle = color;
   g.lineWidth = 1.5;
   g.beginPath();
   v.forEach((y, i) => {
     const px = vals.length === 1 ? w / 2 : (i / (vals.length - 1)) * (w - 4) + 2;
-    const py = h - 3 - ((y - lo) / span) * (h - 8);
+    const py = flat ? h / 2 : h - 3 - ((y - lo) / span) * (h - 8);
     if (i === 0) g.moveTo(px, py);
     else g.lineTo(px, py);
   });
   g.stroke();
-  return [Math.min(...vals), Math.max(...vals)];
+  return [rawLo, rawHi];
 }
 
-/** Compliance (log scale) and volume fraction, each normalised to its own range. Plain canvas, no chart lib. */
+/** Compliance (log scale) and volume fraction, each normalised to its own range (flat if it moves < 1 %). Plain canvas, no chart lib. */
 export function Sparkline({ history, height = 90 }: Props) {
   const ref = useRef<HTMLCanvasElement>(null);
 

@@ -45,7 +45,7 @@ path = "topop/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["topop"]
-# built frontend is gitignored but must ship in the wheel
+# built frontend (committed) must ship in the wheel even if an ignore rule ever covers it
 artifacts = ["topop/server/static/**"]
 
 [tool.ruff]

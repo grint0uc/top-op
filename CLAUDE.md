@@ -26,7 +26,7 @@ Full design: `docs/PLAN.md`. Read it before touching anything non-trivial.
 
 ## Commands
 - `uv sync` — install. `uv run pytest -q` — core+server tests. `uv run pytest -q -m "not slow"` in CI loops.
-- `cd web && npm ci && npm run build` — frontend into `topop/server/static/`. `npm run dev` — Vite with proxy to :8000.
+- `cd web && npm ci && npm run build` — frontend into `topop/server/static/` (committed; rebuild and commit it whenever `web/` changes). `npm run dev` — Vite with proxy to :8000.
 - `uv run topop serve` — serve built frontend + API on :8000. `uv run topop run case.json` — headless.
 - `make test`, `make e2e`, `make build`, `make dev`.
 

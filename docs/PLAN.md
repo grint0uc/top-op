@@ -290,3 +290,29 @@ Claude must be able to run the whole workflow without the GUI: define boundaries
 
 Out of scope for v1 (explicitly deferred): tet meshes, contact, stress constraints, MMA/multiple
 constraints, symmetry planes, overhang constraints, STEP import, GPU.
+
+---
+
+## Status (v0.1)
+
+Shipped, per work package (commit subjects in `git log`; numbers from `docs/PERF.md`):
+
+| WP | Status |
+|----|--------|
+| 0 | Scaffold: uv package, Makefile, `CLAUDE.md`, `problem.py` and `schemas.py` contracts, Vite shell with generated `types.gen.ts`, `examples/` generator (cantilever, bracket). |
+| A1 | `fem.py`, `solver.py`, `filters.py`, `optimize.py`, `benchmarks.py` with tests (KE properties, patch test, filter, OC volume, cantilever regression within 3 %; the 60x20x4 run ends at 96.7806 vs reference 96.7877). |
+| A2 | `voxelize.py` (scan-line voxelizer instead of `trimesh.voxelized`), `selection.py` (faces, facets, normal, plane, box/sphere/cylinder), `export.py` (STL, VTI, NPZ), headless PNG renderer. |
+| A3 | Vanilla-Three.js viewport, pick/paint/primitives/gizmo, panels, density view, mock backend (`web/mock`), Playwright `chromium` project (27 specs). |
+| B1 | FastAPI app, store, threaded run manager (queue, cancel), WebSocket density/progress streaming, exports, previews; one-run-at-a-time. |
+| B2 | Frontend on the real API: upload, voxel stats, query selections, run/stream, results/export, project.json import/export. |
+| C1 | Real-server Playwright project (`real`, 13 specs on `examples/bracket.stl`); screenshots land in `web/test-results/real-*.png`. |
+| C2 | Solver pass: geometric-multigrid PCG, banded Cholesky below bandwidth 380, adaptive CG tolerance, in-place assembly, calibrated memory and time estimates. 4 800 elements 0.14 s/it, 100k 1.5-2.1 s/it (1.5 GB), 250k 3.8-4.3 s/it (3.6 GB), on a shared 4-core Linux box. |
+| B3 | `topop describe`, `topop run`, `topop mcp` (25 tools), `examples/*.json`; `tests/test_cli.py`, `tests/test_mcp.py`. |
+| C3 | `README.md` with screenshots, built frontend committed (`topop/server/static/`, shipped in the wheel), `make check`, Run-panel sparkline draws a near-constant series (volume under OC) flat. Tagging v0.1 is left to the maintainer. |
+
+Deferred or open:
+- Not measured on the target M1 (PLAN targets: 100k <= 6 s/it, 250k <= 20 s/it and <= 8 GB). Re-run `uv run pytest tests/test_perf.py` there to recalibrate `estimate_seconds_per_iter`.
+- Symmetric assembly map (about 17 % of peak RSS and 1 s of setup at 100k); CHOLMOD when `libsuitesparse` is available.
+- Non-identity `design_mesh.transform` is unsupported in the viewport (the GUI never writes one).
+- Facets chain through fine tessellation and fillets; the angle tolerance is the only control.
+- Out of scope since v1: tet meshes, contact, stress constraints, MMA or multiple constraints, symmetry planes, overhang constraints, STEP import, GPU.
