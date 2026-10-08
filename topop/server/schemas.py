@@ -56,7 +56,7 @@ class PlaneSelection(BaseModel):
     kind: Literal["plane"] = "plane"
     point: Vec3
     normal: Vec3
-    tol: float = 0.0  # 0 -> one voxel edge
+    tol: float = 0.0  # 0 -> band of ±h/2 (the single node layer nearest the plane)
 
 
 class PrimitiveSelection(BaseModel):
