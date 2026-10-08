@@ -53,7 +53,7 @@ Reference bodies (`add_ref_model`, any loaded mesh + `transform`): `keep_in` = f
 
 ## STEP input (optional extra)
 
-With `uv sync --extra examples` (OpenCascade via `cadquery`), `load_mesh` and case-file `path`s also take `.step` / `.stp`
+With `uv sync --extra step` (the OpenCascade kernel, `cadquery-ocp`), `load_mesh` and case-file `path`s also take `.step` / `.stp`
 (mm as OpenCascade reports them, no rescaling). The file is tessellated once and cached; `describe_mesh` then lists
 the **B-rep faces** as facets: `id` is the rank by exact area (descending), `brep_face` the face's index in the STEP file,
 `kind` is `plane` / `cylinder` / `other`, and cylinders carry their exact `radius` and `axis`, so "the Ø12 hole" is the
