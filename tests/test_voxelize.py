@@ -84,7 +84,7 @@ def test_load_mesh_missing_file(tmp_path):
 
 def test_mesh_info(cantilever):
     info = mesh_info(cantilever)
-    assert set(info) == set(MeshInfo.model_fields) - {"id", "name"}
+    assert set(info) == set(MeshInfo.model_fields) - {"id", "name", "source", "n_brep_faces"}
     MeshInfo(id="m", name="cantilever", **info)
     assert info["n_faces"] == 12 and info["n_vertices"] == 8
     assert info["bbox"] == [[0, 0, 0], [60, 20, 20]]

@@ -337,6 +337,8 @@ class MockRun {
         volume: round4(volfrac + (1 - volfrac) * Math.exp(-it / 6)),
         change: round4(0.2 * Math.exp(-it / 10)),
         t_iter: 0.15,
+        stress_max: null,
+        constraint: null,
       };
       this.info.history!.push(rec);
       this.send({ type: 'progress', ...rec });
@@ -434,6 +436,7 @@ export function mockApi(): Plugin {
           n_vertices: geom.positions.length / 3,
           bbox: bboxOf(geom),
           is_watertight: watertight,
+          source: 'mesh',
           volume: watertight ? volumeOf(geom) : null,
         };
         meshes.set(id, { info, geom, adjacency: adjacencyPairs(geom) });

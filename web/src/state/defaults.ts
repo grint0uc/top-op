@@ -21,6 +21,11 @@ export const DEFAULT_PARAMS: ParamsSpec = {
   solver: 'auto',
   dtype: 'float64',
   density_every: 1,
+  optimizer: 'oc',
+  symmetry: [],
+  stress_limit: null,
+  stress_pnorm: 8,
+  overhang: null,
 };
 
 export function defaultProject(): ProjectDoc {

@@ -373,6 +373,18 @@ export interface components {
             centroid: number[];
             /** Bbox */
             bbox: number[][];
+            /**
+             * Kind
+             * @default other
+             * @enum {string}
+             */
+            kind: "plane" | "cylinder" | "other";
+            /** Axis */
+            axis?: number[] | null;
+            /** Radius */
+            radius?: number | null;
+            /** Brep Face */
+            brep_face?: number | null;
         };
         /**
          * FacetSelection
@@ -431,6 +443,16 @@ export interface components {
             change: number;
             /** T Iter */
             t_iter: number;
+            /**
+             * Stress Max
+             * @default null
+             */
+            stress_max: number | null;
+            /**
+             * Constraint
+             * @default null
+             */
+            constraint: number | null;
         };
         /** LoadSpec */
         LoadSpec: {
@@ -491,6 +513,14 @@ export interface components {
             is_watertight: boolean;
             /** Volume */
             volume?: number | null;
+            /**
+             * Source
+             * @default mesh
+             * @enum {string}
+             */
+            source: "mesh" | "step";
+            /** N Brep Faces */
+            n_brep_faces?: number | null;
         };
         /** MeshRef */
         MeshRef: {
@@ -585,6 +615,23 @@ export interface components {
              * @default 1
              */
             density_every: number;
+            /**
+             * Optimizer
+             * @default oc
+             * @enum {string}
+             */
+            optimizer: "oc" | "mma";
+            /** Symmetry */
+            symmetry?: components["schemas"]["SymmetrySpec"][];
+            /** Stress Limit */
+            stress_limit?: number | null;
+            /**
+             * Stress Pnorm
+             * @default 8
+             */
+            stress_pnorm: number;
+            /** Overhang */
+            overhang?: ("+x" | "-x" | "+y" | "-y" | "+z" | "-z") | null;
         };
         /**
          * PlaneSelection
@@ -769,6 +816,16 @@ export interface components {
             /** Fix */
             fix?: boolean[];
         };
+        /** SymmetrySpec */
+        SymmetrySpec: {
+            /**
+             * Axis
+             * @enum {string}
+             */
+            axis: "x" | "y" | "z";
+            /** Position */
+            position?: number | null;
+        };
         /** ValidationError */
         ValidationError: {
             /** Location */
@@ -825,6 +882,16 @@ export interface components {
             change: number;
             /** T Iter */
             t_iter: number;
+            /**
+             * Stress Max
+             * @default null
+             */
+            stress_max: number | null;
+            /**
+             * Constraint
+             * @default null
+             */
+            constraint: number | null;
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}

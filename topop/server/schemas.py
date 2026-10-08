@@ -21,6 +21,8 @@ class MeshInfo(BaseModel):
     bbox: list[Vec3]  # [[xmin,ymin,zmin],[xmax,ymax,zmax]]
     is_watertight: bool
     volume: float | None = None
+    source: Literal["mesh", "step"] = "mesh"
+    n_brep_faces: int | None = None  # STEP only
 
 
 class FaceSelection(BaseModel):
@@ -78,9 +80,13 @@ class FacetInfo(BaseModel):
     id: int
     n_faces: int
     area: float
-    normal: Vec3
+    normal: Vec3  # [0,0,0] when not planar
     centroid: Vec3
     bbox: list[Vec3]
+    kind: Literal["plane", "cylinder", "other"] = "other"
+    axis: Vec3 | None = None  # cylinder axis direction
+    radius: float | None = None  # cylinder radius
+    brep_face: int | None = None  # B-rep face index when the mesh came from STEP
 
 
 class MeshFacets(BaseModel):
@@ -116,6 +122,11 @@ class MaterialSpec(BaseModel):
     nu: float = Field(default=0.3, ge=0, lt=0.5)
 
 
+class SymmetrySpec(BaseModel):
+    axis: Literal["x", "y", "z"]
+    position: float | None = None  # world coordinate of the mirror plane; None -> domain center
+
+
 class ParamsSpec(BaseModel):
     volfrac: float = Field(default=0.3, gt=0, lt=1)
     penal: float = Field(default=3.0, ge=1, le=6)
@@ -128,6 +139,11 @@ class ParamsSpec(BaseModel):
     solver: Literal["auto", "amg", "direct"] = "auto"
     dtype: Literal["float64", "float32"] = "float64"
     density_every: int = Field(default=1, ge=1)  # send a density frame every N iterations
+    optimizer: Literal["oc", "mma"] = "oc"
+    symmetry: list[SymmetrySpec] = Field(default_factory=list)
+    stress_limit: float | None = Field(default=None, gt=0)  # von Mises limit, units of E
+    stress_pnorm: float = Field(default=8.0, ge=2, le=40)
+    overhang: Literal["+x", "-x", "+y", "-y", "+z", "-z"] | None = None  # AM build direction
 
 
 class LoadSpec(BaseModel):
@@ -198,6 +214,8 @@ class IterationRecord(BaseModel):
     volume: float
     change: float
     t_iter: float
+    stress_max: float | None = None
+    constraint: float | None = None
 
 
 class RunInfo(BaseModel):

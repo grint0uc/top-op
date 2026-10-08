@@ -175,6 +175,20 @@ class Problem:
 
 
 SolverKind = Literal["auto", "amg", "direct"]
+Axis = Literal["x", "y", "z"]
+Direction = Literal["+x", "-x", "+y", "-y", "+z", "-z"]
+
+
+@dataclass(frozen=True)
+class SymmetryPlane:
+    """Mirror densities about the plane `axis = position` (world units).
+
+    position None -> center of the active region's bounding box. The plane is snapped to the
+    nearest element boundary or element center so that mirrored cells land on the grid.
+    """
+
+    axis: Axis
+    position: float | None = None
 
 
 @dataclass
@@ -190,6 +204,13 @@ class RunParams:
     solver: SolverKind = "auto"
     dtype: Literal["float64", "float32"] = "float64"
     memory_cap_bytes: int = 6_000_000_000
+    optimizer: Literal["oc", "mma"] = "oc"  # oc: volume constraint only; mma: any constraints
+    symmetry: tuple[SymmetryPlane, ...] = ()
+    # von Mises stress constraint (same units as E); None -> compliance-only. Forces optimizer=mma.
+    stress_limit: float | None = None
+    stress_pnorm: float = 8.0  # p-norm aggregation exponent
+    # Additive-manufacturing overhang filter (Langelaar 2017, 45 deg): build direction, or None.
+    overhang: Direction | None = None
 
 
 @dataclass
@@ -199,6 +220,8 @@ class IterationInfo:
     volume: float  # fraction of free elements
     change: float
     t_iter: float
+    stress_max: float | None = None  # max element von Mises (when computed)
+    constraint: float | None = None  # stress constraint value g <= 0 (when active)
 
 
 RunStatus = Literal["converged", "max_iter", "cancelled", "error"]
@@ -210,6 +233,7 @@ class Result:
     history: list[IterationInfo]
     status: RunStatus
     message: str = ""
+    stress: np.ndarray | None = None  # (nx,ny,nz) von Mises at element centers, 0 on inactive
 
 
 # callback(info, rho) -> False to cancel. rho is the physical (filtered/projected) density, full grid.
