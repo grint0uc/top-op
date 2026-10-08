@@ -15,6 +15,8 @@ from topop.core.solver import LinearSolver
 
 BETA_MAX = 64.0
 CONTINUATION_ITERS = 20
+# loose CG rtol while the design moves a lot (change >= 0.1), 1e-6 once change <= 0.02
+ADAPTIVE_TOL: float | None = 1e-4
 
 
 def _linear_volume(v0: float, dv: np.ndarray, x0: np.ndarray, x: np.ndarray) -> float:
@@ -65,7 +67,10 @@ def optimize(
     callback: ProgressCallback | None = None,
     x0: np.ndarray | None = None,
     cancel: Callable[[], bool] | None = None,
+    *,
+    solver_options: dict | None = None,
 ) -> Result:
+    """SIMP + OC. `solver_options` are extra `LinearSolver` keyword arguments (tests, benchmarks)."""
     issues = problem.validate()
     if issues:
         raise ValueError("invalid problem: " + "; ".join(issues))
@@ -89,10 +94,16 @@ def optimize(
     asm = Assembler(problem, dtype=dtype)
     eids = asm.element_ids
     filt = DensityFilter(shape, params.rmin, active)
-    solver = LinearSolver(params.solver)
+    opts = {
+        "prolongators": asm.prolongators,
+        "ordering": asm.band_ordering,
+        "adaptive_tol": ADAPTIVE_TOL,
+        **(solver_options or {}),
+    }
+    solver = LinearSolver(params.solver, **opts)
     rigid = (
         rigid_body_modes(asm.node_coords_compressed)[asm.free]
-        if solver.select(asm.n_free) == "amg"
+        if solver.needs_rigid_modes(asm.n_free)
         else None
     )
 
@@ -157,7 +168,7 @@ def optimize(
 
         xe = xp.ravel()[eids]
         K = asm.assemble(Emin + xe**p * (E0 - Emin))
-        U, _ = solver.solve(K, asm.F_free, x0=U, rigid_modes=rigid)
+        U, _ = solver.solve(K, asm.F_free, x0=U, rigid_modes=rigid, change=change)
         c = float(np.sum(asm.F_free * U))
         if not np.isfinite(c):
             status, message = "error", f"non-finite compliance at iteration {it}"

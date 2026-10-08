@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 from pathlib import Path
@@ -14,9 +15,12 @@ REF = Path(__file__).resolve().parent / "data" / "cantilever_60x20x4.json"
 
 
 @pytest.mark.slow
-def test_cantilever_60x20x4_matches_reference_and_is_two_bar():
+@pytest.mark.parametrize("solver", ["auto", "amg"])
+def test_cantilever_60x20x4_matches_reference_and_is_two_bar(solver):
+    # auto: banded Cholesky (exact); amg: geometric MG-CG with the adaptive tolerance (1e-4 while
+    # the design moves) -- both must land within 1 % of the SuperLU reference, the test allows 3 %
     nelx, nely, nelz = 60, 20, 4
-    params = cantilever_params()
+    params = dataclasses.replace(cantilever_params(), solver=solver)
     t0 = time.perf_counter()
     res = optimize(cantilever(nelx, nely, nelz), params)
     wall = time.perf_counter() - t0
@@ -36,6 +40,7 @@ def test_cantilever_60x20x4_matches_reference_and_is_two_bar():
         REF.write_text(json.dumps(ref, indent=2) + "\n")
     ref = json.loads(REF.read_text())
     assert c == pytest.approx(ref["compliance"], rel=0.03)
+    assert c == pytest.approx(ref["compliance"], rel=0.01)  # solver policy budget (PERF.md)
     assert abs(res.history[-1].volume - params.volfrac) < 1e-3
 
     # Two-chord truss: material concentrates in the top and bottom thirds. Measured over the full

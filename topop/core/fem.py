@@ -72,6 +72,25 @@ def rigid_body_modes(coords: np.ndarray) -> np.ndarray:
     return B.reshape(3 * n, 6)
 
 
+MG_COARSE_DOFS = 1000  # geometric MG coarsens until a level has at most this many unknowns
+
+
+def interpolation_1d(n: int) -> tuple[sp.csr_matrix, int]:
+    """(n+1, nc+1) linear interpolation from coarse nodes (spacing 2h) to the n+1 fine nodes.
+
+    Axes with a single cell are not coarsened (identity, nc = n).
+    """
+    if n < 2:
+        return sp.identity(n + 1, format="csr"), n
+    nc = (n + 1) // 2
+    i = np.arange(n + 1)
+    ev, od = i[i % 2 == 0], i[i % 2 == 1]
+    rows = np.concatenate([ev, od, od])
+    cols = np.concatenate([ev // 2, od // 2, od // 2 + 1])
+    vals = np.concatenate([np.ones(ev.size), np.full(2 * od.size, 0.5)])
+    return sp.csr_matrix((vals, (rows, cols)), shape=(n + 1, nc + 1)), nc
+
+
 class Assembler:
     """Global stiffness on the compressed active node set, restricted to free DOFs.
 
@@ -134,20 +153,28 @@ class Assembler:
         self.F_free = np.ascontiguousarray(F[free])
 
         self._build_pattern(enodes, free, free_map)
+        self._prolongators: list[sp.csr_matrix] | None = None
 
     def _build_pattern(self, enodes: np.ndarray, free: np.ndarray, free_map: np.ndarray) -> None:
         # Node n couples to the nodes sharing an element with it ("slots", sorted by node id ==
         # stencil order). Free row 3n+ai holds, per slot, the free axes of the neighbour, so every
         # element-matrix entry's CSR position is a sum of small gathered tables -- no sort.
+        # The assembly map P (K entries x elements, CSR) gives K entry q with node offset d
+        # exactly _STENCIL_MULT[d] slots, one per corner pair (a, b) with that offset
+        # (_PAIR_RANK); slots of missing elements stay (0, 0.0). Element and row loops run in
+        # chunks so no temporary exceeds a few MB (large temporaries are fresh mmaps per call).
         nel = enodes.shape[0]
         n_nodes = self.n_dof // 3
         coupled = np.zeros((n_nodes, 27), dtype=bool)
-        coupled[enodes[:, :, None], _PAIR_OFFSET[None, :, :]] = True
+        for lo, hi in _chunks(nel, _ELEM_CHUNK):
+            coupled[enodes[lo:hi, :, None], _PAIR_OFFSET[None, :, :]] = True
         cnt = coupled.sum(axis=1)
         slot_start = np.concatenate([[0], np.cumsum(cnt)[:-1]])
         slot_of = np.cumsum(coupled, axis=1) - 1 + slot_start[:, None]
         full_ids = self.node_ids[:, None] + _stencil_full_offsets(self.problem.grid)[None, :]
         nbr = self.node_map[full_ids[coupled]]  # neighbour node of every slot
+        mult = _STENCIL_MULT[np.nonzero(coupled)[1]]  # P slots per K entry of every slot
+        del full_ids
 
         free3 = free.reshape(n_nodes, 3)
         w = free3.sum(axis=1)[nbr]  # free columns contributed by each slot
@@ -160,42 +187,60 @@ class Assembler:
         indptr = np.zeros(self.n_free + 1, dtype=np.int64)
         np.cumsum(row_len, out=indptr[1:])
         nnz = int(indptr[-1])
-        idx_dtype = np.int32 if max(nnz, self.n_dof) < 2**31 - 1 else np.int64
         fm = free_map[3 * nbr[:, None] + np.arange(3)]
-        cols_by_node = fm[fm >= 0]  # node n's column list, concatenated over nodes
+        keep = fm >= 0
+        cols_by_node = fm[keep]  # node n's column list, concatenated over nodes
+        mult_by_node = np.broadcast_to(mult[:, None], fm.shape)[keep].astype(np.int8)
+        del fm, keep, nbr, mult
         node_col_start = np.concatenate([[0], np.cumsum(row_nnz)[:-1]])
-        shift = np.repeat(node_col_start[self.free_dofs // 3] - indptr[:-1], row_len)
-        indices = cols_by_node[np.arange(nnz) + shift].astype(idx_dtype)
-        del shift, fm, cols_by_node
+        # gather index of K entry q of free row r: node_col_start[node(r)] + (q - indptr[r])
+        p_len = np.empty(nnz, dtype=np.int8)
+        idx64 = max(self.n_dof, 8 * nnz) >= 2**31 - 1
+        idx_dtype = np.int64 if idx64 else np.int32
+        indices = np.empty(nnz, dtype=idx_dtype)
+        row_node = self.free_dofs // 3
+        for lo, hi in _chunks(self.n_free, _ROW_CHUNK):
+            a, b = indptr[lo], indptr[hi]
+            g = np.arange(a, b) + np.repeat(
+                node_col_start[row_node[lo:hi]] - indptr[lo:hi], row_len[lo:hi]
+            )
+            indices[a:b] = cols_by_node[g]
+            p_len[a:b] = mult_by_node[g]
+        del cols_by_node, mult_by_node
+        p_indptr = np.zeros(nnz + 1, dtype=idx_dtype)
+        np.cumsum(p_len, out=p_indptr[1:], dtype=idx_dtype)
+        del p_len
+        nnz_p = int(p_indptr[-1])
+        p_indices = np.zeros(nnz_p, dtype=idx_dtype)
+        p_data = np.zeros(nnz_p, dtype=self.dtype)
 
-        row_start = np.full(self.n_dof, -1, dtype=np.int64)
+        row_start = np.full(self.n_dof, -1, dtype=idx_dtype)
         row_start[self.free_dofs] = indptr[:-1]
-        rs = row_start.astype(idx_dtype)[3 * enodes[:, :, None] + np.arange(3)]  # (nel, 8, 3)
-        cb = col_before.astype(idx_dtype)[slot_of[enodes[:, :, None], _PAIR_OFFSET[None]]]
-        ab = axis_before.astype(idx_dtype)[enodes]  # (nel, 8, 3)
-        # entry (e, a, ai, b, aj) == KE_h[3a+ai, 3b+aj]
-        tgt = (rs[:, :, :, None, None] + cb[:, :, None, :, None] + ab[:, None, None, :, :]).reshape(
-            nel, 576
-        )
-        valid = ((rs >= 0)[:, :, :, None, None] & free3[enodes][:, None, None, :, :]).reshape(
-            nel, 576
-        )
-        del rs, cb, ab
-        counts = valid.sum(axis=1)
-        tgt = tgt[valid]
-        vals = np.tile(self.KE_h.ravel().astype(self.dtype), (nel, 1))[valid]
-        del valid
-        # column e of P holds element e's entries: K.data = P @ E_e (CSC matvec == scatter-add)
-        p_dtype = np.int32 if max(nnz, tgt.size) < 2**31 - 1 else np.int64
-        p_indptr = np.zeros(nel + 1, dtype=p_dtype)
-        np.cumsum(counts, out=p_indptr[1:])
-        self._P = sp.csc_matrix((vals, tgt.astype(p_dtype, copy=False), p_indptr), shape=(nnz, nel))
-        del vals, tgt
+        col_before = col_before.astype(idx_dtype)
+        axis_before = axis_before.astype(idx_dtype)
+        ke = self.KE_h.astype(self.dtype).reshape(8, 3, 8, 3)
+        rank = _PAIR_RANK.astype(idx_dtype)[None, :, None, :, None]
+        for lo, hi in _chunks(nel, _ELEM_CHUNK):
+            en = enodes[lo:hi]
+            m = hi - lo
+            rs = row_start[3 * en[:, :, None] + np.arange(3)]  # (m, 8, 3)
+            cb = col_before[slot_of[en[:, :, None], _PAIR_OFFSET[None]]]  # (m, 8, 8)
+            ab = axis_before[en]  # (m, 8, 3)
+            # entry (e, a, ai, b, aj) == KE_h[3a+ai, 3b+aj]
+            q = rs[:, :, :, None, None] + cb[:, :, None, :, None] + ab[:, None, None, :, :]
+            valid = (rs >= 0)[:, :, :, None, None] & free3[en][:, None, None, :, :]
+            pos = p_indptr[q[valid]] + np.broadcast_to(rank, valid.shape)[valid]
+            p_indices[pos] = np.broadcast_to(
+                np.arange(lo, hi, dtype=idx_dtype)[:, None, None, None, None], valid.shape
+            )[valid]
+            p_data[pos] = np.broadcast_to(ke[None], (m, 8, 3, 8, 3))[valid]
+        self._P = sp.csr_matrix((p_data, p_indices, p_indptr), shape=(nnz, nel))
         self._K = sp.csr_matrix(
             (np.zeros(nnz, dtype=self.dtype), indices, indptr.astype(idx_dtype)),
             shape=(self.n_free, self.n_free),
         )
         self._K.has_sorted_indices = True
+        self._P_blocks = None
 
     @property
     def n_elements(self) -> int:
@@ -206,7 +251,11 @@ class Assembler:
         E_e = np.asarray(E_e, dtype=self.dtype)
         if E_e.shape != (self.n_elements,):
             raise ValueError(f"E_e must have shape ({self.n_elements},), got {E_e.shape}")
-        self._K.data[:] = self._P @ E_e
+        if self._P_blocks is None:
+            from topop.core.solver import _Blocks, default_threads
+
+            self._P_blocks = _Blocks(self._P, default_threads())
+        self._P_blocks.matvec(E_e, self._K.data)
         return self._K
 
     def expand(self, U_free: np.ndarray) -> np.ndarray:
@@ -216,6 +265,52 @@ class Assembler:
         U[self.free] = U_free
         return U
 
+    def prolongators(self, min_dofs: int = MG_COARSE_DOFS) -> list[sp.csr_matrix]:
+        """Geometric MG transfer operators: trilinear interpolation from grids of spacing 2h, 4h...
+
+        P[0] maps the unknowns of the next coarser level to the free DOFs (rows in free-DOF
+        order); P[l] maps level l+1 to level l. Coarse unknowns are the coarse-grid DOFs whose
+        interpolation reaches at least one unknown of the finer level, so supports and inactive
+        regions are carried through the Galerkin products. Built once and cached.
+        """
+        if self._prolongators is not None:
+            return self._prolongators
+        shape = tuple(self.problem.grid.shape)
+        nodes = self.node_ids[self.free_dofs // 3]  # full-grid node of every unknown
+        axes = self.free_dofs % 3
+        out: list[sp.csr_matrix] = []
+        n = nodes.size
+        while n > min_dofs:
+            ops = [interpolation_1d(k) for k in shape]
+            cshape = tuple(nc for _, nc in ops)
+            if cshape == shape:
+                break
+            Pn = sp.kron(sp.kron(ops[0][0], ops[1][0]), ops[2][0], format="csr")
+            sub = Pn[nodes]
+            cdof = 3 * sub.indices.astype(np.int64) + np.repeat(axes, np.diff(sub.indptr))
+            used, col = np.unique(cdof, return_inverse=True)
+            idx = np.int32 if max(sub.nnz, used.size) < 2**31 - 1 else np.int64
+            P = sp.csr_matrix(
+                (sub.data, col.astype(idx), sub.indptr.astype(idx)), shape=(n, used.size)
+            )
+            out.append(P)
+            nodes, axes, shape, n = used // 3, used % 3, cshape, used.size
+        self._prolongators = out
+        return out
+
+    def band_ordering(self) -> np.ndarray:
+        """Permutation of the free DOFs ordering nodes by (longest axis, middle, shortest).
+
+        Gives the smallest bandwidth of the axis-sweep orderings for the banded Cholesky
+        (reverse Cuthill-McKee is ~2x wider on these grids).
+        """
+        ijk = np.stack(np.unravel_index(self.node_ids, self.problem.grid.node_shape), axis=1)
+        extent = ijk.max(axis=0) - ijk.min(axis=0)
+        order = np.argsort(-extent, kind="stable")  # slowest first
+        node = self.free_dofs // 3
+        keys = [self.free_dofs % 3] + [ijk[node, a] for a in order[::-1]]
+        return np.lexsort(keys)
+
     def element_energies(self, U_free: np.ndarray) -> np.ndarray:
         """(nel_active,) u_e^T (h KE) u_e summed over load cases."""
         U = self.expand(U_free)
@@ -223,22 +318,65 @@ class Assembler:
             U = U[:, None]
         out = np.zeros(self.n_elements)
         for c in range(U.shape[1]):
-            ue = U[self.edof, c].astype(np.float64)
-            out += np.einsum("ij,ij->i", ue @ self.KE_h, ue)
+            u = U[:, c]
+            for lo, hi in _chunks(self.n_elements, 32768):  # temporaries stay a few MB
+                ue = u[self.edof[lo:hi]].astype(np.float64)
+                out[lo:hi] += np.einsum("ij,ij->i", ue @ self.KE_h, ue)
         return out
 
     @staticmethod
     def estimate_bytes(nel_active: int, dtype=np.float64) -> int:
-        """Rough peak bytes of assembly + solve for `nel_active` elements."""
+        """Peak bytes of a run for `nel_active` elements of a box-like domain.
+
+        Assembly map (576 entries per element plus boundary padding, CSR) + K_free + edof +
+        multigrid level 1 + work vectors + interpreter, x1.12 for allocator slack and the
+        Galerkin/pattern temporaries. Calibrated on peak RSS (docs/PERF.md: 2-6 % at 100k and
+        250k elements); thin domains have more nodes per element and need somewhat more.
+        """
         item = np.dtype(dtype).itemsize
         n = int(nel_active)
-        entries = 576 * n
-        nodes = n + 3 * n ** (2 / 3) + 8  # box-like domain; thin domains have more nodes
-        nnz = 243 * nodes  # 81 nonzeros per DOF row in the interior
-        setup = entries * (8 + 8 + 2 * (4 + item))  # positions, masks and the two copies of P
-        persistent = entries * (4 + item) + 4 * nnz * (4 + item)  # P, K, AMG hierarchy ~3x K
-        vectors = 40 * 3 * nodes * 8
-        return int(max(setup, persistent) + vectors + 50_000_000)
+        nodes = n + 3 * n ** (2 / 3) + 8
+        nnz = 228 * nodes  # K_free nonzeros (81 per interior DOF row)
+        entries = 583 * n
+        persistent = entries * (4 + item) + nnz * (8 + item)  # map, its row pointers, K
+        persistent += 192 * n + 900 * nodes + 0.124 * nnz * 12  # edof, vectors, MG level 1
+        return int(1.12 * persistent + 160_000_000)  # interpreter + chunk temporaries
+
+
+# (active elements, seconds per SIMP iteration averaged over a run) on full-box cantilevers,
+# 4-core CI VM, see docs/PERF.md "Time estimate"
+_SEC_PER_ITER = np.array(
+    [[0, 0.01], [4_800, 0.15], [12_000, 0.4], [30_000, 0.85], [100_000, 2.0], [250_000, 4.6]]
+)
+
+
+def estimate_seconds_per_iter(nel_active: int) -> float:
+    """Seconds per SIMP iteration (whole iteration, average over a run) for a box-like domain.
+
+    Piecewise-linear fit of measurements on the 4-core CI VM (proxy for an M1, see PERF.md);
+    extrapolated linearly above the last point.
+    """
+    n = float(max(0, nel_active))
+    x, y = _SEC_PER_ITER[:, 0], _SEC_PER_ITER[:, 1]
+    if n > x[-1]:
+        return float(y[-1] + (n - x[-1]) * (y[-1] - y[-2]) / (x[-1] - x[-2]))
+    return float(np.interp(n, x, y))
+
+
+_ELEM_CHUNK = 4096  # elements per pattern-building chunk (~20 MB of temporaries)
+_ROW_CHUNK = 32768
+_STENCIL = np.array(list(itertools.product((-1, 0, 1), repeat=3)))
+# elements that can share a node pair with this offset: 8, 4, 2, 1 for 0..3 nonzero components
+_STENCIL_MULT = 2 ** (3 - np.count_nonzero(_STENCIL, axis=1))
+_PAIR_RANK = np.zeros((8, 8), dtype=np.int64)  # rank of corner pair (a, b) among same-offset pairs
+for _s in range(27):
+    _ab = np.argwhere(_PAIR_OFFSET == _s)
+    _PAIR_RANK[_ab[:, 0], _ab[:, 1]] = np.arange(len(_ab))
+
+
+def _chunks(n: int, size: int):
+    for lo in range(0, n, size):
+        yield lo, min(n, lo + size)
 
 
 def _stencil_full_offsets(grid) -> np.ndarray:

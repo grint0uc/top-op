@@ -154,3 +154,17 @@ def test_oc_update_volume_move_and_bounds():
     dc2 = dc.copy()
     dc2[0] *= 100
     assert oc_update(x, dc2, dv, 0.5, 0.2)[0] >= oc_update(x, dc, dv, 0.5, 0.2)[0]
+
+
+def test_geometric_mg_and_banded_paths_agree():
+    # 2700 free DOFs: auto -> banded Cholesky; amg -> one geometric MG level + adaptive CG rtol
+    p = cantilever(20, 8, 4)
+    band = optimize(p, small_params(max_iter=12))
+    mg = optimize(p, small_params(max_iter=12, solver="amg"))
+    exact = optimize(
+        p, small_params(max_iter=12, solver="amg"), solver_options={"adaptive_tol": None}
+    )
+    c_band = np.array([h.compliance for h in band.history])
+    assert np.allclose([h.compliance for h in mg.history], c_band, rtol=1e-3)
+    assert np.allclose([h.compliance for h in exact.history], c_band, rtol=1e-5)
+    assert np.abs(mg.rho - band.rho).max() < 0.02
