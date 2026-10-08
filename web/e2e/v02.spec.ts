@@ -286,6 +286,51 @@ test.describe('results (mock backend)', () => {
     await expect(page.getByTestId('result-warnings')).toHaveCount(0);
     await expect(link).toHaveAttribute('href', /trim=false$/);
   });
+
+  test('export buttons fetch the file: a download arrives, X-Topop-Warnings and a 409 are shown next to the buttons', async ({ page }) => {
+    await runBracket(page, 3);
+    const stl = page.getByTestId('download-stl');
+    const href = await stl.getAttribute('href'); // the href stays for right-click / open in new tab
+    expect(href).toMatch(/\/api\/runs\/[^/]+\/result\.stl\?/);
+
+    // untrimmed: a file, no warning
+    const plainDl = page.waitForEvent('download');
+    await stl.click();
+    const plain = await plainDl;
+    expect(plain.suggestedFilename()).toMatch(/\.stl$/);
+    expect(readFileSync((await plain.path())!).length).toBeGreaterThan(84);
+    await expect(page.getByTestId('export-warnings')).toHaveCount(0);
+    await expect(page.getByTestId('export-error')).toHaveCount(0);
+
+    // trim on: the file still downloads and the server's warning header is shown
+    await page.getByTestId('trim-cad').check();
+    const trimDl = page.waitForEvent('download');
+    await stl.click();
+    const trimmed = await trimDl;
+    expect(trimmed.suggestedFilename()).toMatch(/\.stl$/);
+    expect(readFileSync((await trimmed.path())!).length).toBeGreaterThan(84);
+    await expect(page.getByTestId('export-warnings')).toContainText('STL download');
+    await expect(page.getByTestId('export-warnings')).toContainText('trim to CAD not applied');
+    await expect(page.getByTestId('result-warnings')).toHaveCount(0); // that one belongs to the result-mesh load
+    await expect(stl).toHaveAttribute('href', /trim=true$/);
+
+    // a download without a warning clears the old one
+    const vtiDl = page.waitForEvent('download');
+    await page.getByTestId('download-vti').click();
+    expect((await vtiDl).suggestedFilename()).toMatch(/\.vti$/);
+    await expect(page.getByTestId('export-warnings')).toHaveCount(0);
+
+    // the server refuses (409: no result): the message is shown and nothing is saved
+    await page.route('**/result.npz', (route) =>
+      route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ detail: 'run run-1 is running; no result to export' }) }),
+    );
+    let saved = 0;
+    page.on('download', () => saved++);
+    await page.getByTestId('download-npz').click();
+    await expect(page.getByTestId('export-error')).toContainText('no result to export');
+    await page.waitForTimeout(300);
+    expect(saved).toBe(0);
+  });
 });
 
 test.describe('facets (mock backend)', () => {

@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# a newer push to the same branch/PR supersedes the run in progress
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # fail instead of silently re-locking when pyproject.toml and uv.lock disagree
+  UV_LOCKED: "1"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Python dependencies (dev groups + STEP import extra)
+        run: uv sync --all-groups --extra step
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Web dependencies
+        run: npm ci
+        working-directory: web
+
+      # ruff check, ruff format --check and `npm run typecheck` (web)
+      - name: Lint and typecheck
+        run: make lint
+
+      - name: Tests (fast)
+        run: make test-fast # uv run pytest -q -m "not slow"
+        env:
+          TOPOP_THREADS: "2"
+
+      # topop/server/static is committed: it must equal a fresh build (Vite output is content-hashed and deterministic)
+      - name: Built frontend is up to date
+        run: make static-check
+
+      - name: Playwright version
+        id: pw
+        run: echo "version=$(node -p "require('./node_modules/@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+        working-directory: web
+
+      # PLAYWRIGHT_BROWSERS_PATH is deliberately not set: the default cache is ~/.cache/ms-playwright
+      - name: Playwright browser cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      - name: Install Chromium (system libraries every run, the download only on a cache miss)
+        run: npx playwright install --with-deps chromium
+        working-directory: web
+
+      # both projects: `chromium` (UI on the mock API) and `real` (UI + `uv run topop serve`); the config starts the servers
+      - name: Playwright
+        run: npx playwright test
+        working-directory: web
+
+      - name: Upload Playwright results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-test-results
+          path: web/test-results/
+          if-no-files-found: ignore
+          retention-days: 14

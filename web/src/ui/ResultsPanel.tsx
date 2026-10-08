@@ -1,5 +1,6 @@
+import type { MouseEvent } from 'react';
 import { api } from '../api/client';
-import { hideResultMesh, loadResultMesh, resultOptions, setColorByStress, setTrimToCad } from '../state/actions';
+import { downloadExport, hideResultMesh, loadResultMesh, resultOptions, setColorByStress, setTrimToCad } from '../state/actions';
 import { cssHex } from '../state/derived';
 import { useStore } from '../state/store';
 import { INFERNO } from '../viewport/DensityView';
@@ -17,6 +18,7 @@ export function ResultsPanel() {
   const info = useStore((s) => s.densityInfo);
   const hasResult = useStore((s) => s.resultStl !== null);
   const warnings = useStore((s) => s.resultWarnings);
+  const exportNote = useStore((s) => s.exportNote);
   const byStress = useStore((s) => s.colorByStress);
   const stress = useStore((s) => s.stress);
   const stressUi = useStore((s) => s.stressUi);
@@ -27,9 +29,21 @@ export function ResultsPanel() {
   const opts = resultOptions({ threshold, smoothIterations: smooth, trimToCad: trim });
   const sameGrid = !stress || !frameShape || stress.shape.every((n, k) => n === frameShape[k]);
 
+  // A plain click fetches the file so the server's warning/error can be shown; the href stays for right-click,
+  // open-in-new-tab and modified clicks, which keep the browser's own behaviour.
   const link = (label: string, href: string | null, testId: string, download: string) =>
     href ? (
-      <a className="btn" href={href} download={download} data-testid={testId}>
+      <a
+        className="btn"
+        href={href}
+        download={download}
+        data-testid={testId}
+        onClick={(e: MouseEvent<HTMLAnchorElement>) => {
+          if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+          e.preventDefault();
+          void downloadExport(label, href, download);
+        }}
+      >
         {label}
       </a>
     ) : (
@@ -112,6 +126,11 @@ export function ResultsPanel() {
         {link('NPZ', ready ? api.resultNpzUrl(runId) : null, 'download-npz', `${runId}.npz`)}
         {link('project.json', ready ? api.projectJsonUrl(runId) : null, 'download-project', `${runId}-project.json`)}
       </div>
+      {exportNote && (
+        <p className={exportNote.kind === 'error' ? 'red' : 'amber'} data-testid={exportNote.kind === 'error' ? 'export-error' : 'export-warnings'}>
+          {exportNote.kind === 'error' ? `${exportNote.label} download failed: ${exportNote.text}` : `${exportNote.label} download, server warning: ${exportNote.text}`}
+        </p>
+      )}
     </Section>
   );
 }

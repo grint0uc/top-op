@@ -469,18 +469,26 @@ async function attachServerRun(run: RunInfo): Promise<void> {
   }
 }
 
-/** The current document as a Project JSON file (no run). */
-export function exportProjectJson(): void {
-  const { project } = get();
-  const payload: ProjectIn = { ...project };
-  const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }));
+/** Hands bytes to the browser as a file download (programmatic `<a download>` click, URL revoked afterwards). */
+function saveBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `${project.name.replace(/[^\w.-]+/g, '_') || 'project'}.json`;
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** The current document as a Project JSON file (no run). */
+export function exportProjectJson(): void {
+  const { project } = get();
+  const payload: ProjectIn = { ...project };
+  saveBlob(
+    new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }),
+    `${project.name.replace(/[^\w.-]+/g, '_') || 'project'}.json`,
+  );
 }
 
 // ------------------------------------------------------------------ server project sync
@@ -646,6 +654,26 @@ export async function loadResultMesh(): Promise<void> {
   });
 }
 
+/**
+ * Result export (STL/VTI/NPZ/project.json): fetch, check the status, save the bytes as a file. The server's
+ * `X-Topop-Warnings` (e.g. a CAD trim that fell back) and its error text (409: the run has no result) go to `exportNote`,
+ * which a plain `<a download>` could not show.
+ */
+export async function downloadExport(label: string, url: string, filename: string): Promise<void> {
+  if (get().busy?.startsWith('Download')) return;
+  get().setExportNote(null);
+  get().setBusy(`Download ${label}`);
+  try {
+    const { blob, warnings } = await api.download(url);
+    saveBlob(blob, filename);
+    if (warnings) get().setExportNote({ kind: 'warning', label, text: warnings });
+  } catch (e) {
+    get().setExportNote({ kind: 'error', label, text: message(e) });
+  } finally {
+    get().setBusy(null);
+  }
+}
+
 export function hideResultMesh(): void {
   get().setResultStl(null);
 }
@@ -653,6 +681,7 @@ export function hideResultMesh(): void {
 /** "Trim to CAD": affects the STL link and, when a result mesh is on screen, reloads it trimmed (or untrimmed). */
 export function setTrimToCad(on: boolean): void {
   get().setTrimToCad(on);
+  get().setExportNote(null); // a warning belongs to the trim setting it came from
   if (get().resultStl) void loadResultMesh();
 }
 

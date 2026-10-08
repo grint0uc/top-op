@@ -1,0 +1,51 @@
+name: Slow tests
+
+# Everything marked `slow` (> ~10 s) plus the perf timing tests, which depend on the runner and are advisory.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC
+
+permissions:
+  contents: read
+
+env:
+  UV_LOCKED: "1"
+
+jobs:
+  slow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash # -eo pipefail, so `| tee` below keeps pytest's exit status
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Python dependencies (dev groups + STEP import extra)
+        run: uv sync --all-groups --extra step
+
+      - name: Slow tests (required)
+        run: uv run pytest -q -m slow --deselect tests/test_perf.py 2>&1 | tee pytest-slow.txt
+
+      # wall-clock assertions on a shared runner: reported, never blocking
+      - name: Perf timing tests (advisory)
+        continue-on-error: true
+        run: uv run pytest -q tests/test_perf.py 2>&1 | tee pytest-perf.txt
+
+      - name: Upload pytest output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-output
+          path: |
+            pytest-slow.txt
+            pytest-perf.txt
+          if-no-files-found: ignore
+          retention-days: 30

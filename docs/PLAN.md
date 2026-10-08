@@ -333,6 +333,8 @@ facets, `trim_to_design` (manifold boolean). This pass exposes them through the 
 | CLI | `describe`: kind / radius / axis / brep columns ("B-rep faces" for STEP). `run`: `--trim`, `--optimizer`, `--stress-limit`, `--overhang`, `--symmetry AXIS[=POS]` (repeatable); `stress_max` (and `constraint`) per iteration; summary line with the final max stress and the constraint verdict. Exit codes unchanged. |
 | MCP | 27 tools. `set_params` takes the v0.2 fields (`stress_limit=0` and `overhang="none"` clear them), `export_stl` / `export_files` / `result_preview` take `trim`, `run` reports `stress_max` and `constraint`, new `facet_faces` and `result_stress_summary`; docstrings and `docs/AGENT.md` explain symmetry, overhang, stress, trim and cylinder facets. |
 
+CI: `.github/workflows/ci.yml` (every push and PR) runs lint + web typecheck, the fast tests, a check that `topop/server/static` equals a fresh build, and both Playwright projects (`make ci` locally); `slow.yml` (weekly + manual) runs the `slow` tests, with the perf timing tests as a non-blocking step.
+
 Deferred or open:
 - Solver: the CG breakdown on warm-started adjoint solves is fixed (Lanczos bound for the Chebyshev smoother, see `docs/PERF.md`); +5 % per iteration at 100k.
 - Stress constraint: stable on the L-bracket only with `stress_pnorm=16` and `move=0.05`; p=8 or move >= 0.1 oscillates 12-18 % over the limit. The GUI defaults do not change automatically.

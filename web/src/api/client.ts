@@ -121,6 +121,12 @@ export interface ResultMesh {
   warnings: string | null;
 }
 
+/** An export fetched into memory: the bytes plus the server's `X-Topop-Warnings` header (null when absent). */
+export interface Download {
+  blob: Blob;
+  warnings: string | null;
+}
+
 /** GET /api/runs/{id}/stress: von Mises per element, [ix][iy][iz] (iz fastest), 0 on inactive cells. */
 export interface StressField {
   shape: [number, number, number];
@@ -145,6 +151,13 @@ export function parseStress(buf: ArrayBuffer): StressField {
   let max = 0;
   for (let i = 0; i < n; i++) if (data[i]! > max) max = data[i]!;
   return { shape: [nx, ny, nz], data, max };
+}
+
+/** Fetches an export so the status and the warnings header are visible (a plain `<a download>` shows neither). */
+async function fetchDownload(url: string): Promise<Download> {
+  const res = await fetch(url);
+  if (!res.ok) return fail(res);
+  return { blob: await res.blob(), warnings: res.headers.get('X-Topop-Warnings') };
 }
 
 export const api = {
@@ -183,6 +196,8 @@ export const api = {
   },
   /** 409 (ApiError.status) while the run has no stress field yet. */
   runStress: async (id: string) => parseStress(await apiGetBuffer(`/api/runs/${enc(id)}/stress`)),
+  /** Any of the export URLs below (`resultStlUrl`, `resultVtiUrl`, ...): ApiError on 409 (no result yet) and the like. */
+  download: fetchDownload,
   resultStlUrl: (id: string, o: ResultOptions) => `/api/runs/${enc(id)}/result.stl?${resultQuery(o)}`,
   resultVtiUrl: (id: string) => `/api/runs/${enc(id)}/result.vti`,
   resultNpzUrl: (id: string) => `/api/runs/${enc(id)}/result.npz`,

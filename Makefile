@@ -1,4 +1,4 @@
-.PHONY: install test test-fast lint check build dev e2e e2e-mock e2e-real types
+.PHONY: install test test-fast lint check static-check ci build dev e2e e2e-mock e2e-real types
 
 install:
 	uv sync --all-groups
@@ -17,6 +17,22 @@ lint:
 
 # pre-commit gate; `lint` already ends with the web typecheck (`cd web && npm run typecheck`)
 check: lint test-fast
+
+# CI gate: the committed topop/server/static must be what a fresh build produces (Vite names assets by content hash, so
+# identical sources give identical output; verified by building twice). Builds into a temp dir, leaves the tree alone.
+static-check:
+	tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	(cd web && npx vite build --outDir "$$tmp" --emptyOutDir --logLevel warn) && \
+	{ diff -rq "$$tmp" topop/server/static || { echo 'run `make build` and commit topop/server/static'; exit 1; }; }
+
+# What .github/workflows/ci.yml runs after the toolchain setup (needs `make install` and the Playwright browser, which
+# `playwright install` provides in CI; never run here): lint (ruff + web typecheck), fast tests on 2 threads,
+# committed-frontend check, both Playwright projects.
+ci:
+	$(MAKE) lint
+	TOPOP_THREADS=2 $(MAKE) test-fast
+	$(MAKE) static-check
+	$(MAKE) e2e
 
 # Vite writes to ../topop/server/static (see web/vite.config.ts); that directory is committed
 build:

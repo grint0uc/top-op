@@ -111,6 +111,13 @@ export interface Notice {
   text: string;
 }
 
+/** What the last export download said: `warning` = `X-Topop-Warnings` (the file was still saved), `error` = nothing saved. */
+export interface ExportNote {
+  kind: 'warning' | 'error';
+  label: string;
+  text: string;
+}
+
 const idleRun = (): RunState => ({
   id: null,
   status: 'idle',
@@ -178,6 +185,8 @@ export interface State {
   resultStl: ArrayBuffer | null;
   /** `X-Topop-Warnings` of the last result mesh load */
   resultWarnings: string | null;
+  /** outcome of the last export download (STL/VTI/NPZ/project.json): the server's warning header or its error message */
+  exportNote: ExportNote | null;
   /** apply `trim=true` (intersect with the original CAD) to the STL download and the result mesh */
   trimToCad: boolean;
   colorByStress: boolean;
@@ -250,6 +259,7 @@ export interface State {
   setGhostDesign: (b: boolean) => void;
   setDensityInfo: (i: State['densityInfo']) => void;
   setResultStl: (b: ArrayBuffer | null, warnings?: string | null) => void;
+  setExportNote: (n: ExportNote | null) => void;
   setTrimToCad: (b: boolean) => void;
   setStress: (s: StressState | null) => void;
   setColorByStress: (b: boolean) => void;
@@ -287,6 +297,7 @@ export const useStore = create<State>()((set, get) => ({
   densityInfo: { mode: 'none', count: 0, it: 0 },
   resultStl: null,
   resultWarnings: null,
+  exportNote: null,
   trimToCad: false,
   colorByStress: false,
   stress: null,
@@ -358,6 +369,7 @@ export const useStore = create<State>()((set, get) => ({
       run: idleRun(),
       resultStl: null,
       resultWarnings: null,
+      exportNote: null,
       colorByStress: false,
       stress: null,
       stressUi: { loading: false, error: null },
@@ -377,6 +389,7 @@ export const useStore = create<State>()((set, get) => ({
       run: idleRun(),
       resultStl: null,
       resultWarnings: null,
+      exportNote: null,
       colorByStress: false,
       stress: null,
       stressUi: { loading: false, error: null },
@@ -462,6 +475,7 @@ export const useStore = create<State>()((set, get) => ({
       run: idleRun(),
       resultStl: null,
       resultWarnings: null,
+      exportNote: null,
       colorByStress: false,
       stress: null,
       stressUi: { loading: false, error: null },
@@ -475,6 +489,7 @@ export const useStore = create<State>()((set, get) => ({
   setGhostDesign: (ghostDesign) => set({ ghostDesign }),
   setDensityInfo: (densityInfo) => set({ densityInfo }),
   setResultStl: (resultStl, warnings = null) => set({ resultStl, resultWarnings: resultStl ? warnings : null }),
+  setExportNote: (exportNote) => set({ exportNote }),
   setTrimToCad: (trimToCad) => set({ trimToCad }),
   setStress: (stress) => set({ stress }),
   setColorByStress: (colorByStress) => set({ colorByStress }),

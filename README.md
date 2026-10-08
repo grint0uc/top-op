@@ -1,5 +1,7 @@
 # top-op
 
+[![CI](https://github.com/grint0uc/top-op/actions/workflows/ci.yml/badge.svg)](https://github.com/grint0uc/top-op/actions/workflows/ci.yml)
+
 Voxel SIMP topology optimization for your own 3D models. Import an STL, mark where it is held and
 where it is pushed, run, and export the optimized shape as an STL. It comes with three front ends over
 the same engine: a browser GUI, a CLI for scripted runs, and an MCP server so a Claude session can
@@ -56,7 +58,8 @@ The built frontend is committed (`topop/server/static/`), so `uv sync` is enough
 7. **Results**: the density threshold slider and smoothing control the surface; "Load result mesh" shows
    the marching-cubes surface over the ghosted design.
 8. **Export**: STL (threshold + smoothing as set), VTI (density field), NPZ (raw), `project.json`
-   (reloads in the GUI via "Load project.json" and re-runs with `topop run`).
+   (reloads in the GUI via "Load project.json" and re-runs with `topop run`). The buttons fetch the file, so a
+   server warning (e.g. "Trim to CAD" falling back to the untrimmed STL) or error shows next to them.
 
 Hotkeys 1-5 switch Orbit / Pick / Paint / Gizmo / Query. Projects persist in `~/.cache/topop`
 (`TOPOP_DATA_DIR` to move it).
@@ -180,11 +183,18 @@ make install     uv sync --all-groups and npm ci
 make test        full pytest              make test-fast   pytest -m "not slow"
 make lint        ruff check + format check + web typecheck
 make check       lint + test-fast (the pre-commit gate)
+make static-check  committed topop/server/static equals a fresh frontend build
+make ci          what CI runs: lint, test-fast on 2 threads, static-check, e2e (both projects)
 make build       frontend into topop/server/static/ (commit the result)
 make dev         uvicorn --reload on :8000 and Vite dev server (proxies /api)
 make e2e         Playwright: both projects    make e2e-mock  UI against web/mock
 make e2e-real    UI + real server on :8765    make types     regenerate types.gen.ts from the API
 ```
+
+CI (`.github/workflows/ci.yml`, every push and pull request, Python 3.13 + Node 22) runs `make ci`'s steps on
+ubuntu-latest after installing Chromium for Playwright. The `slow` tests and the wall-clock perf tests run
+weekly and on demand in `.github/workflows/slow.yml` (perf failures there are advisory). Before pushing a
+`web/` change: `make build` and commit `topop/server/static/`, or CI's static check fails.
 
 Conventions (grid ordering, transforms, wire formats) are in [CLAUDE.md](CLAUDE.md).
 
