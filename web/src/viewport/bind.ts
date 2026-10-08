@@ -1,7 +1,8 @@
 // Mirrors store state into a Viewport (store -> viewport) and viewport edits back (viewport -> store).
-import type { DensityFrame } from '../api/client';
-import { SUPPORT_COLOR, bboxDiagonal, caseColor, designEntry, isPrimitive, selectionAnchor, toPrim } from '../state/derived';
+import type { DensityFrame, Selection } from '../api/client';
+import { SUPPORT_COLOR, bboxDiagonal, caseColor, designEntry, facetKey, isPrimitive, selectionAnchor, toPrim } from '../state/derived';
 import { IDENTITY } from '../state/defaults';
+import { selectionFaces } from '../state/query';
 import { type State, useStore } from '../state/store';
 import type { DensityGrid } from './DensityView';
 import type { LoadMarker, SupportMarker } from './Markers';
@@ -39,22 +40,23 @@ export function bindViewport(vp: Viewport): () => void {
   vp.onRefTransform = (id, m) => store.getState().updateRef(id, { transform: m });
 
   // ---- helpers
+  /** Faces a load/support/query selection covers on the design mesh (faces: as given; normal/facets: client preview). */
+  const facesOf = (sel: Selection, s: State, design: NonNullable<ReturnType<typeof designEntry>>): readonly number[] => {
+    if (!('mesh_id' in sel) || sel.mesh_id !== design.info.id) return [];
+    if (sel.kind === 'faces') return sel.face_ids;
+    const table = sel.kind === 'facets' ? (s.facetCache[facetKey(sel.mesh_id, sel.angle_deg)] ?? null) : null;
+    return selectionFaces(sel, design.data, table);
+  };
+
   const applyFaces = () => {
     const s = store.getState();
     const design = designEntry(s);
     if (!design) return;
     const groups: FaceGroup[] = [];
-    for (const l of s.project.loads) {
-      if (l.selection.kind === 'faces' && l.selection.mesh_id === design.info.id) {
-        groups.push({ faces: l.selection.face_ids, color: caseColor(l.case) });
-      }
-    }
-    for (const x of s.project.supports) {
-      if (x.selection.kind === 'faces' && x.selection.mesh_id === design.info.id) {
-        groups.push({ faces: x.selection.face_ids, color: SUPPORT_COLOR });
-      }
-    }
-    vp.setFaceLayers(s.selection.faceIds, groups);
+    for (const l of s.project.loads) groups.push({ faces: facesOf(l.selection, s, design), color: caseColor(l.case) });
+    for (const x of s.project.supports) groups.push({ faces: facesOf(x.selection, s, design), color: SUPPORT_COLOR });
+    const selected = s.selection.query ? facesOf(s.selection.query, s, design) : s.selection.faceIds;
+    vp.setFaceLayers(selected, groups, s.hoverFaces);
   };
 
   const applyAppearance = () => {
@@ -73,12 +75,12 @@ export function bindViewport(vp: Viewport): () => void {
     const supports: SupportMarker[] = [];
     const committed: { id: string; prim: ReturnType<typeof toPrim>; color: number }[] = [];
     for (const l of s.project.loads) {
-      const at = selectionAnchor(l.selection, s.meshes);
+      const at = selectionAnchor(l.selection, s.meshes, s.facetCache);
       if (at) loads.push({ id: l.id, at, force: l.force, color: caseColor(l.case) });
       if (isPrimitive(l.selection)) committed.push({ id: l.id, prim: toPrim(l.selection), color: caseColor(l.case) });
     }
     for (const x of s.project.supports) {
-      const at = selectionAnchor(x.selection, s.meshes);
+      const at = selectionAnchor(x.selection, s.meshes, s.facetCache);
       if (at) supports.push({ id: x.id, at, color: SUPPORT_COLOR });
       if (isPrimitive(x.selection)) committed.push({ id: x.id, prim: toPrim(x.selection), color: SUPPORT_COLOR });
     }
@@ -132,6 +134,12 @@ export function bindViewport(vp: Viewport): () => void {
   watch((s) => s.tool, (t) => vp.setMode(t));
   watch((s) => s.gizmoMode, (m) => vp.setGizmoMode(m));
   watch((s) => s.selection.faceIds, applyFaces);
+  watch((s) => s.selection.query, applyFaces);
+  watch((s) => s.hoverFaces, applyFaces);
+  watch((s) => s.facetCache, () => {
+    applyFaces();
+    syncMarkers();
+  });
   watch((s) => s.selection.primitive, (p) => {
     vp.primitives.setActive(p);
     syncGizmoTarget();
@@ -152,6 +160,14 @@ export function bindViewport(vp: Viewport): () => void {
       else vp.density.clear();
       reportDensity();
       applyAppearance();
+    },
+  );
+  // run.stats (origin, h) from the `started` frame can land after the first density frame: re-place the cells
+  watch(
+    (s) => s.run.stats,
+    (_st, s) => {
+      const f = s.run.densityFrame;
+      if (f) vp.density.setFrame(f, gridFor(f, s), s.threshold);
     },
   );
   watch((s) => s.threshold, (t) => {

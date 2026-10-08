@@ -1,17 +1,26 @@
 // Orchestration: store + api/client. Panels and hotkeys call these; the viewport follows the store (viewport/bind.ts).
 import {
+  ApiError,
   api,
+  type FacetInfo,
   type LoadSpec,
+  type MeshFacets,
+  type MeshInfo,
   type ProjectIn,
   type RefModel,
+  type RunInfo,
   type Selection,
   type SupportSpec,
   openRunStream,
 } from '../api/client';
 import { buildAdjacency, parseMeshBuffer } from '../viewport/meshData';
-import { bboxDiagonal, designEntry, isPrimitive, toPrim } from './derived';
+import { bboxDiagonal, designEntry, facetKey, isPrimitive, requiredMeshes, toPrim } from './derived';
 import { IDENTITY } from './defaults';
+import { parseProjectFile } from './projectFile';
+import { primitiveStl, type RefPrimitiveKind } from './primitiveMesh';
+import { type QueryKind, facetFaces, formFromSelection, paddedBox } from './query';
 import { type Prim, type PrimitiveKind, currentSelectionSpec, genId, useStore } from './store';
+import { composeTRS } from './transform';
 
 const get = useStore.getState;
 
@@ -34,66 +43,122 @@ async function guard<T>(label: string, fn: () => Promise<T>): Promise<T | undefi
 
 // ------------------------------------------------------------------ meshes
 
-async function uploadAndLoad(file: File, role: 'design' | 'ref') {
-  const info = await api.uploadMesh(file);
+/** Fetches the render buffer of a mesh the server already knows and registers it in the store. */
+async function loadMeshInto(info: MeshInfo): Promise<void> {
   const buffer = await api.meshBuffer(info.id);
-  const data = parseMeshBuffer(buffer);
-  get().addMesh({ info, role, buffer, data });
+  get().addMesh({ info, buffer, data: parseMeshBuffer(buffer) });
+}
+
+/** Mesh ids are content hashes (sha256 prefix): the same bytes always come back with the same id. */
+async function uploadAndLoad(file: File): Promise<MeshInfo> {
+  const info = await api.uploadMesh(file);
+  await loadMeshInto(info);
   return info;
+}
+
+/** After a design mesh is in the store: brush size, Query form defaults, and the "restored" notice. */
+function designReady(): void {
+  const s = get();
+  const entry = designEntry(s);
+  if (!entry) return;
+  s.setBrushRadius(Math.round((bboxDiagonal(entry.data) / 25) * 10) / 10 || 1);
+  if (!s.selection.query) {
+    const { min, max } = entry.data.bbox;
+    s.setQueryForm({ ...s.queryForm, plane: { ...s.queryForm.plane, point: [0, 1, 2].map((k) => (min[k]! + max[k]!) / 2) as [number, number, number] } });
+  }
+  if (s.restored && requiredMeshes(get()).every((m) => m.loaded)) useStore.setState({ restored: false, notice: null });
+  void prefetchFacets();
 }
 
 export async function importDesignMesh(file: File): Promise<void> {
   await guard('Upload', async () => {
     const before = get();
     const old = before.project.design_mesh?.mesh_id ?? null;
-    const info = await uploadAndLoad(file, 'design');
-    const s = get();
-    if (old && old !== info.id) {
-      const wasLoaded = !!before.meshes[old];
-      const memo = before.meshMemo[old];
-      if (!wasLoaded && memo && memo.n_faces === info.n_faces) {
-        s.remapMesh(old, info.id); // restored project + same mesh re-uploaded: keep loads/supports
-      } else {
-        // a different mesh: face ids no longer mean anything
-        const stale = (x: { selection: Selection }) => x.selection.kind === 'faces' && x.selection.mesh_id === old;
-        const dropped = s.project.loads.filter(stale).length + s.project.supports.filter(stale).length;
-        s.project.loads.filter(stale).forEach((l) => s.removeLoad(l.id));
-        s.project.supports.filter(stale).forEach((x) => s.removeSupport(x.id));
-        if (dropped > 0) {
-          s.setNotice({ kind: 'warn', text: `Removed ${dropped} load/support(s) that were defined on the previous mesh.` });
-        }
+    const info = await uploadAndLoad(file);
+    let warn: string | null = null;
+    if (old === info.id) {
+      // same file as the project expects (restored project, or simply re-uploaded): nothing to remap
+      get().setPreview(null);
+    } else {
+      const dropped = old ? get().adoptDesignMesh(old, info.id) : 0;
+      const expected = old && !before.meshes[old]; // the project was restored and wanted a specific file
+      get().setDesignMesh(info.id);
+      if (expected || dropped > 0) {
+        warn =
+          `${expected ? 'This is not the file the project was made with. ' : ''}` +
+          (dropped > 0 ? `Removed ${dropped} load/support(s) that were defined by faces/facets of the previous mesh. ` : '') +
+          'Normal, plane and primitive selections were kept.';
       }
     }
-    get().setDesignMesh(info.id);
-    get().setPreview(null);
-    const entry = designEntry(get());
-    if (entry) get().setBrushRadius(Math.round((bboxDiagonal(entry.data) / 25) * 10) / 10 || 1);
-    if (get().restored) useStore.setState({ restored: false, notice: null });
+    designReady();
+    if (warn) get().setNotice({ kind: 'warn', text: warn });
   });
 }
 
 export async function importRefMesh(file: File): Promise<void> {
   await guard('Upload', async () => {
-    const info = await uploadAndLoad(file, 'ref');
-    const ref: RefModel = {
-      id: genId('ref'),
-      name: info.name,
-      mesh_id: info.id,
-      transform: [...IDENTITY],
-      mode: 'keep_out',
-      visible: true,
-    };
-    get().addRef(ref);
-    get().setActiveItem({ kind: 'ref', id: ref.id });
-    get().setTool('gizmo');
+    const info = await uploadAndLoad(file);
+    addRefFor(info, info.name);
+  });
+}
+
+function addRefFor(info: MeshInfo, name: string, transform: number[] = [...IDENTITY], mode: RefModel['mode'] = 'keep_out'): void {
+  const ref: RefModel = { id: genId('ref'), name, mesh_id: info.id, transform, mode, visible: true };
+  get().addRef(ref);
+  get().setActiveItem({ kind: 'ref', id: ref.id });
+  get().setTool('gizmo');
+}
+
+/**
+ * A keep-out / keep-in volume without a file: a generated unit primitive uploaded as a reference model. Its transform
+ * is the full matrix (translation * rotation * scale) applied to the unit mesh, the same convention the gizmo writes.
+ */
+export async function addRefPrimitive(kind: RefPrimitiveKind, mode: RefModel['mode'] = 'keep_out'): Promise<void> {
+  await guard('Upload', async () => {
+    const label = `${mode === 'keep_out' ? 'Keep-out' : 'Keep-in'} ${kind}`;
+    const file = new File([primitiveStl(kind)], `${label.toLowerCase().replace(/\s+/g, '-')}.stl`, { type: 'model/stl' });
+    const info = await uploadAndLoad(file);
+    const bbox = designEntry(get())?.data.bbox ?? { min: [-10, -10, -10], max: [10, 10, 10] };
+    const centre = [0, 1, 2].map((k) => (bbox.min[k]! + bbox.max[k]!) / 2);
+    const span = Math.max(bbox.max[0]! - bbox.min[0]!, bbox.max[1]! - bbox.min[1]!, bbox.max[2]! - bbox.min[2]!) || 20;
+    const edge = span * 0.25;
+    const scale = kind === 'box' ? [edge, edge, edge] : kind === 'sphere' ? [edge / 2, edge / 2, edge / 2] : [edge / 2, edge, edge / 2];
+    const n = get().project.ref_models.length + 1;
+    addRefFor(info, `${label} ${n}`, composeTRS(centre, [0, 0, 0], scale), mode);
   });
 }
 
 /** After a reload the project knows its ref models but not their geometry: attach a fresh upload. */
 export async function reuploadRefMesh(refId: string, file: File): Promise<void> {
   await guard('Upload', async () => {
-    const info = await uploadAndLoad(file, 'ref');
+    const expected = get().project.ref_models.find((r) => r.id === refId)?.mesh_id;
+    const info = await uploadAndLoad(file);
     get().updateRef(refId, { mesh_id: info.id, name: info.name });
+    if (expected && expected !== info.id) {
+      get().setNotice({ kind: 'warn', text: `"${info.name}" is not the file this reference model was made with (id ${info.id}, expected ${expected}).` });
+    }
+  });
+}
+
+/** Asks the server for every mesh the project needs but the browser does not hold (the server keeps uploads on disk). */
+export async function fetchMissingMeshes(): Promise<void> {
+  await guard('Fetch meshes', async () => {
+    const missing = requiredMeshes(get()).filter((m) => !m.loaded);
+    const gone: string[] = [];
+    for (const m of [...new Map(missing.map((x) => [x.id, x])).values()]) {
+      try {
+        await loadMeshInto(await api.getMesh(m.id));
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404) gone.push(m.label);
+        else throw e;
+      }
+    }
+    designReady();
+    if (gone.length > 0) {
+      get().setNotice({ kind: 'warn', text: `The server no longer has ${gone.join(', ')}: re-upload the file${gone.length > 1 ? 's' : ''}.` });
+    } else if (missing.length > 0) {
+      get().setNotice(null);
+    }
   });
 }
 
@@ -105,6 +170,72 @@ export async function ensureAdjacency() {
     entry.data.adjacency = buildAdjacency(pairs, entry.data.nTri);
   }
   return entry.data.adjacency;
+}
+
+// ------------------------------------------------------------------ query selections (facets / normal / plane)
+
+/** Facet table of the design mesh at `angleDeg` (cached by mesh and angle). */
+export async function fetchFacets(angleDeg?: number): Promise<MeshFacets | null> {
+  const s = get();
+  const meshId = s.project.design_mesh?.mesh_id;
+  if (!meshId) return null;
+  const angle = angleDeg ?? s.queryForm.facets.angle;
+  const key = facetKey(meshId, angle);
+  const hit = get().facetCache[key];
+  if (hit) return hit;
+  s.setQueryUi({ loading: true, error: null });
+  try {
+    const table = await api.meshFacets(meshId, angle);
+    get().putFacets(key, table);
+    return table;
+  } catch (e) {
+    get().setQueryUi({ error: message(e) });
+    return null;
+  } finally {
+    get().setQueryUi({ loading: false });
+  }
+}
+
+/** Facet tables that loads/supports with `facets` selections need (viewport markers, labels), fetched in the background. */
+async function prefetchFacets(): Promise<void> {
+  const p = get().project;
+  const angles = new Set<number>();
+  for (const it of [...p.loads, ...p.supports]) if (it.selection.kind === 'facets') angles.add(it.selection.angle_deg);
+  for (const a of angles) await fetchFacets(a);
+}
+
+export function setQueryKind(kind: QueryKind): void {
+  get().editQueryForm((f) => ({ ...f, kind }));
+  if (kind === 'facets') void fetchFacets();
+}
+
+/** Toggle the optional `within` box; switching it on fills it from the design bbox padded by one voxel h. */
+export function setNormalWithin(on: boolean): void {
+  const s = get();
+  const entry = designEntry(s);
+  let box = { min: [0, 0, 0] as [number, number, number], max: [0, 0, 0] as [number, number, number] };
+  if (entry) {
+    const b = entry.data.bbox;
+    const span = Math.max(b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]);
+    const h = s.voxel.stats?.h ?? span / s.project.grid.elements_along_longest;
+    box = paddedBox(b, h);
+  }
+  s.editQueryForm((f) => ({ ...f, normal: { ...f.normal, within: on ? box : null } }));
+}
+
+export function toggleFacet(id: number): void {
+  get().editQueryForm((f) => {
+    const ids = f.facets.ids.includes(id) ? f.facets.ids.filter((x) => x !== id) : [...f.facets.ids, id];
+    return { ...f, facets: { ...f.facets, ids } };
+  });
+}
+
+/** Highlight (or un-highlight with null) the faces of a facet row in the viewport. */
+export function hoverFacet(facet: FacetInfo | null): void {
+  const s = get();
+  const entry = designEntry(s);
+  if (!facet || !entry) s.setHoverFaces([]);
+  else s.setHoverFaces(facetFaces(entry.data, facet, s.queryForm.facets.angle));
 }
 
 // ------------------------------------------------------------------ selection -> loads / supports / primitives
@@ -131,18 +262,24 @@ function nextName(prefix: string, existing: readonly { name: string }[]): string
   return `${prefix} ${existing.length + 1}`;
 }
 
+/** The current selection has been turned into a load/support: faces/query selections are consumed like primitives. */
+function consumeSelection(sel: Selection): void {
+  const s = get();
+  if (isPrimitive(sel)) s.setPrimitive(null);
+  else s.clearSelection();
+}
+
 export function addLoadFromSelection(): LoadSpec | null {
   const s = get();
   const sel = currentSelectionSpec(s);
   if (!sel) {
-    s.setNotice({ kind: 'warn', text: 'Select faces (pick/paint) or add a primitive first.' });
+    s.setNotice({ kind: 'warn', text: 'Select faces (pick/paint), a query or a primitive first.' });
     return null;
   }
   const load: LoadSpec = { id: genId('load'), name: nextName('Load', s.project.loads), selection: sel, force: [0, 0, -1], case: 0 };
   s.addLoad(load);
   s.setActiveItem({ kind: 'load', id: load.id });
-  if (!isPrimitive(sel)) s.clearSelection();
-  else s.setPrimitive(null);
+  consumeSelection(sel);
   return load;
 }
 
@@ -150,7 +287,7 @@ export function addSupportFromSelection(): SupportSpec | null {
   const s = get();
   const sel = currentSelectionSpec(s);
   if (!sel) {
-    s.setNotice({ kind: 'warn', text: 'Select faces (pick/paint) or add a primitive first.' });
+    s.setNotice({ kind: 'warn', text: 'Select faces (pick/paint), a query or a primitive first.' });
     return null;
   }
   const support: SupportSpec = {
@@ -161,8 +298,7 @@ export function addSupportFromSelection(): SupportSpec | null {
   };
   s.addSupport(support);
   s.setActiveItem({ kind: 'support', id: support.id });
-  if (!isPrimitive(sel)) s.clearSelection();
-  else s.setPrimitive(null);
+  consumeSelection(sel);
   return support;
 }
 
@@ -173,7 +309,12 @@ export function reselect(selection: Selection): void {
   else if (isPrimitive(selection)) {
     s.setPrimitive(toPrim(selection));
     s.setTool('gizmo');
-  } else s.setNotice({ kind: 'info', text: `A ${selection.kind} selection has no viewport editor.` });
+  } else {
+    s.setQueryForm(formFromSelection(selection, s.queryForm));
+    s.setQuerySelection(structuredClone(selection));
+    s.setTool('query');
+    if (selection.kind === 'facets') void fetchFacets(selection.angle_deg);
+  }
 }
 
 export function deleteActive(): void {
@@ -183,6 +324,89 @@ export function deleteActive(): void {
   if (a.kind === 'load') s.removeLoad(a.id);
   else if (a.kind === 'support') s.removeSupport(a.id);
   else s.removeRef(a.id);
+}
+
+// ------------------------------------------------------------------ project.json import / export
+
+/**
+ * Loads a project.json (RunExport or Project). The document replaces the current one; meshes the browser lacks are
+ * requested from the server by id (it keeps uploads on disk), the rest are listed in the Import panel for re-upload.
+ * Mesh ids are content hashes, so a re-uploaded file restores every selection that refers to it.
+ */
+export async function loadProjectFile(file: File): Promise<void> {
+  const st = get();
+  if (st.run.status === 'queued' || st.run.status === 'running') {
+    st.setNotice({ kind: 'warn', text: 'Stop the running job before loading another project.' });
+    return;
+  }
+  await guard('Load project', async () => {
+    let json: unknown;
+    try {
+      json = JSON.parse(await file.text());
+    } catch {
+      throw new Error(`${file.name} is not valid JSON`);
+    }
+    const { doc, run, warnings } = parseProjectFile(json);
+    closeStream?.();
+    get().setProjectDoc(doc);
+    get().setLoadedRun(run ? { run, fileName: file.name, onServer: null } : null);
+
+    const missing = requiredMeshes(get()).filter((m) => !m.loaded);
+    const gone: string[] = [];
+    for (const m of [...new Map(missing.map((x) => [x.id, x])).values()]) {
+      try {
+        await loadMeshInto(await api.getMesh(m.id));
+      } catch (e) {
+        if (!(e instanceof ApiError && e.status === 404)) throw e;
+        gone.push(m.id);
+      }
+    }
+    designReady();
+
+    if (run) await attachServerRun(run);
+    const notes = [...warnings];
+    if (gone.length > 0) notes.push(`${gone.length} mesh file(s) must be re-uploaded (the server does not have them). Loads and supports are kept.`);
+    get().setNotice({
+      kind: notes.length > 0 ? 'warn' : 'info',
+      text: `Loaded "${doc.name}": ${doc.loads.length} load(s), ${doc.supports.length} support(s), ${doc.ref_models.length} reference model(s).${notes.length ? ' ' + notes.join(' ') : ''}`,
+    });
+  });
+}
+
+/** If the server still has the run of a loaded project.json, bind the Run/Results panels to it (exports, result mesh). */
+async function attachServerRun(run: RunInfo): Promise<void> {
+  let info: RunInfo | null = null;
+  try {
+    info = await api.getRun(run.id);
+  } catch (e) {
+    if (!(e instanceof ApiError && e.status === 404)) throw e;
+  }
+  const loaded = get().loadedRun;
+  if (loaded) get().setLoadedRun({ ...loaded, onServer: info !== null });
+  if (info && info.status !== 'queued' && info.status !== 'running') {
+    get().patchRun({
+      id: info.id,
+      status: info.status,
+      history: info.history ?? [],
+      stats: info.stats ?? null,
+      maxIter: get().project.params.max_iter,
+      error: info.error,
+    });
+  }
+}
+
+/** The current document as a Project JSON file (no run). */
+export function exportProjectJson(): void {
+  const { project } = get();
+  const payload: ProjectIn = { ...project };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${project.name.replace(/[^\w.-]+/g, '_') || 'project'}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // ------------------------------------------------------------------ server project sync
@@ -228,10 +452,10 @@ export async function runVoxelize(): Promise<void> {
   }
 }
 
-export async function resolvePreview(target?: Selection): Promise<void> {
+export async function resolvePreview(target?: Selection, label?: string): Promise<void> {
   const s = get();
   let sel = target ?? currentSelectionSpec(s);
-  let source = 'selection';
+  let source = label ?? 'selection';
   if (!sel && s.activeItem) {
     const it =
       s.activeItem.kind === 'load'
@@ -243,7 +467,7 @@ export async function resolvePreview(target?: Selection): Promise<void> {
     }
   }
   if (!sel) {
-    s.setNotice({ kind: 'warn', text: 'Nothing to preview: select faces or pick a load/support first.' });
+    s.setNotice({ kind: 'warn', text: 'Nothing to preview: select faces, a query or a primitive, or pick a load/support first.' });
     return;
   }
   await guard('Resolve preview', async () => {
@@ -278,17 +502,26 @@ export async function startRun(): Promise<void> {
       closeStream = openRunStream(info.id, {
         onStatus: (msg) => {
           const run = get().run;
-          const stats = msg.run?.stats ?? run.stats;
-          if (msg.type === 'started') get().patchRun({ status: 'running', stats });
-          else if (msg.type === 'done') {
-            const hist = msg.run?.history ?? [];
-            get().patchRun({ status: 'done', stats, history: hist.length > run.history.length ? hist : run.history });
+          const stats = msg.run?.stats ?? run.stats; // origin / h / nx.. position the density cells
+          const hist = msg.run?.history ?? [];
+          const history = hist.length > run.history.length ? hist : run.history;
+          if (msg.type === 'started') {
+            // sent on connect with the current status, so a run waiting behind another one reads "queued";
+            // a second `started` (running) follows when it gets its turn
+            get().patchRun({ status: msg.run?.status === 'queued' ? 'queued' : 'running', stats, history });
+          } else if (msg.type === 'done') {
+            get().patchRun({ status: 'done', stats, history, message: msg.message ?? null });
           } else if (msg.type === 'error') {
-            get().patchRun({ status: 'error', error: msg.message ?? msg.run?.error ?? 'run failed' });
-          } else get().patchRun({ status: 'cancelled' });
+            get().patchRun({ status: 'error', error: msg.message ?? msg.run?.error ?? 'run failed', stats, history });
+          } else {
+            get().patchRun({ status: 'cancelled', stats, history, message: msg.message ?? null });
+          }
           if (msg.type !== 'started') closeStream?.();
         },
-        onProgress: (rec) => get().pushProgress(rec),
+        onProgress: (rec) => {
+          const last = get().run.history[get().run.history.length - 1];
+          if (!last || rec.it > last.it) get().pushProgress(rec);
+        },
         onDensity: (f) => get().pushDensity(f),
         // a dropped socket is not a failed run: ask the server what happened before giving up
         onClose: () => {
@@ -309,8 +542,8 @@ export async function startRun(): Promise<void> {
         },
       });
     } catch (e) {
-      get().patchRun({ status: 'error', error: message(e) });
-      throw e;
+      // 422 "project is not runnable: ..." (no loads/supports, empty selection) and friends: nothing ran, show why
+      get().patchRun({ status: e instanceof ApiError ? 'idle' : 'error', error: message(e) });
     }
   });
 }

@@ -13,6 +13,7 @@ import { SelectionPainter, type PainterDeps } from './SelectionPainter';
 
 export const BASE_HEX = 0xb8bec8;
 export const SELECT_HEX = 0xffa534;
+export const HOVER_HEX = 0x41e0ff;
 const BG_HEX = 0x14161a;
 
 export type DesignAppearance = 'solid' | 'ghost' | 'hidden';
@@ -187,6 +188,11 @@ export class Viewport {
   }
 
   // ---------------------------------------------------------------- design mesh
+  /**
+   * The design mesh is drawn untransformed: `Project.design_mesh.transform` must be the identity (the GUI never
+   * writes anything else). A non-identity design transform in an imported project.json is unsupported here and
+   * only reported on import (state/projectFile.ts); reference models, in contrast, carry a full matrix (see setRefTransform).
+   */
   loadDesignMesh(buffer: ArrayBuffer, opts: { meshId?: string; data?: MeshData } = {}): THREE.BufferGeometry {
     this.clearDesignMesh();
     const data = opts.data ?? parseMeshBuffer(buffer);
@@ -256,8 +262,8 @@ export class Viewport {
     this.requestRender();
   }
 
-  /** Recolours only the faces whose colour changed (in place; the geometry is never rebuilt). */
-  setFaceLayers(selected: readonly number[], groups: readonly FaceGroup[]): void {
+  /** Recolours only the faces whose colour changed (in place; the geometry is never rebuilt). Layers, bottom to top: groups, selected, hover. */
+  setFaceLayers(selected: readonly number[], groups: readonly FaceGroup[], hover: readonly number[] = []): void {
     const d = this.design;
     if (!d) return;
     const n = d.data.nTri;
@@ -265,6 +271,7 @@ export class Viewport {
     next.fill(BASE_HEX);
     for (const g of groups) for (const f of g.faces) if (f < n) next[f] = g.color;
     for (const f of selected) if (f < n) next[f] = SELECT_HEX;
+    for (const f of hover) if (f < n) next[f] = HOVER_HEX;
     const attr = d.geometry.getAttribute('color') as THREE.BufferAttribute;
     const arr = attr.array as Float32Array;
     const c = new THREE.Color();
@@ -502,6 +509,7 @@ export class Viewport {
     refs: number;
     densityCount: number;
     densityMode: string;
+    densityBounds: { min: number[]; max: number[] } | null;
     resolvedPoints: number;
     arrows: number;
     glyphs: number;
@@ -513,6 +521,7 @@ export class Viewport {
       refs: this.refs.size,
       densityCount: this.density.count,
       densityMode: this.density.mode,
+      densityBounds: this.density.bounds,
       resolvedPoints: this.markers.counts().points,
       arrows: this.markers.counts().arrows,
       glyphs: this.markers.counts().glyphs,

@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
-import { importDesignMesh } from '../state/actions';
-import { designEntry } from '../state/derived';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { exportProjectJson, fetchMissingMeshes, importDesignMesh, loadProjectFile, reuploadRefMesh } from '../state/actions';
+import { type RequiredMesh, designEntry, requiredMeshes } from '../state/derived';
 import { useStore } from '../state/store';
 import { Banner, Btn, Section } from './controls';
+import { Sparkline } from './Sparkline';
 
 export const IS_MOCK = import.meta.env.VITE_MOCK === '1';
 
@@ -12,21 +13,135 @@ function fileList(f: File): FileList {
   return dt.files;
 }
 
+/** Required meshes the browser does not hold: one row each with a re-upload input (ids are content hashes). */
+function MissingMeshes({ missing }: { missing: RequiredMesh[] }) {
+  const memo = useStore((s) => s.meshMemo);
+  const busy = useStore((s) => s.busy);
+  const names = missing.map((m) => {
+    const known = memo[m.id];
+    return known ? `"${known.name}" (${known.n_faces} faces)` : m.role === 'design' ? 'the design mesh' : `"${m.label}"`;
+  });
+  return (
+    <Banner kind="warn" testId="reupload-notice">
+      <div className="stack">
+        <span>
+          The project's geometry is not loaded. Re-upload {names.join(', ')} to continue; loads and supports are kept (mesh ids are
+          content hashes, so the same file brings every selection back).
+        </span>
+        <ul className="items required-meshes" data-testid="required-meshes">
+          {missing.map((m) => (
+            <li key={`${m.id}:${m.refId ?? ''}`} className="row wrap" data-testid="required-mesh" data-mesh-id={m.id}>
+              <span className="grow ellipsis" title={m.id}>
+                {m.role}: {m.label} <code>{m.id}</code>
+              </span>
+              <input
+                type="file"
+                accept=".stl,model/stl"
+                aria-label={`re-upload ${m.label}`}
+                data-testid="reupload-input"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (!f) return;
+                  if (m.role === 'design') void importDesignMesh(f);
+                  else if (m.refId) void reuploadRefMesh(m.refId, f);
+                  e.target.value = '';
+                }}
+              />
+            </li>
+          ))}
+        </ul>
+        <div className="row">
+          <Btn onClick={() => void fetchMissingMeshes()} disabled={busy !== null} testId="fetch-from-server" title="The server keeps uploaded meshes on disk; ask it for these ids">
+            Fetch from server
+          </Btn>
+        </div>
+      </div>
+    </Banner>
+  );
+}
+
+function LoadedRun() {
+  const loaded = useStore((s) => s.loadedRun);
+  if (!loaded) return null;
+  const { run, fileName, onServer } = loaded;
+  const hist = run.history ?? [];
+  const first = hist[0];
+  const last = hist[hist.length - 1];
+  return (
+    <div className="loaded-run" data-testid="loaded-run">
+      <dl className="kv">
+        <dt>Run</dt>
+        <dd>
+          <code>{run.id}</code> <span className={`status status-${run.status}`}>{run.status}</span>
+        </dd>
+        <dt>From</dt>
+        <dd className="ellipsis" title={fileName}>
+          {fileName}
+        </dd>
+        <dt>Iterations</dt>
+        <dd data-testid="loaded-run-iters">{hist.length}</dd>
+        {first && last && (
+          <>
+            <dt>Compliance</dt>
+            <dd>
+              {first.compliance.toPrecision(4)} &rarr; {last.compliance.toPrecision(4)}
+            </dd>
+            <dt>Volume</dt>
+            <dd>{last.volume.toFixed(3)}</dd>
+          </>
+        )}
+        {run.stats && (
+          <>
+            <dt>Grid</dt>
+            <dd>
+              {run.stats.nx} x {run.stats.ny} x {run.stats.nz}
+            </dd>
+          </>
+        )}
+        {run.finished_at && (
+          <>
+            <dt>Finished</dt>
+            <dd>{run.finished_at.replace('T', ' ').slice(0, 19)}</dd>
+          </>
+        )}
+      </dl>
+      {run.error && <p className="red">{run.error}</p>}
+      <Sparkline history={hist} height={60} />
+      {onServer === false && (
+        <p className="amber" data-testid="loaded-run-gone">
+          The connected server does not have this run: the history is shown, but result exports need a new run.
+        </p>
+      )}
+      {onServer === true && (
+        <p className="dim" data-testid="loaded-run-attached">
+          This run is still on the server: its exports and result mesh are available in Results.
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function ImportPanel() {
   const entry = useStore((s) => designEntry(s));
-  const designId = useStore((s) => s.project.design_mesh?.mesh_id ?? null);
-  const memo = useStore((s) => (designId ? s.meshMemo[designId] : undefined));
+  const project = useStore((s) => s.project);
+  const meshes = useStore((s) => s.meshes);
+  const meshMemo = useStore((s) => s.meshMemo);
+  const required = useMemo(() => requiredMeshes({ project, meshes, meshMemo }), [project, meshes, meshMemo]);
   const name = useStore((s) => s.project.name);
   const busy = useStore((s) => s.busy);
   const [over, setOver] = useState(false);
   const input = useRef<HTMLInputElement>(null);
+  const projectInput = useRef<HTMLInputElement>(null);
 
   const take = (files: FileList | null | undefined) => {
     const f = files?.[0];
-    if (f) void importDesignMesh(f);
+    if (!f) return;
+    // a .json dropped on the window is a project, anything else a design mesh
+    if (/\.json$/i.test(f.name)) void loadProjectFile(f);
+    else void importDesignMesh(f);
   };
 
-  // dropping a file anywhere on the window imports it as the design mesh
+  // dropping a file anywhere on the window imports it as the design mesh (or loads it as a project if it is .json)
   useEffect(() => {
     const over = (e: DragEvent) => e.preventDefault();
     const drop = (e: DragEvent) => {
@@ -44,6 +159,7 @@ export function ImportPanel() {
 
   const info = entry?.info;
   const size = info ? info.bbox[1]!.map((v, k) => v - info.bbox[0]![k]!) : null;
+  const missing = required.filter((m) => !m.loaded);
 
   return (
     <Section title="Import">
@@ -84,12 +200,7 @@ export function ImportPanel() {
         </div>
       )}
 
-      {designId && !entry && (
-        <Banner kind="warn" testId="reupload-notice">
-          Project restored without its geometry. Re-upload {memo ? `"${memo.name}" (${memo.n_faces} faces)` : 'the design mesh'} to
-          continue; loads and supports are kept.
-        </Banner>
-      )}
+      {missing.length > 0 && <MissingMeshes missing={missing} />}
 
       {info && (
         <dl className="kv" data-testid="mesh-info">
@@ -129,7 +240,30 @@ export function ImportPanel() {
           onChange={(e) => useStore.getState().setProjectName(e.target.value)}
         />
       </label>
-      <div className="row">
+      <input
+        ref={projectInput}
+        type="file"
+        accept=".json,application/json"
+        className="visually-hidden"
+        data-testid="project-file-input"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) void loadProjectFile(f);
+          e.target.value = '';
+        }}
+      />
+      <div className="row wrap">
+        <Btn
+          onClick={() => projectInput.current?.click()}
+          disabled={busy === 'Load project'}
+          testId="load-project"
+          title="A project.json from Results (run export) or a saved project: restores loads, supports, parameters and the run history"
+        >
+          Load project.json
+        </Btn>
+        <Btn onClick={exportProjectJson} disabled={!info} testId="export-project" title="Save the current setup as a project.json (no run)">
+          Save project
+        </Btn>
         <Btn
           onClick={() => {
             useStore.getState().resetProject();
@@ -141,6 +275,7 @@ export function ImportPanel() {
         </Btn>
         {IS_MOCK && <span className="badge" title="Served by web/mock, not the Python server">MOCK API</span>}
       </div>
+      <LoadedRun />
     </Section>
   );
 }

@@ -1,6 +1,10 @@
 import type { GridSpec, MaterialSpec, ParamsSpec } from '../api/client';
 import type { ProjectDoc } from './store';
 
+export function genId(prefix: string): string {
+  return `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 export const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 
 export const DEFAULT_GRID: GridSpec = { elements_along_longest: 60, padding: 1 };

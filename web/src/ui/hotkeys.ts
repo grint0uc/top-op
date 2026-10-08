@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import { deleteActive } from '../state/actions';
 import { type ToolMode, useStore } from '../state/store';
 
-const MODE_KEYS: Record<string, ToolMode> = { '1': 'orbit', '2': 'pick', '3': 'paint', '4': 'gizmo' };
+const MODE_KEYS: Record<string, ToolMode> = { '1': 'orbit', '2': 'pick', '3': 'paint', '4': 'gizmo', '5': 'query' };
 const GIZMO_KEYS = { g: 'translate', r: 'rotate', s: 'scale' } as const;
 const TEXT_INPUT = new Set(['text', 'number', 'search', 'email', 'url', 'password', 'tel']);
 
@@ -12,7 +12,7 @@ function isTyping(t: EventTarget | null): boolean {
   return t instanceof HTMLInputElement && TEXT_INPUT.has(t.type);
 }
 
-/** 1-4 modes, g/r/s gizmo mode, Esc clears the selection, Delete removes the active load/support/reference. */
+/** 1-5 modes, g/r/s gizmo mode, Esc clears the selection, Delete removes the active load/support/reference. */
 export function useHotkeys(): void {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

@@ -38,6 +38,8 @@ export class DensityView {
   mode: 'none' | 'instanced' | 'points' = 'none';
   count = 0;
   it = 0;
+  /** world-space extent of the visible cells (diagnostic: lets e2e check the grid is positioned on the design) */
+  bounds: { min: number[]; max: number[] } | null = null;
 
   private inst: THREE.InstancedMesh | null = null;
   private instCap = 0;
@@ -112,6 +114,7 @@ export class DensityView {
       this.count = 0;
       this.mode = 'none';
       this.it = 0;
+      this.bounds = null;
       if (this.inst) this.inst.count = 0;
       if (this.pts) this.pts.geometry.setDrawRange(0, 0);
       this.vp.requestRender();
@@ -131,6 +134,17 @@ export class DensityView {
 
     const h = g.h;
     const [ox, oy, oz] = [g.origin[0] ?? 0, g.origin[1] ?? 0, g.origin[2] ?? 0];
+    const lo = [Infinity, Infinity, Infinity];
+    const hi = [-Infinity, -Infinity, -Infinity];
+    this.fill(rho, nx, ny, nz, cut, (_j, x, y, z) => {
+      if (x < lo[0]!) lo[0] = x;
+      if (x > hi[0]!) hi[0] = x;
+      if (y < lo[1]!) lo[1] = y;
+      if (y > hi[1]!) hi[1] = y;
+      if (z < lo[2]!) lo[2] = z;
+      if (z > hi[2]!) hi[2] = z;
+    });
+    this.bounds = n > 0 ? { min: [ox + h * lo[0]!, oy + h * lo[1]!, oz + h * lo[2]!], max: [ox + h * (hi[0]! + 1), oy + h * (hi[1]! + 1), oz + h * (hi[2]! + 1)] } : null;
     if (asPoints) {
       const pts = this.ensurePoints(n);
       const pos = pts.geometry.getAttribute('position') as THREE.BufferAttribute;

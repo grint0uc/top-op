@@ -1,30 +1,21 @@
-import { Euler, Matrix4, Quaternion, Vector3 } from 'three';
 import { addPrimitive, resolvePreview } from '../state/actions';
-import { selectionSummary } from '../state/derived';
+import { hasSelection, selectionSummary } from '../state/derived';
 import { type Prim, type PrimitiveKind, type ToolMode, useStore } from '../state/store';
+import { composeTRS, decomposeTRS } from '../state/transform';
 import { Btn, NumField, Slider } from './controls';
+import { QueryPanel } from './QueryPanel';
 
 const MODES: { id: ToolMode; label: string; key: string; hint: string }[] = [
   { id: 'orbit', label: 'Orbit', key: '1', hint: 'Rotate / pan / zoom' },
   { id: 'pick', label: 'Pick', key: '2', hint: 'Click: face. Shift+click: grow flat face. Ctrl/Cmd+click: remove' },
   { id: 'paint', label: 'Paint', key: '3', hint: 'Drag to paint faces, Ctrl/Cmd-drag to erase. Right-drag orbits' },
   { id: 'gizmo', label: 'Gizmo', key: '4', hint: 'Move / rotate / scale the active primitive or reference model (g / r / s)' },
+  { id: 'query', label: 'Query', key: '5', hint: 'Select by facet, surface normal or plane, as an agent would (no clicking)' },
 ];
 
-const RAD = Math.PI / 180;
-
-function decompose(prim: Prim): { pos: number[]; rot: number[] } {
-  const p = new Vector3();
-  const q = new Quaternion();
-  new Matrix4().fromArray(prim.transform).decompose(p, q, new Vector3());
-  const e = new Euler().setFromQuaternion(q, 'XYZ');
-  return { pos: [p.x, p.y, p.z], rot: [e.x / RAD, e.y / RAD, e.z / RAD] };
-}
-
-function compose(pos: number[], rot: number[]): number[] {
-  const q = new Quaternion().setFromEuler(new Euler(rot[0]! * RAD, rot[1]! * RAD, rot[2]! * RAD, 'XYZ'));
-  return new Matrix4().compose(new Vector3(pos[0], pos[1], pos[2]), q, new Vector3(1, 1, 1)).toArray();
-}
+// A primitive's transform carries rotation + translation only (size is separate), so the scale part is dropped.
+const decompose = (prim: Prim) => decomposeTRS(prim.transform);
+const compose = (pos: number[], rot: number[]) => composeTRS(pos, rot);
 
 /** Numeric fields bound two-way to the active primitive (the gizmo writes the same store field). */
 function PrimitiveFields({ prim }: { prim: Prim }) {
@@ -102,7 +93,7 @@ export function SelectionToolbar() {
   const gizmoMode = useStore((s) => s.gizmoMode);
   const prim = useStore((s) => s.selection.primitive);
   const summary = useStore((s) => selectionSummary(s));
-  const hasSel = useStore((s) => s.selection.faceIds.length > 0 || s.selection.primitive !== null);
+  const hasSel = useStore((s) => hasSelection(s));
   const preview = useStore((s) => s.preview);
   const diag = useStore((s) => {
     const id = s.project.design_mesh?.mesh_id;
@@ -121,6 +112,7 @@ export function SelectionToolbar() {
           </Btn>
         ))}
       </div>
+      {tool === 'query' && <QueryPanel />}
       {tool === 'pick' && (
         <Slider label="Grow angle" value={grow} min={1} max={60} step={1} format={(v) => `${v}°`} testId="grow-angle" onChange={setGrowAngle} />
       )}

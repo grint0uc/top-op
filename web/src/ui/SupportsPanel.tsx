@@ -1,5 +1,5 @@
 import { addSupportFromSelection } from '../state/actions';
-import { selectionSummary } from '../state/derived';
+import { hasSelection, selectionSummary } from '../state/derived';
 import { useStore } from '../state/store';
 import { Btn, Section } from './controls';
 import { ItemActions, SUPPORT_COLOR, Swatch, selectionLabel } from './ItemRows';
@@ -7,7 +7,7 @@ import { ItemActions, SUPPORT_COLOR, Swatch, selectionLabel } from './ItemRows';
 export function SupportsPanel() {
   const supports = useStore((s) => s.project.supports);
   const active = useStore((s) => s.activeItem);
-  const hasSel = useStore((s) => s.selection.faceIds.length > 0 || s.selection.primitive !== null);
+  const hasSel = useStore((s) => hasSelection(s));
   const summary = useStore((s) => selectionSummary(s));
   const { updateSupport, removeSupport, setActiveItem } = useStore.getState();
 
@@ -59,6 +59,7 @@ export function SupportsPanel() {
             </div>
             <ItemActions
               selection={sp.selection}
+              label={sp.name || sp.id}
               onReplace={(selection) => updateSupport(sp.id, { selection })}
               onDelete={() => removeSupport(sp.id)}
             />

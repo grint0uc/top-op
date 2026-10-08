@@ -9,7 +9,9 @@
     "build": "tsc -b && vite build",
     "typecheck": "tsc --noEmit",
     "types": "openapi-typescript ../openapi.json -o src/api/types.gen.ts",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:e2e:mock": "playwright test --project=chromium",
+    "test:e2e:real": "playwright test --project=real"
   },
   "dependencies": {
     "react": "^19.3.0",

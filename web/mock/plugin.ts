@@ -81,6 +81,12 @@ function apply(m: number[], p: number[]): number[] {
 
 const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 
+/** Exports exist once a run is done (or cancelled with a partial result); before that the server answers 409. */
+function finished(run: { info: RunInfo }): void {
+  const { id, status } = run.info;
+  if (status !== 'done' && status !== 'cancelled') throw new HttpError(409, `run ${id} is ${status}; no result to export`);
+}
+
 function worldBBox(mesh: StoredMesh, transform: number[] | undefined): [number[], number[]] {
   const [lo, hi] = mesh.info.bbox as [number[], number[]];
   const t = transform && transform.length === 16 ? transform : IDENTITY;
@@ -250,6 +256,10 @@ function densityFrame(
 }
 
 class MockRun {
+  /** One run at a time, like the server's semaphore; later runs wait in `waiting` and report `queued`. */
+  static active: MockRun | null = null;
+  static waiting: MockRun[] = [];
+
   info: RunInfo;
   clients = new Set<WebSocket>();
   private timer: NodeJS.Timeout | null = null;
@@ -293,8 +303,15 @@ class MockRun {
     this.clients.add(ws);
     ws.on('close', () => this.clients.delete(ws));
     const s = this.info.status;
-    if (s === 'queued') this.start();
-    else if (s === 'running') ws.send(JSON.stringify({ type: 'started', message: null, run: this.info }));
+    if (s === 'queued') {
+      if (!MockRun.active) this.start();
+      else {
+        // like the server: `started` carries the current status, so a waiting run announces "queued";
+        // another `started` (status running) follows when its turn comes
+        ws.send(JSON.stringify({ type: 'started', message: null, run: this.info }));
+        if (!MockRun.waiting.includes(this)) MockRun.waiting.push(this);
+      }
+    } else if (s === 'running') ws.send(JSON.stringify({ type: 'started', message: null, run: this.info }));
     else {
       ws.send(JSON.stringify({ type: s, message: null, run: this.info }));
       ws.close(1000);
@@ -302,6 +319,8 @@ class MockRun {
   }
 
   private start(): void {
+    MockRun.active = this;
+    MockRun.waiting = MockRun.waiting.filter((r) => r !== this);
     this.info.status = 'running';
     this.send({ type: 'started', message: null, run: this.info });
     const maxIter = this.project.params?.max_iter ?? 100;
@@ -319,6 +338,7 @@ class MockRun {
       };
       this.info.history!.push(rec);
       this.send({ type: 'progress', ...rec });
+      // the server sends a frame every `every` iterations plus a final one right before `done`
       if (it % every === 0 || it === maxIter) {
         this.sendBinary(densityFrame(it, maxIter, this.stats, this.pad));
       }
@@ -331,9 +351,14 @@ class MockRun {
     this.timer = null;
     this.info.status = status;
     this.info.finished_at = new Date().toISOString();
-    this.send({ type: status, message: null, run: this.info });
+    this.send({ type: status, message: status === 'done' ? `stopped at max_iter=${this.info.history?.length ?? 0}` : 'cancelled', run: this.info });
     for (const ws of this.clients) ws.close(1000);
     this.clients.clear();
+    MockRun.waiting = MockRun.waiting.filter((r) => r !== this);
+    if (MockRun.active === this) {
+      MockRun.active = null;
+      MockRun.waiting.shift()?.start();
+    }
   }
 
   cancel(): void {
@@ -395,7 +420,8 @@ export function mockApi(): Plugin {
         } catch (e) {
           throw new HttpError(400, e instanceof StlError ? e.message : 'could not parse mesh');
         }
-        const id = createHash('sha1').update(file.data).digest('hex').slice(0, 12);
+        // same as the server: id = first 16 hex chars of the sha256 of the bytes, so a re-upload returns the same id
+        const id = createHash('sha256').update(file.data).digest('hex').slice(0, 16);
         const watertight = isWatertight(geom);
         const info: S['MeshInfo'] = {
           id,
@@ -410,6 +436,7 @@ export function mockApi(): Plugin {
         json(c.res, info);
       },
     ],
+    ['GET', /^\/api\/meshes\/([^/]+)$/, (c) => json(c.res, meshOf(c.params[0]!).info)],
     [
       'GET',
       /^\/api\/meshes\/([^/]+)\/buffer$/,
@@ -491,6 +518,10 @@ export function mockApi(): Plugin {
       async (c) => {
         const { project_id } = await readJson<S['RunCreate']>(c);
         const p = projectOf(project_id);
+        designMesh(p);
+        // same wording as Problem.validate() on the server
+        const issues = [...(p.loads?.length ? [] : ['no loads defined']), ...(p.supports?.length ? [] : ['no supports defined'])];
+        if (issues.length) throw new HttpError(422, `project is not runnable: ${issues.join('; ')}`);
         const run = new MockRun(`run-${++nRun}`, p.id, structuredClone(p), designMesh(p));
         runs.set(run.info.id, run);
         json(c.res, run.info);
@@ -512,6 +543,7 @@ export function mockApi(): Plugin {
       /^\/api\/runs\/([^/]+)\/result\.stl$/,
       (c) => {
         const r = runOf(c.params[0]!);
+        finished(r);
         const [lo, hi] = worldBBox(designMesh(r.project), r.project.design_mesh?.transform);
         const shrink = lo.map((v, k) => (hi[k]! - v) * 0.2);
         bin(
@@ -527,6 +559,7 @@ export function mockApi(): Plugin {
       /^\/api\/runs\/([^/]+)\/result\.vti$/,
       (c) => {
         const r = runOf(c.params[0]!);
+        finished(r);
         const s = r.info.stats!;
         const xml =
           `<?xml version="1.0"?>\n<VTKFile type="ImageData" version="1.0" byte_order="LittleEndian">\n` +
@@ -542,6 +575,7 @@ export function mockApi(): Plugin {
       /^\/api\/runs\/([^/]+)\/result\.npz$/,
       (c) => {
         const r = runOf(c.params[0]!);
+        finished(r);
         const emptyZip = Buffer.concat([Buffer.from([0x50, 0x4b, 0x05, 0x06]), Buffer.alloc(18)]);
         bin(c.res, emptyZip, 'application/zip', { 'Content-Disposition': `attachment; filename="${r.info.id}.npz"` });
       },
@@ -551,7 +585,7 @@ export function mockApi(): Plugin {
       /^\/api\/runs\/([^/]+)\/project\.json$/,
       (c) => {
         const r = runOf(c.params[0]!);
-        json(c.res, { project: projectOf(r.projectId), run: r.info });
+        json(c.res, { project: r.project as Project, run: r.info }); // the project as it was when the run started
       },
     ],
     [

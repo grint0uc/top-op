@@ -1,5 +1,5 @@
 import { addLoadFromSelection } from '../state/actions';
-import { selectionSummary } from '../state/derived';
+import { hasSelection, selectionSummary } from '../state/derived';
 import { useStore } from '../state/store';
 import { Btn, Field, NumField, Section } from './controls';
 import { ItemActions, Swatch, caseColor, selectionLabel } from './ItemRows';
@@ -7,7 +7,7 @@ import { ItemActions, Swatch, caseColor, selectionLabel } from './ItemRows';
 export function LoadsPanel() {
   const loads = useStore((s) => s.project.loads);
   const active = useStore((s) => s.activeItem);
-  const hasSel = useStore((s) => s.selection.faceIds.length > 0 || s.selection.primitive !== null);
+  const hasSel = useStore((s) => hasSelection(s));
   const summary = useStore((s) => selectionSummary(s));
   const { updateLoad, removeLoad, setActiveItem } = useStore.getState();
 
@@ -19,7 +19,7 @@ export function LoadsPanel() {
         </Btn>
         <span className="dim">{summary}</span>
       </div>
-      {loads.length === 0 && <p className="dim">No loads. Select faces or add a primitive, then add.</p>}
+      {loads.length === 0 && <p className="dim">No loads. Select faces, run a query or add a primitive, then add.</p>}
       <ul className="items">
         {loads.map((l) => (
           <li
@@ -55,6 +55,7 @@ export function LoadsPanel() {
             </div>
             <ItemActions
               selection={l.selection}
+              label={l.name || l.id}
               onReplace={(selection) => updateLoad(l.id, { selection })}
               onDelete={() => removeLoad(l.id)}
             />

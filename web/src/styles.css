@@ -522,3 +522,99 @@ progress {
 a.btn {
   text-decoration: none;
 }
+
+/* ---------- query tab, import ---------- */
+.toolbar {
+  max-height: calc(100% - 20px);
+  overflow-y: auto;
+}
+
+.query-panel,
+.query-form,
+.query-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.query-panel {
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-width: 420px;
+}
+
+.vec3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+}
+
+.query-form p,
+.query-box p {
+  max-width: 400px;
+}
+
+.facet-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 210px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.facet-row {
+  display: grid;
+  grid-template-columns: auto 34px 58px auto 1fr auto;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+}
+
+.facet-row:last-child {
+  border-bottom: 0;
+}
+
+.facet-row:hover {
+  background: #14283f;
+}
+
+.facet-row.picked {
+  background: #162235;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.facet-id {
+  font-weight: 600;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.required-meshes {
+  gap: 4px;
+}
+
+.loaded-run {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+code {
+  font-size: 11px;
+  color: var(--fg-dim);
+}

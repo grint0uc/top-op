@@ -1,4 +1,4 @@
-.PHONY: install test test-fast lint build dev e2e types
+.PHONY: install test test-fast lint build dev e2e e2e-mock e2e-real types
 
 install:
 	uv sync --all-groups
@@ -25,8 +25,16 @@ dev:
 	(cd web && npm run dev) & \
 	wait
 
+# Playwright, two projects (web/playwright.config.ts): `chromium` = UI against the mock backend (web/mock),
+# `real` = UI + `uv run topop serve` on :8765 with a fresh data dir. Never runs `playwright install`.
 e2e:
 	cd web && npx playwright test
+
+e2e-mock:
+	cd web && npx playwright test --project=chromium
+
+e2e-real:
+	cd web && npx playwright test --project=real
 
 # regenerate web/src/api/types.gen.ts from the live FastAPI schema
 types:

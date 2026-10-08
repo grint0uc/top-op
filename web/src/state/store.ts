@@ -5,11 +5,14 @@ import type {
   IterationRecord,
   LoadSpec,
   MaterialSpec,
+  MeshFacets,
   MeshInfo,
   MeshRef,
   ParamsSpec,
   PrimitiveSelection,
+  QuerySelection,
   RefModel,
+  RunInfo,
   RunStatus,
   Selection,
   SupportSpec,
@@ -18,8 +21,9 @@ import type {
 import type { MeshData } from '../viewport/meshData';
 import { IDENTITY, defaultProject } from './defaults';
 import { loadPersisted } from './persist';
+import { type QueryForm, defaultQueryForm, formToSelection } from './query';
 
-export type ToolMode = 'orbit' | 'pick' | 'paint' | 'gizmo';
+export type ToolMode = 'orbit' | 'pick' | 'paint' | 'gizmo' | 'query';
 export type PrimitiveKind = PrimitiveSelection['kind'];
 export type GizmoMode = 'translate' | 'rotate' | 'scale';
 
@@ -31,7 +35,14 @@ export interface Prim {
   surface_only: boolean;
 }
 
-/** ProjectIn with every optional section present. */
+/**
+ * ProjectIn with every optional section present.
+ *
+ * Transforms: `ref_models[].transform` is the full column-major matrix (translation, rotation AND scale) applied
+ * to the reference mesh's own coordinates. `design_mesh.transform` must stay the identity: the viewport draws the
+ * design mesh untransformed and face selections index the raw mesh, so a non-identity design transform (possible
+ * in a hand-written or agent-written project.json) is unsupported in the viewport and only reported on import.
+ */
 export interface ProjectDoc {
   name: string;
   design_mesh: MeshRef | null;
@@ -51,9 +62,15 @@ export interface ProjectMeta {
 
 export interface MeshEntry {
   info: MeshInfo;
-  role: 'design' | 'ref';
   buffer: ArrayBuffer;
   data: MeshData;
+}
+
+/** A project.json that was loaded: its run record (if any) and whether the server still knows that run. */
+export interface LoadedRun {
+  run: RunInfo;
+  fileName: string;
+  onServer: boolean | null; // null while checking
 }
 
 export type ActiveItem = { kind: 'load' | 'support' | 'ref'; id: string } | null;
@@ -66,6 +83,7 @@ export interface RunState {
   stats: VoxelStats | null;
   maxIter: number;
   error: string | null;
+  message: string | null; // server's final status text, e.g. "stopped at max_iter=8"
   densityFrame: DensityFrame | null;
   densityFrames: number; // binary frames received so far (also asserted by e2e)
 }
@@ -95,13 +113,12 @@ const idleRun = (): RunState => ({
   stats: null,
   maxIter: 0,
   error: null,
+  message: null,
   densityFrame: null,
   densityFrames: 0,
 });
 
-export function genId(prefix: string): string {
-  return `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
-}
+export { genId } from './defaults';
 
 /** Selection as the wire type, from whatever is currently selected in the viewport. */
 export function currentSelectionSpec(s: Pick<State, 'selection' | 'project'>): Selection | null {
@@ -110,6 +127,7 @@ export function currentSelectionSpec(s: Pick<State, 'selection' | 'project'>): S
     const { kind, transform, size, surface_only } = s.selection.primitive;
     return { kind, transform: [...transform], size: [...size], surface_only };
   }
+  if (s.selection.query) return structuredClone(s.selection.query);
   if (meshId && s.selection.faceIds.length > 0) {
     return { kind: 'faces', mesh_id: meshId, face_ids: [...s.selection.faceIds] };
   }
@@ -130,9 +148,18 @@ export interface State {
   gizmoMode: GizmoMode;
   growAngleDeg: number;
   brushRadius: number;
-  selection: { faceIds: number[]; primitive: Prim | null };
+  /** At most one of the three is set: clicked/painted faces, a primitive, or a query (facets/normal/plane). */
+  selection: { faceIds: number[]; primitive: Prim | null; query: QuerySelection | null };
   activeItem: ActiveItem;
   preview: PreviewState | null;
+  /** Query tab: the form is the source of truth; every edit re-derives `selection.query` from it. */
+  queryForm: QueryForm;
+  queryUi: { loading: boolean; error: string | null };
+  /** GET /facets responses keyed `${mesh_id}@${angle_deg}`. */
+  facetCache: Record<string, MeshFacets>;
+  /** Faces drawn in the hover colour (facet row under the pointer). */
+  hoverFaces: number[];
+  loadedRun: LoadedRun | null;
 
   // ---- analysis
   voxel: VoxelState;
@@ -154,11 +181,24 @@ export interface State {
   setBrushRadius: (r: number) => void;
   setFaceSelection: (ids: number[]) => void;
   setPrimitive: (p: Prim | null) => void;
+  setQuerySelection: (q: QuerySelection | null) => void;
   clearSelection: () => void;
+  /** Edit the Query form; the resulting selection (null while the form is invalid) replaces the current one. */
+  editQueryForm: (fn: (f: QueryForm) => QueryForm) => void;
+  /** Put the form's selection in the store without editing it (e.g. after a load was added). */
+  commitQueryForm: () => void;
+  /** Set the form without committing (new design mesh: sensible defaults). */
+  setQueryForm: (f: QueryForm) => void;
+  setQueryUi: (patch: Partial<State['queryUi']>) => void;
+  putFacets: (key: string, facets: MeshFacets) => void;
+  setHoverFaces: (ids: number[]) => void;
+  setLoadedRun: (r: LoadedRun | null) => void;
   setActiveItem: (a: ActiveItem) => void;
   setPreview: (p: PreviewState | null) => void;
 
   resetProject: () => void;
+  /** Replace the whole document (project.json import). Loaded meshes are kept: they are content-addressed. */
+  setProjectDoc: (doc: ProjectDoc) => void;
   setProjectName: (name: string) => void;
   setGrid: (patch: Partial<GridSpec>) => void;
   setMaterial: (patch: Partial<MaterialSpec>) => void;
@@ -166,8 +206,12 @@ export interface State {
   setProjectMeta: (m: ProjectMeta | null) => void;
   addMesh: (entry: MeshEntry) => void;
   setDesignMesh: (meshId: string) => void;
-  /** After re-uploading a restored project's mesh: point every reference at the new id. */
-  remapMesh: (oldId: string, newId: string) => void;
+  /**
+   * The design mesh was replaced by a different file (ids are content hashes). Face and facet selections index the
+   * old mesh and are dropped; normal/plane/primitive selections are geometry-agnostic and follow the new id.
+   * Returns how many loads/supports were dropped.
+   */
+  adoptDesignMesh: (oldId: string, newId: string) => number;
 
   addLoad: (l: LoadSpec) => void;
   updateLoad: (id: string, patch: Partial<LoadSpec>) => void;
@@ -193,7 +237,7 @@ export interface State {
 
 const persisted = loadPersisted();
 
-export const useStore = create<State>()((set) => ({
+export const useStore = create<State>()((set, get) => ({
   project: persisted?.project ?? defaultProject(),
   projectMeta: null,
   meshes: {},
@@ -204,9 +248,14 @@ export const useStore = create<State>()((set) => ({
   gizmoMode: 'translate',
   growAngleDeg: 15,
   brushRadius: 5,
-  selection: { faceIds: [], primitive: null },
+  selection: { faceIds: [], primitive: null, query: null },
   activeItem: null,
   preview: null,
+  queryForm: defaultQueryForm(),
+  queryUi: { loading: false, error: null },
+  facetCache: {},
+  hoverFaces: [],
+  loadedRun: null,
 
   voxel: { stats: null, loading: false, error: null },
   run: idleRun(),
@@ -217,7 +266,10 @@ export const useStore = create<State>()((set) => ({
   resultStl: null,
   busy: null,
   notice: persisted?.project.design_mesh
-    ? { kind: 'info', text: 'Project restored from this browser. Mesh files are not stored: re-upload them to continue.' }
+    ? {
+        kind: 'info',
+        text: 'Project restored from this browser. Mesh files are not stored here: re-upload them (same file, same id) or fetch them from the server.',
+      }
     : null,
 
   setNotice: (notice) => set({ notice }),
@@ -226,12 +278,35 @@ export const useStore = create<State>()((set) => ({
   setGizmoMode: (gizmoMode) => set({ gizmoMode }),
   setGrowAngle: (growAngleDeg) => set({ growAngleDeg }),
   setBrushRadius: (brushRadius) => set({ brushRadius }),
-  setFaceSelection: (faceIds) => set({ selection: { faceIds, primitive: null } }),
+  setFaceSelection: (faceIds) => set({ selection: { faceIds, primitive: null, query: null } }),
   // keep the existing (empty) faceIds array so face-layer watchers do not refire while a primitive is dragged
   setPrimitive: (primitive) =>
-    set((s) => ({ selection: { faceIds: s.selection.faceIds.length ? [] : s.selection.faceIds, primitive } })),
+    set((s) => ({
+      selection: {
+        faceIds: s.selection.faceIds.length ? [] : s.selection.faceIds,
+        primitive,
+        query: primitive ? null : s.selection.query,
+      },
+    })),
+  setQuerySelection: (query) =>
+    set((s) => ({ selection: { faceIds: s.selection.faceIds.length ? [] : s.selection.faceIds, primitive: null, query } })),
   clearSelection: () =>
-    set((s) => (s.selection.faceIds.length || s.selection.primitive ? { selection: { faceIds: [], primitive: null } } : s)),
+    set((s) =>
+      s.selection.faceIds.length || s.selection.primitive || s.selection.query
+        ? { selection: { faceIds: [], primitive: null, query: null } }
+        : s,
+    ),
+  editQueryForm: (fn) => {
+    const queryForm = fn(get().queryForm);
+    set({ queryForm });
+    get().setQuerySelection(formToSelection(queryForm, get().project.design_mesh?.mesh_id ?? null));
+  },
+  commitQueryForm: () => get().setQuerySelection(formToSelection(get().queryForm, get().project.design_mesh?.mesh_id ?? null)),
+  setQueryForm: (queryForm) => set({ queryForm }),
+  setQueryUi: (patch) => set((s) => ({ queryUi: { ...s.queryUi, ...patch } })),
+  putFacets: (key, facets) => set((s) => ({ facetCache: { ...s.facetCache, [key]: facets } })),
+  setHoverFaces: (hoverFaces) => set((s) => (hoverFaces.length === 0 && s.hoverFaces.length === 0 ? s : { hoverFaces })),
+  setLoadedRun: (loadedRun) => set({ loadedRun }),
   setActiveItem: (activeItem) => set({ activeItem }),
   setPreview: (preview) => set({ preview }),
 
@@ -242,13 +317,33 @@ export const useStore = create<State>()((set) => ({
       meshes: {},
       meshMemo: {},
       restored: false,
-      selection: { faceIds: [], primitive: null },
+      selection: { faceIds: [], primitive: null, query: null },
+      queryForm: defaultQueryForm(),
+      queryUi: { loading: false, error: null },
+      facetCache: {},
+      hoverFaces: [],
+      loadedRun: null,
       activeItem: null,
       preview: null,
       voxel: { stats: null, loading: false, error: null },
       run: idleRun(),
       resultStl: null,
       notice: null,
+    }),
+  setProjectDoc: (project) =>
+    set({
+      project,
+      projectMeta: null,
+      restored: false,
+      selection: { faceIds: [], primitive: null, query: null },
+      queryForm: defaultQueryForm(),
+      hoverFaces: [],
+      activeItem: null,
+      preview: null,
+      voxel: { stats: null, loading: false, error: null },
+      run: idleRun(),
+      resultStl: null,
+      densityInfo: { mode: 'none', count: 0, it: 0 },
     }),
   setProjectName: (name) => set((s) => ({ project: { ...s.project, name } })),
   setGrid: (patch) => set((s) => ({ project: { ...s.project, grid: { ...s.project.grid, ...patch } } })),
@@ -263,25 +358,28 @@ export const useStore = create<State>()((set) => ({
   setDesignMesh: (meshId) =>
     set((s) => ({
       project: { ...s.project, design_mesh: { mesh_id: meshId, transform: [...IDENTITY] } },
-      selection: { faceIds: [], primitive: null },
+      selection: { faceIds: [], primitive: null, query: null },
+      hoverFaces: [],
       preview: null,
     })),
-  remapMesh: (oldId, newId) =>
-    set((s) => {
-      const remapSel = <T extends { selection: Selection }>(item: T): T =>
-        'mesh_id' in item.selection && item.selection.mesh_id === oldId
-          ? { ...item, selection: { ...item.selection, mesh_id: newId } }
-          : item;
-      const p = s.project;
-      return {
-        project: {
-          ...p,
-          design_mesh: p.design_mesh?.mesh_id === oldId ? { ...p.design_mesh, mesh_id: newId } : p.design_mesh,
-          loads: p.loads.map(remapSel),
-          supports: p.supports.map(remapSel),
-        },
-      };
-    }),
+  adoptDesignMesh: (oldId, newId) => {
+    let dropped = 0;
+    const follow = <T extends { selection: Selection }>(items: T[]): T[] =>
+      items.flatMap((item) => {
+        const sel = item.selection;
+        if (!('mesh_id' in sel) || sel.mesh_id !== oldId) return [item];
+        if (sel.kind === 'faces' || sel.kind === 'facets') {
+          dropped++;
+          return [];
+        }
+        return [{ ...item, selection: { ...sel, mesh_id: newId } }];
+      });
+    set((s) => ({
+      project: { ...s.project, loads: follow(s.project.loads), supports: follow(s.project.supports) },
+      activeItem: null,
+    }));
+    return dropped;
+  },
 
   addLoad: (l) => set((s) => ({ project: { ...s.project, loads: [...s.project.loads, l] } })),
   updateLoad: (id, patch) =>

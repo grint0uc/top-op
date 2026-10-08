@@ -15,7 +15,14 @@ export type LoadSpec = Schemas['LoadSpec'];
 export type SupportSpec = Schemas['SupportSpec'];
 export type Selection = Schemas['Selection'];
 export type FaceSelection = Schemas['FaceSelection'];
+export type FacetSelection = Schemas['FacetSelection'];
+export type NormalSelection = Schemas['NormalSelection'];
+export type PlaneSelection = Schemas['PlaneSelection'];
 export type PrimitiveSelection = Schemas['PrimitiveSelection'];
+/** The selection kinds an agent writes from the facet table / bbox alone (no viewport editor of their own). */
+export type QuerySelection = FacetSelection | NormalSelection | PlaneSelection;
+export type FacetInfo = Schemas['FacetInfo'];
+export type RunExport = Schemas['RunExport'];
 export type VoxelStats = Schemas['VoxelStats'];
 export type ResolvedNodes = Schemas['ResolvedNodes'];
 export type RunInfo = Schemas['RunInfo'];
@@ -34,12 +41,24 @@ export class ApiError extends Error {
   }
 }
 
+/** FastAPI errors: `{detail: "text"}` (our HTTPException) or `{detail: [{loc, msg}, ...]}` (request validation). */
+export function errorDetail(detail: unknown, fallback: string): string {
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail.map((d: unknown) => {
+      const e = d as { loc?: unknown[]; msg?: string };
+      const where = Array.isArray(e.loc) ? e.loc.filter((x) => x !== 'body').join('.') : '';
+      return e.msg ? (where ? `${where}: ${e.msg}` : e.msg) : JSON.stringify(d);
+    });
+    if (parts.length > 0) return parts.join('; ');
+  }
+  return detail === undefined ? fallback : JSON.stringify(detail);
+}
+
 async function fail(res: Response): Promise<never> {
-  let detail = res.statusText;
+  let detail = res.statusText || `HTTP ${res.status}`;
   try {
-    const body = (await res.json()) as { detail?: unknown };
-    if (typeof body.detail === 'string') detail = body.detail;
-    else if (body.detail !== undefined) detail = JSON.stringify(body.detail);
+    detail = errorDetail(((await res.json()) as { detail?: unknown }).detail, detail);
   } catch {
     // non-JSON error body: keep statusText
   }
@@ -94,7 +113,10 @@ const resultQuery = (o: ResultOptions) => `threshold=${o.threshold}&smooth=${o.s
 
 export const api = {
   // meshes
+  /** Mesh ids are content hashes: uploading the same bytes again returns the same id. */
   uploadMesh: (file: File) => apiUpload<MeshInfo>('/api/meshes', file),
+  /** 404 (ApiError.status) when the server does not know the id; the store persists across restarts. */
+  getMesh: (id: string) => apiGet<MeshInfo>(`/api/meshes/${enc(id)}`),
   meshBuffer: (id: string) => apiGetBuffer(`/api/meshes/${enc(id)}/buffer`),
   /** Flat u32 array of face pairs [a0, b0, a1, b1, ...]. */
   meshAdjacency: async (id: string) => new Uint32Array(await apiGetBuffer(`/api/meshes/${enc(id)}/adjacency`)),
@@ -120,6 +142,7 @@ export const api = {
   resultVtiUrl: (id: string) => `/api/runs/${enc(id)}/result.vti`,
   resultNpzUrl: (id: string) => `/api/runs/${enc(id)}/result.npz`,
   projectJsonUrl: (id: string) => `/api/runs/${enc(id)}/project.json`,
+  runExport: (id: string) => apiGet<RunExport>(`/api/runs/${enc(id)}/project.json`),
   runPreviewUrl: (id: string, o: { threshold: number; view?: string }) =>
     `/api/runs/${enc(id)}/preview.png?threshold=${o.threshold}&view=${enc(o.view ?? 'iso')}`,
 };

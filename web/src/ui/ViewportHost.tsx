@@ -8,6 +8,7 @@ const HINTS: Record<string, string> = {
   pick: 'Pick: click face, Shift+click grow flat face, Ctrl/Cmd+click remove, Esc clear',
   paint: 'Paint: drag to add faces, Ctrl/Cmd-drag to remove, right-drag orbits',
   gizmo: 'Gizmo: drag handles; g move, r rotate, s scale',
+  query: 'Query: describe the region (facet / normal / plane); matching faces light up, Resolve preview shows the grid nodes',
 };
 
 export function ViewportHost() {

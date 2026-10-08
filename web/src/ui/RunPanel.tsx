@@ -82,7 +82,7 @@ export function RunPanel() {
         <Btn variant="danger" onClick={() => void stopRun()} disabled={!active} testId="run-stop">
           Stop
         </Btn>
-        <span className={`status status-${run.status}`} data-testid="run-status">
+        <span className={`status status-${run.status}`} data-testid="run-status" title={run.status === 'queued' ? 'Waiting for the previous run to finish' : undefined}>
           {run.status}
         </span>
       </div>
@@ -92,6 +92,11 @@ export function RunPanel() {
         </span>
         <progress className="grow" max={max} value={last?.it ?? 0} />
       </div>
+      {run.message && run.status !== 'idle' && (
+        <p className="dim" data-testid="run-message">
+          {run.message}
+        </p>
+      )}
       <Sparkline history={run.history} />
       <div className="legend">
         <span style={{ color: '#4f9cf9' }}>compliance {last ? last.compliance.toPrecision(5) : '-'}</span>
