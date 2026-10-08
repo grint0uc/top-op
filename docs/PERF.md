@@ -231,3 +231,14 @@ at 100k within 30 % of `estimate_bytes` for both dtypes. The server previously a
 - An M1 has 8 cores (4 performance): the sparse kernels use up to 8 threads (`TOPOP_THREADS`), and
   macOS wheels use Accelerate, so the OpenBLAS pinning is a no-op there. Re-run
   `tests/test_perf.py` there to recalibrate the estimate.
+
+## v0.2 note: Chebyshev bound and CG breakdown
+
+Stress-constrained runs (adjoint solves with very different right-hand sides, warm-started) exposed CG
+breakdowns: the smoother's upper eigenvalue bound came from a 4-step power iteration restarted from the
+previous solve's vector, which gets stuck on a moving solid/void boundary and underestimated λmax by up to
+2x, making the V-cycle indefinite. The bound is now 8 Lanczos steps from a fixed random start on every
+refresh (≥ 0.967x the true λmax over 170 recorded matrices; the cycle needs ≥ 0.826x). Cost: about +5 % per
+iteration at 100k elements (1.37-1.39 → 1.44-1.50 s). Fallbacks inside `solve`: restart from zero →
+Gershgorin bounds (`gmg-safe`) → Jacobi-PCG, each tagged in `SolveInfo.method`. The replayed failure is
+`tests/data/lbracket_gmg_breakdown.npz` (`tests/test_solver.py`).
