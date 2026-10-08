@@ -51,6 +51,44 @@ def to_stl_bytes(mesh: trimesh.Trimesh) -> bytes:
     return trimesh.exchange.stl.export_stl(mesh)
 
 
+def _closed(mesh: trimesh.Trimesh | None) -> bool:
+    return (
+        mesh is not None
+        and len(mesh.faces) > 0
+        and mesh.is_watertight
+        and mesh.is_winding_consistent
+    )
+
+
+def trim_to_design(
+    result: trimesh.Trimesh, design: trimesh.Trimesh
+) -> tuple[trimesh.Trimesh, list[str]]:
+    """result ∩ design (manifold boolean), in the same (world) coordinates.
+
+    The exported part then never pokes outside the CAD surface and keeps the exact CAD skin
+    where the density stayed full. Never raises: if an input is not a closed, consistently
+    oriented surface, the intersection is empty or the engine fails, returns `result`
+    unchanged plus a warning.
+    """
+    for name, mesh in (("result", result), ("design", design)):
+        if not _closed(mesh):
+            return result, [f"not trimmed to the design: the {name} mesh is not watertight"]
+    a, b = result, design
+    if a.volume < 0:  # inside-out but closed: manifold needs outward normals
+        a = a.copy()
+        a.invert()
+    if b.volume < 0:
+        b = b.copy()
+        b.invert()
+    try:
+        out = trimesh.boolean.intersection([a, b], engine="manifold")
+    except Exception as exc:  # noqa: BLE001 - engine errors have no common base class
+        return result, [f"not trimmed to the design: boolean failed ({type(exc).__name__}: {exc})"]
+    if not _closed(out) or not out.volume > 0:
+        return result, ["not trimmed to the design: the intersection is empty or not watertight"]
+    return out, []
+
+
 # ---- VTK ImageData -------------------------------------------------------------------------------
 
 

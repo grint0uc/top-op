@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import io
 import time
 import xml.etree.ElementTree as ET
@@ -10,6 +11,7 @@ import pytest
 import trimesh
 from PIL import Image
 
+from topop.core.benchmarks import cantilever, cantilever_params
 from topop.core.export import (
     VIEWS,
     density_to_mesh,
@@ -18,7 +20,9 @@ from topop.core.export import (
     to_npz_bytes,
     to_stl_bytes,
     to_vti_bytes,
+    trim_to_design,
 )
+from topop.core.optimize import optimize
 from topop.core.problem import Grid
 from topop.core.voxelize import build_domain, load_mesh
 
@@ -75,6 +79,68 @@ def test_stl_bytes_round_trip(box_case):
     assert back.is_watertight and len(back.faces) == len(mesh.faces)
     assert np.allclose(back.bounds, bounds, atol=1e-5)
     assert len(to_stl_bytes(trimesh.Trimesh())) == 84
+
+
+@pytest.fixture(scope="module")
+def cantilever_result():
+    problem = cantilever(20, 8, 4)
+    res = optimize(problem, dataclasses.replace(cantilever_params(), max_iter=15))
+    design = trimesh.creation.box(extents=(20, 8, 4))
+    design.apply_translation((10, 4, 2))
+    return res.rho, problem.grid, design
+
+
+def test_trim_to_design_cantilever(cantilever_result):
+    rho, grid, design = cantilever_result
+    # threshold < 0.5 puts the iso-surface outside the outer element faces where rho ~ 1
+    raw = density_to_mesh(rho, grid, threshold=0.3)
+    assert np.any(raw.bounds[0] < -0.05) and np.any(raw.bounds[1] > design.bounds[1] + 0.05)
+    out, warnings = trim_to_design(raw, design)
+    assert warnings == []
+    assert out.is_watertight and out.volume > 0
+    assert np.all(out.bounds[0] >= design.bounds[0] - 1e-6)
+    assert np.all(out.bounds[1] <= design.bounds[1] + 1e-6)
+    assert out.volume <= raw.volume
+    # the CAD skin is kept exactly where the part touches it (e.g. the clamped face x=0)
+    assert np.isclose(out.bounds[0], 0, atol=1e-9).all()
+    # an inside-out (but closed) design trims the same
+    flipped = design.copy()
+    flipped.invert()
+    out2, warnings2 = trim_to_design(raw, flipped)
+    assert warnings2 == [] and out2.volume == pytest.approx(out.volume, rel=1e-9)
+
+
+def test_trim_to_design_failures(cantilever_result):
+    rho, grid, design = cantilever_result
+    raw = density_to_mesh(rho, grid)
+    open_design = trimesh.Trimesh(design.vertices, design.faces[:-2], process=False)
+    assert not open_design.is_watertight
+    out, warnings = trim_to_design(raw, open_design)
+    assert out is raw and len(warnings) == 1 and "design" in warnings[0]
+    open_result = trimesh.Trimesh(raw.vertices, raw.faces[:-3], process=False)
+    out, warnings = trim_to_design(open_result, design)
+    assert out is open_result and len(warnings) == 1 and "result" in warnings[0]
+    far = design.copy()
+    far.apply_translation((100, 0, 0))
+    out, warnings = trim_to_design(raw, far)
+    assert out is raw and len(warnings) == 1 and "empty" in warnings[0]
+    empty = trimesh.Trimesh()
+    out, warnings = trim_to_design(empty, design)
+    assert out is empty and len(warnings) == 1
+
+
+def test_trim_to_design_bracket_timing(bracket):
+    grid, active, _, _ = build_domain(bracket, [], 180)
+    raw = density_to_mesh(active.astype(float), grid)
+    assert len(raw.faces) >= 200_000
+    t = time.perf_counter()
+    out, warnings = trim_to_design(raw, bracket)
+    assert time.perf_counter() - t < 5.0
+    assert warnings == [] and out.is_watertight
+    assert np.all(out.bounds[0] >= bracket.bounds[0] - 1e-6)
+    assert np.all(out.bounds[1] <= bracket.bounds[1] + 1e-6)
+    assert out.volume <= min(raw.volume, bracket.volume) + 1e-6 * bracket.volume
+    assert out.volume > 0.95 * bracket.volume
 
 
 def _decode_vtk(text: str, dtype) -> np.ndarray:

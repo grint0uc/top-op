@@ -6,10 +6,15 @@ Meshes passed to `resolve_selection` are already in world coordinates, keyed by 
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 import trimesh
+from scipy import sparse
 from scipy.spatial import cKDTree
 
 from topop.core.problem import Grid
@@ -67,67 +72,471 @@ def faces_from_normal(
     return np.flatnonzero(ok).astype(np.int64)
 
 
-def compute_facets(mesh: trimesh.Trimesh, angle_deg: float = 5.0) -> tuple[list[dict], np.ndarray]:
-    """Coplanar face groups as `FacetInfo` dicts (sorted by area, id = rank) + face_to_facet.
+# ---- facets ------------------------------------------------------------------------------------
+#
+# Two phases. A: planar region growing from the largest faces; a neighbour joins when its normal
+# is within angle_deg of the group's area-weighted mean normal and within 2*angle_deg of the seed
+# normal, so growth stops on fillets and spheres (curved surfaces fragment into thin strips).
+# B: Phase-A groups that are *strips* (see `_STRIP_AREA_RATIO`) are chained into curved regions
+# through "smooth" adjacencies (mean normals within 3*angle_deg) and each region is tested
+# against a cylinder model. Strips are split into cylinder-like and sphere-like ones by their
+# discrete bending tensor sum(theta_e * len_e * e e^T) over their smooth mesh edges: on a
+# cylinder every bend is around the axis (rank 1), on a sphere it is isotropic. Only like joins
+# like, so a capsule's barrel and caps end up in different regions. A fitted cylinder then sheds
+# boundary faces that leave its surface (`_peel`) and takes back connected faces that lie on it
+# (`_grab`), so the tolerance of Phase A does not blur where a fillet starts. Strips that are no
+# cylinder become "other", one facet per smoothly connected patch.
 
-    Order: area descending (rounded to 1e-9 of the total area), ties by lowest face id. Both keys
-    are invariant under rigid transforms, so ids listed for a raw mesh stay valid after the
-    project transform is applied.
-    """
+_SMOOTH_FACTOR = 3.0  # strips chain when their mean normals differ by <= 3 * angle_deg
+# A Phase-A group is a strip (a fragment of a curved surface) when it has a smooth neighbour
+# group at least 1/ratio of its area. Strips of one surface have similar areas; a plane next to
+# a fillet is much larger than the fillet's strips, so it is never chained into the fillet.
+_STRIP_AREA_RATIO = 4.0
+_CYL_ANISOTROPY = 0.5  # bending tensor lambda2/lambda1 at or below this -> cylinder-like strip
+_CYL_RESIDUAL = 0.02  # max rms radial residual of the circle fit, relative to the radius
+_CYL_MIN_GROUPS = 3  # a cylinder region needs >= 3 Phase-A groups (2 planes at 10 deg are no arc)
+_CYL_MIN_TURN = 4.0  # ... and normals turning by >= 4 * angle_deg (3 planks at 6 deg are no arc)
+_BIG_FLAT = 0.1  # in a region that is no cylinder, flat groups with >= 10 % of its area are planes
+# A face this thin (altitude / sqrt(total area)) whose normal disagrees with all its neighbours
+# has a noise normal (float32 STL rounding tilts it 1 deg at ~4e-6): it joins any group, unweighted.
+_SLIVER = 1e-4
+_FACET_CACHE: OrderedDict[tuple[int, float], _Segmentation] = OrderedDict()
+_FACET_CACHE_SIZE = 8
+_FACET_LOCK = threading.Lock()  # the server segments from worker threads
+
+
+@dataclass(frozen=True)
+class _Segmentation:
+    label: np.ndarray  # (n_faces,) facet id (already ranked)
+    facets: tuple[dict, ...]
+
+
+def _neighbours(n: int, pairs: np.ndarray) -> tuple[list[int], list[int]]:
+    """CSR face adjacency (Python lists), neighbours sorted by face id."""
+    a = np.concatenate([pairs[:, 0], pairs[:, 1]])
+    b = np.concatenate([pairs[:, 1], pairs[:, 0]])
+    order = np.lexsort((b, a))
+    indptr = np.searchsorted(a[order], np.arange(n + 1))
+    return indptr.tolist(), b[order].tolist()
+
+
+def _grow_planar(
+    normals: np.ndarray,
+    area: np.ndarray,
+    unreliable: np.ndarray,
+    pairs: np.ndarray,
+    angle_deg: float,
+) -> np.ndarray:
+    """Phase A group label per face. Seeds by decreasing area (relative, rounded, so rigid
+    transforms keep the order), ties by face id; BFS with neighbours in face-id order.
+    Unreliable faces (degenerate or slivers: their normal is noise) never seed a group and join
+    whichever group reaches them first, without weight."""
+    n = len(area)
+    ip, nb = _neighbours(n, pairs)
+    cos1 = float(np.cos(np.radians(angle_deg)))
+    cos2 = float(np.cos(np.radians(min(2 * angle_deg, 180.0))))
+    amax = float(area.max()) or 1.0
+    order = np.lexsort((np.arange(n), -np.round(area / amax, 9), unreliable))
+    nrm = normals.tolist()
+    ar = area.tolist()
+    bad = unreliable.tolist()
+    lab = [-1] * n
+    g = 0
+    for s in order[: n - int(unreliable.sum())].tolist():
+        if lab[s] >= 0:
+            continue
+        lab[s] = g
+        sx, sy, sz = nrm[s]
+        a = ar[s]
+        mx, my, mz, mlen = a * sx, a * sy, a * sz, a
+        queue = [s]
+        i = 0
+        while i < len(queue):
+            f = queue[i]
+            i += 1
+            for k in range(ip[f], ip[f + 1]):
+                h = nb[k]
+                if lab[h] >= 0:
+                    continue
+                if not bad[h]:
+                    hx, hy, hz = nrm[h]
+                    if (
+                        hx * sx + hy * sy + hz * sz < cos2
+                        or hx * mx + hy * my + hz * mz < cos1 * mlen
+                    ):
+                        continue
+                    a = ar[h]
+                    mx, my, mz = mx + a * hx, my + a * hy, mz + a * hz
+                    mlen = (mx * mx + my * my + mz * mz) ** 0.5
+                lab[h] = g
+                queue.append(h)
+        g += 1
+    for s in order.tolist():  # left-over islands of unreliable faces
+        if lab[s] < 0:
+            lab[s] = g
+            queue = [s]
+            for f in queue:
+                for k in range(ip[f], ip[f + 1]):
+                    if lab[nb[k]] < 0:
+                        lab[nb[k]] = g
+                        queue.append(nb[k])
+            g += 1
+    return np.asarray(lab, dtype=np.int64)
+
+
+def _bincount3(label: np.ndarray, w: np.ndarray, vec: np.ndarray, n: int) -> np.ndarray:
+    return np.stack([np.bincount(label, weights=w * vec[:, i], minlength=n) for i in range(3)], 1)
+
+
+def _components(n: int, edges: np.ndarray) -> np.ndarray:
+    return np.asarray(
+        trimesh.graph.connected_component_labels(edges.reshape(-1, 2), node_count=n),
+        dtype=np.int64,
+    )
+
+
+class _Cylinder(NamedTuple):
+    axis: np.ndarray
+    center: np.ndarray  # on the axis, at the area-weighted mean axial position
+    radius: float
+    na: np.ndarray  # |n . axis| per fitted face
+    resid: float  # rms radial residual / radius
+
+
+def _fit_cylinder(mesh: trimesh.Trimesh, faces: np.ndarray, angle_deg: float) -> _Cylinder | None:
+    """Axis = least eigenvector of sum(area * n n^T) (cylinder normals are perpendicular to it),
+    then an algebraic (Kasa) circle fit of the vertices projected along the axis. None unless
+    the normals turn by >= _CYL_MIN_TURN * angle_deg around the axis, their rms axial component is
+    <= sin(angle_deg) and the rms radial residual is <= _CYL_RESIDUAL * radius."""
+    n = np.asarray(mesh.face_normals)[faces]
+    a = np.asarray(mesh.area_faces)[faces]
+    tot = float(a.sum())
+    if not tot > 0:
+        return None
+    w, v = np.linalg.eigh((n * a[:, None]).T @ n)
+    axis = v[:, 0]
+    if w[1] < tot * np.radians(_CYL_MIN_TURN * angle_deg) ** 2 / 12:  # spread t: ~t^2/12
+        return None
+    na = np.abs(n @ axis)
+    if np.sqrt(np.sum(a * na**2) / tot) > np.sin(np.radians(angle_deg)):
+        return None
+    u = v[:, 1] - axis * (v[:, 1] @ axis)
+    u /= np.linalg.norm(u)
+    vv = np.cross(axis, u)
+    pts = np.asarray(mesh.vertices)[np.unique(np.asarray(mesh.faces)[faces])]
+    mean = pts.mean(0)
+    x, y = (pts - mean) @ u, (pts - mean) @ vv
+    lhs = np.stack([x, y, np.ones_like(x)], 1)
+    sol, *_ = np.linalg.lstsq(lhs, -(x * x + y * y), rcond=None)
+    cx, cy = -sol[0] / 2, -sol[1] / 2
+    r2 = cx * cx + cy * cy - sol[2]
+    if not r2 > 0:
+        return None
+    r = float(np.sqrt(r2))
+    resid = float(np.sqrt(np.mean((np.hypot(x - cx, y - cy) - r) ** 2))) / r
+    if resid > _CYL_RESIDUAL:
+        return None
+    z = float(np.sum(a * (np.asarray(mesh.triangles_center)[faces] @ axis)) / tot)
+    center = mean + cx * u + cy * vv + (z - mean @ axis) * axis
+    big = np.flatnonzero(np.abs(axis) > 1e-9)
+    if big.size and axis[big[0]] < 0:  # lexicographically towards +x/+y/+z
+        axis = -axis
+    return _Cylinder(axis, center, r, na, resid)
+
+
+def _peel(
+    mesh: trimesh.Trimesh,
+    adj: sparse.csr_matrix,
+    faces: np.ndarray,
+    cyl: _Cylinder,
+    unreliable: np.ndarray,
+    angle_deg: float,
+) -> np.ndarray:
+    """Mask over `faces`: faces whose normal leaves the cylinder (|n . axis| above
+    max(sin(angle_deg/4), 4 * area-weighted median)) and that reach the region's boundary
+    through such faces, e.g. the first ring of a capsule cap, which Phase A puts into the
+    barrel's strips."""
+    na = cyl.na
+    a = np.asarray(mesh.area_faces)[faces]
+    srt = np.argsort(na)
+    cum = np.cumsum(a[srt])
+    med = na[srt][min(int(np.searchsorted(cum, 0.5 * cum[-1])), len(srt) - 1)]
+    bad = (na > max(np.sin(np.radians(angle_deg / 4)), 4 * med)) & ~unreliable
+    if not bad.any():
+        return bad
+    sub = adj[faces][:, faces].tocoo()
+    boundary = np.diff(adj[faces].indptr) > np.bincount(sub.row, minlength=len(faces))
+    keep = bad[sub.row] & bad[sub.col]
+    comp = _components(len(faces), np.stack([sub.row[keep], sub.col[keep]], 1))
+    hit = np.zeros(int(comp.max()) + 1, dtype=bool)
+    hit[comp[bad & boundary]] = True
+    return bad & hit[comp]
+
+
+def _grab(
+    mesh: trimesh.Trimesh,
+    adj: sparse.csr_matrix,
+    faces: np.ndarray,
+    cyl: _Cylinder,
+    free: np.ndarray,
+    unreliable: np.ndarray,
+    angle_deg: float,
+) -> np.ndarray:
+    """Faces of `free` (plane / other faces) connected to the cylinder that lie on it: normal
+    within angle_deg/4 of perpendicular to the axis, every vertex within max(4 * rms residual,
+    1e-3) * radius of the surface. Phase A puts a fillet's first strips (normal < angle_deg off
+    the tangent plane) into that plane, and strip ends into a corner blend's groups; this hands
+    them back."""
+    tol = max(4 * cyl.resid, 1e-3) * cyl.radius
+    sin_n = np.sin(np.radians(angle_deg / 4))
+    normals = np.asarray(mesh.face_normals)
+    seen = np.zeros(len(mesh.faces), dtype=bool)
+    seen[faces] = True
+    front, taken = faces, []
+    while front.size:
+        nb = np.unique(adj[front].indices)
+        nb = nb[free[nb] & ~seen[nb]]
+        seen[nb] = True
+        d = np.asarray(mesh.triangles)[nb] - cyl.center
+        radial = np.linalg.norm(d - (d @ cyl.axis)[..., None] * cyl.axis, axis=2)
+        ok = ((np.abs(normals[nb] @ cyl.axis) <= sin_n) | unreliable[nb]) & np.all(
+            np.abs(radial - cyl.radius) <= tol, axis=1
+        )
+        front = nb[ok]
+        taken.append(front)
+    return np.concatenate(taken) if taken else np.zeros(0, dtype=np.int64)
+
+
+def _segment(mesh: trimesh.Trimesh, angle_deg: float) -> _Segmentation:
     n = len(mesh.faces)
     if n == 0:
-        return [], np.zeros(0, dtype=np.int64)
-    adj = np.asarray(mesh.face_adjacency)
-    if len(adj):
-        adj = adj[np.asarray(mesh.face_adjacency_angles) <= np.radians(float(angle_deg))]
-    label = np.asarray(
-        trimesh.graph.connected_component_labels(adj.reshape(-1, 2), node_count=n), dtype=np.int64
-    )
-    ng = int(label.max()) + 1
-
+        return _Segmentation(np.zeros(0, dtype=np.int64), ())
+    normals = np.asarray(mesh.face_normals, dtype=np.float64)
     area = np.asarray(mesh.area_faces, dtype=np.float64)
-    g_area = np.bincount(label, weights=area, minlength=ng)
-    g_nf = np.bincount(label, minlength=ng)
-    wn = np.stack(
-        [
-            np.bincount(label, weights=area * mesh.face_normals[:, i], minlength=ng)
-            for i in range(3)
-        ],
-        1,
-    )
-    norm = np.linalg.norm(wn, axis=1, keepdims=True)
-    # a closed curved group (e.g. a finely tessellated sphere) has no meaningful normal -> 0
-    g_normal = np.divide(wn, norm, out=np.zeros_like(wn), where=norm > 1e-6 * g_area[:, None])
-    tc = np.asarray(mesh.triangles_center)
-    safe = np.where(g_area > 0, g_area, 1.0)[:, None]
-    g_centroid = (
-        np.stack([np.bincount(label, weights=area * tc[:, i], minlength=ng) for i in range(3)], 1)
-        / safe
-    )
-    tri = np.asarray(mesh.triangles)
-    g_min = np.full((ng, 3), np.inf)
-    g_max = np.full((ng, 3), -np.inf)
-    np.minimum.at(g_min, label, tri.min(1))
-    np.maximum.at(g_max, label, tri.max(1))
-    first_face = np.full(ng, n, dtype=np.int64)
-    np.minimum.at(first_face, label, np.arange(n))
+    adj = np.asarray(mesh.face_adjacency, dtype=np.int64).reshape(-1, 2)
+    theta = np.asarray(mesh.face_adjacency_angles, dtype=np.float64)
+    smooth = np.radians(min(_SMOOTH_FACTOR * angle_deg, 180.0))
 
-    total = max(float(g_area.sum()), np.finfo(float).tiny)
-    order = np.lexsort((first_face, -np.round(g_area / total, 9)))
-    rank = np.empty(ng, dtype=np.int64)
-    rank[order] = np.arange(ng)
+    # ---- phase A
+    tri = np.asarray(mesh.triangles)
+    longest = np.linalg.norm(tri - np.roll(tri, 1, axis=1), axis=2).max(1)
+    altitude = np.divide(2 * area, longest, out=np.zeros(n), where=longest > 0)
+    # a thin face whose normal disagrees with every neighbour: its normal is rounding noise
+    agree = np.full(n, np.pi)
+    np.minimum.at(agree, adj.ravel(), np.repeat(theta, 2))
+    unreliable = (np.linalg.norm(normals, axis=1) < 0.5) | (
+        (altitude <= _SLIVER * np.sqrt(area.sum())) & (agree > np.radians(angle_deg))
+    )
+    lab = _grow_planar(normals, area, unreliable, adj, angle_deg)
+    ng = int(lab.max()) + 1
+    g_area = np.bincount(lab, weights=area, minlength=ng)
+    g_sum = _bincount3(lab, area, normals, ng)
+    g_len = np.linalg.norm(g_sum, axis=1)
+    g_n = np.divide(g_sum, g_len[:, None], out=np.zeros_like(g_sum), where=g_len[:, None] > 0)
+    g_flat = g_len >= np.cos(np.radians(angle_deg / 2)) * g_area
+
+    # ---- phase B: smooth group adjacency, strips, bending tensors
+    la, lb = lab[adj[:, 0]], lab[adj[:, 1]]
+    cross = la != lb
+    gp = np.unique(np.sort(np.stack([la[cross], lb[cross]], 1), axis=1), axis=0)
+    phi = np.arccos(np.clip(np.einsum("ij,ij->i", g_n[gp[:, 0]], g_n[gp[:, 1]]), -1, 1))
+    gp = gp[(phi <= smooth) & (g_area[gp[:, 0]] > 0) & (g_area[gp[:, 1]] > 0)]
+    nbr_area = np.zeros(ng)
+    np.maximum.at(nbr_area, gp[:, 0], g_area[gp[:, 1]])
+    np.maximum.at(nbr_area, gp[:, 1], g_area[gp[:, 0]])
+    strip = (nbr_area > 0) & (g_area <= _STRIP_AREA_RATIO * nbr_area)
+
+    ev = np.asarray(mesh.face_adjacency_edges, dtype=np.int64).reshape(-1, 2)
+    vec = np.asarray(mesh.vertices)[ev[:, 1]] - np.asarray(mesh.vertices)[ev[:, 0]]
+    elen = np.linalg.norm(vec, axis=1)
+    rel = ~unreliable[adj[:, 0]] & ~unreliable[adj[:, 1]]
+    bend = (theta > 0) & (theta <= smooth) & (elen > 0) & rel
+    e = vec[bend] / elen[bend, None]
+    w = (theta * elen)[bend]
+    bcross = cross[bend]
+
+    def per_group(c: np.ndarray) -> np.ndarray:  # edge values -> both groups (once if internal)
+        return np.bincount(la[bend], weights=c, minlength=ng) + np.bincount(
+            lb[bend], weights=np.where(bcross, c, 0.0), minlength=ng
+        )
+
+    tens = np.zeros((ng, 3, 3))
+    for i in range(3):
+        for j in range(i, 3):
+            tens[:, i, j] = tens[:, j, i] = per_group(w * e[:, i] * e[:, j])
+    lam, vecs = np.linalg.eigh(tens)
+    g_axis = vecs[:, :, 2]
+    cyl_like = (lam[:, 2] > 0) & (lam[:, 1] <= _CYL_ANISOTROPY * lam[:, 2])
+    # +1 convex, -1 concave: a convex and a concave fillet that meet tangentially (an S-curve)
+    # are two cylinders, not one
+    convex = np.asarray(mesh.face_adjacency_convex, dtype=bool)[bend]
+    g_convex = np.sign(per_group(np.where(convex, w, -w)))
+
+    sa, sb = gp[:, 0], gp[:, 1]
+    both = strip[sa] & strip[sb]
+    same_axis = np.abs(np.einsum("ij,ij->i", g_axis[sa], g_axis[sb])) >= np.cos(smooth)
+    same_cyl = cyl_like[sa] & cyl_like[sb] & same_axis & (g_convex[sa] == g_convex[sb])
+    join = both & (same_cyl | (~cyl_like[sa] & ~cyl_like[sb]))
+    region = _components(ng, gp[join])
+    # a group no larger than a curved strip of another region next to it (e.g. a lone sliver
+    # group on a sphere) is curved too, whatever its own region turns out to be
+    other_strip = strip[sb] & (region[sa] != region[sb])
+    absorbed = np.zeros(ng, dtype=bool)
+    absorbed[sa[other_strip & (g_area[sa] <= _STRIP_AREA_RATIO * g_area[sb])]] = True
+    other_strip = strip[sa] & (region[sa] != region[sb])
+    absorbed[sb[other_strip & (g_area[sb] <= _STRIP_AREA_RATIO * g_area[sa])]] = True
+
+    # ---- classify regions: face kind 0 plane (per group), 1 cylinder (per region), 2 other
+    kind = np.zeros(ng, dtype=np.int8)  # per group
+    cyl_of_face = np.full(n, -1, dtype=np.int64)
+    cylinders: list[tuple[np.ndarray, _Cylinder]] = []
+    fadj = sparse.coo_matrix(
+        (np.ones(2 * len(adj), dtype=np.int8), (adj.T.ravel(), adj[:, ::-1].T.ravel())),
+        shape=(n, n),
+    ).tocsr()
+    order = np.argsort(lab, kind="stable")
+    starts = np.searchsorted(lab[order], np.arange(ng + 1))
+
+    def faces_of(groups: np.ndarray) -> np.ndarray:
+        return np.sort(np.concatenate([order[starts[g] : starts[g + 1]] for g in groups]))
+
+    pending = [np.flatnonzero(region == r) for r in np.unique(region[strip])]
+    while pending:
+        groups = pending.pop()
+        if len(groups) >= _CYL_MIN_GROUPS and cyl_like[groups].all():
+            faces = faces_of(groups)
+            fit = _fit_cylinder(mesh, faces, angle_deg)
+            if fit is not None:
+                drop = _peel(mesh, fadj, faces, fit, unreliable[faces], angle_deg)
+                refit = _fit_cylinder(mesh, faces[~drop], angle_deg) if drop.any() else None
+                if refit is not None:
+                    faces, fit = faces[~drop], refit
+                kind[groups] = 1
+                cyl_of_face[faces] = len(cylinders)
+                cylinders.append((faces, fit))
+                continue
+        big = g_flat[groups] & (g_area[groups] >= _BIG_FLAT * g_area[groups].sum())
+        if big.any() and (~big).any():
+            # e.g. two wide planes at a shallow angle chained with a fillet: keep the planes,
+            # retry the rest (terminates: every split drops >= 1 group)
+            rest = groups[~big]
+            sub = join & np.isin(sa, rest) & np.isin(sb, rest)
+            comp = _components(ng, gp[sub])[rest]
+            pending.extend(rest[comp == c] for c in np.unique(comp))
+            continue
+        if len(groups) < _CYL_MIN_GROUPS:
+            kind[groups] = np.where(g_flat[groups] & ~absorbed[groups], 0, 2)
+        else:
+            kind[groups] = np.where(big, 0, 2)
+
+    face_kind = kind[lab]
+    face_kind[(face_kind == 1) & (cyl_of_face < 0)] = 2  # peeled faces
+    for c, (faces, fit) in enumerate(cylinders):
+        extra = _grab(mesh, fadj, faces, fit, face_kind != 1, unreliable, angle_deg)
+        if extra.size:
+            faces = np.union1d(faces, extra)
+            face_kind[extra] = 1
+            cyl_of_face[extra] = c
+            cylinders[c] = (faces, _fit_cylinder(mesh, faces, angle_deg) or fit)
+    # "other" faces: one facet per smoothly connected patch
+    oth = face_kind == 2
+    sm = oth[adj[:, 0]] & oth[adj[:, 1]] & ((theta <= smooth) | ~rel)
+    other_comp = _components(n, adj[sm])
+
+    # final label: planes keep their group, cylinders their region, others their patch
+    key = np.where(face_kind == 0, lab, np.where(face_kind == 1, ng + cyl_of_face, 0))
+    key[oth] = ng + len(cylinders) + other_comp[oth]
+    _, final = np.unique(key, return_inverse=True)
+    final = final.ravel()
+    nf = int(final.max()) + 1
+    f_area = np.bincount(final, weights=area, minlength=nf)
+    f_nf = np.bincount(final, minlength=nf)
+    f_sum = _bincount3(final, area, normals, nf)
+    f_len = np.linalg.norm(f_sum, axis=1)
+    f_n = np.divide(f_sum, f_len[:, None], out=np.zeros_like(f_sum), where=f_len[:, None] > 0)
+    safe = np.where(f_area > 0, f_area, 1.0)[:, None]
+    f_c = _bincount3(final, area, np.asarray(mesh.triangles_center), nf) / safe
+    f_min = np.full((nf, 3), np.inf)
+    f_max = np.full((nf, 3), -np.inf)
+    np.minimum.at(f_min, final, tri.min(1))
+    np.maximum.at(f_max, final, tri.max(1))
+    first = np.full(nf, n, dtype=np.int64)
+    np.minimum.at(first, final, np.arange(n))
+    f_kind = np.zeros(nf, dtype=np.int8)
+    f_kind[final] = face_kind
+    f_cyl = np.full(nf, -1, dtype=np.int64)
+    f_cyl[final] = cyl_of_face
+
+    total = max(float(f_area.sum()), np.finfo(float).tiny)
+    rank_order = np.lexsort((first, -np.round(f_area / total, 9)))
+    rank = np.empty(nf, dtype=np.int64)
+    rank[rank_order] = np.arange(nf)
+    out = []
+    for r, g in enumerate(rank_order):
+        k = int(f_kind[g])
+        info = {
+            "id": r,
+            "n_faces": int(f_nf[g]),
+            "area": float(f_area[g]),
+            "normal": f_n[g].tolist() if k == 0 else [0.0, 0.0, 0.0],
+            "centroid": f_c[g].tolist(),
+            "bbox": [f_min[g].tolist(), f_max[g].tolist()],
+            "kind": ("plane", "cylinder", "other")[k],
+            "axis": None,
+            "radius": None,
+        }
+        if k == 1:
+            fit = cylinders[int(f_cyl[g])][1]
+            info.update(axis=fit.axis.tolist(), radius=fit.radius, centroid=fit.center.tolist())
+        out.append(info)
+    return _Segmentation(rank[final], tuple(out))
+
+
+def _segmentation(mesh: trimesh.Trimesh, angle_deg: float) -> _Segmentation:
+    key = (hash(mesh), float(angle_deg))  # trimesh hashes vertices + faces
+    with _FACET_LOCK:
+        hit = _FACET_CACHE.get(key)
+        if hit is not None:
+            _FACET_CACHE.move_to_end(key)
+            return hit
+    seg = _segment(mesh, float(angle_deg))
+    seg.label.flags.writeable = False
+    with _FACET_LOCK:
+        _FACET_CACHE[key] = seg
+        while len(_FACET_CACHE) > _FACET_CACHE_SIZE:
+            _FACET_CACHE.popitem(last=False)
+    return seg
+
+
+def compute_facets(mesh: trimesh.Trimesh, angle_deg: float = 5.0) -> tuple[list[dict], np.ndarray]:
+    """Planar / cylindrical / other face groups as `FacetInfo` dicts + face_to_facet.
+
+    Order: area descending (rounded to 1e-9 of the total area), ties by lowest face id. Every
+    criterion is invariant under rigid transforms, so ids listed for a raw mesh stay valid after
+    the project transform is applied.
+    """
+    seg = _segmentation(mesh, angle_deg)
     facets = [
         {
-            "id": int(r),
-            "n_faces": int(g_nf[g]),
-            "area": float(g_area[g]),
-            "normal": g_normal[g].tolist(),
-            "centroid": g_centroid[g].tolist(),
-            "bbox": [g_min[g].tolist(), g_max[g].tolist()],
+            **f,
+            "normal": list(f["normal"]),
+            "centroid": list(f["centroid"]),
+            "bbox": [list(b) for b in f["bbox"]],
+            "axis": None if f["axis"] is None else list(f["axis"]),
         }
-        for r, g in enumerate(order)
+        for f in seg.facets
     ]
-    return facets, rank[label]
+    return facets, seg.label.copy()
+
+
+def facet_faces(mesh: trimesh.Trimesh, angle_deg: float, facet_ids: Sequence[int]) -> np.ndarray:
+    """Sorted face ids (int64) of the given facets of `compute_facets(mesh, angle_deg)`."""
+    seg = _segmentation(mesh, angle_deg)
+    want = np.asarray(facet_ids, dtype=np.int64).ravel()
+    bad = want[(want < 0) | (want >= len(seg.facets))]
+    if bad.size:
+        raise ValueError(f"unknown facet ids {bad.tolist()} (mesh has {len(seg.facets)} facets)")
+    return np.flatnonzero(np.isin(seg.label, want)).astype(np.int64)
 
 
 def _nodes_near_faces(
@@ -238,12 +647,8 @@ def resolve_selection(
         out = _nodes_near_faces(_mesh(meshes, sel), sel.get("face_ids", []), grid, active)
     elif kind == "facets":
         mesh = _mesh(meshes, sel)
-        facets, f2f = compute_facets(mesh, float(sel.get("angle_deg", 5.0)))
-        want = np.asarray(sel.get("facet_ids", []), dtype=np.int64)
-        bad = want[(want < 0) | (want >= len(facets))]
-        if bad.size:
-            raise ValueError(f"unknown facet ids {bad.tolist()} (mesh has {len(facets)} facets)")
-        out = _nodes_near_faces(mesh, np.flatnonzero(np.isin(f2f, want)), grid, active)
+        faces = facet_faces(mesh, float(sel.get("angle_deg", 5.0)), sel.get("facet_ids", []))
+        out = _nodes_near_faces(mesh, faces, grid, active)
     elif kind == "normal":
         mesh = _mesh(meshes, sel)
         within = sel.get("within")
