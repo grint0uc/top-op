@@ -152,7 +152,7 @@ pydantic 2.14; three 0.186, vite 8, react 19, zustand 5, openapi-typescript 7, @
 ## 3. API contract (`server/schemas.py`) — the frontend builds against this from day one
 
 ```
-POST /api/meshes                 multipart file  → MeshInfo{id, name, n_faces, bbox, is_watertight, units_hint}
+POST /api/meshes                 multipart file  → MeshInfo{id, name, n_faces, n_vertices, bbox, is_watertight, volume}
 GET  /api/meshes/{id}/buffer     → application/octet-stream: [u32 n_vert][u32 n_tri][f32 xyz*n_vert][u32 ijk*n_tri][f32 nxyz per face]
 GET  /api/meshes/{id}/adjacency  → octet-stream u32 pairs (trimesh.face_adjacency) for flat-face grow
 GET  /api/meshes/{id}/facets?angle_deg=5 → MeshFacets{facets:[{id,n_faces,area,normal,centroid,bbox}]} (coplanar groups, area-sorted; agents pick by id)
@@ -166,7 +166,7 @@ POST /api/projects/{id}/voxelize → VoxelStats{nx,ny,nz,h,n_active,n_nodes,n_do
 POST /api/projects/{id}/resolve-selection  Selection → ResolvedNodes{count, xyz: float32 list (capped at 5000 for preview)}
 
 POST /api/runs                   {project_id} → Run{id,status}
-WS   /api/runs/{id}/stream       → ProgressMsg{type:"progress", it, c, vol, change, t_iter} every iteration
+WS   /api/runs/{id}/stream       → ProgressMsg{type:"progress", it, compliance, volume, change, t_iter} every iteration
                                    + DensityMsg (binary, little-endian: [u32 it][u32 nx][u32 ny][u32 nz][u8 rho*255 ...] C-order) every k iterations (k=1 for ≤50k elems)
                                    + {type:"done"|"error"|"cancelled", ...}
 POST /api/runs/{id}/cancel       GET /api/runs/{id} → RunInfo      GET /api/runs → list[RunInfo]

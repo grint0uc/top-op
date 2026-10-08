@@ -31,10 +31,13 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'], launchOptions: { executablePath: chromiumPath() } },
     },
   ],
+  // The e2e suite runs against the in-process mock backend (web/mock). Set PW_REUSE_SERVER=1 to attach to a
+  // dev server you started yourself with `VITE_MOCK=1 npm run dev`.
   webServer: {
     command: 'npm run dev',
-    url: 'http://127.0.0.1:5173',
-    reuseExistingServer: true,
+    env: { VITE_MOCK: '1' },
+    url: 'http://127.0.0.1:5173/api/health',
+    reuseExistingServer: process.env.PW_REUSE_SERVER === '1',
     timeout: 60_000,
   },
 });

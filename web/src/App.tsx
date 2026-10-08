@@ -1,19 +1,31 @@
-// Panel names follow docs/PLAN.md section 4; each becomes a ui/*Panel component in A3.
-const PANELS = ['Import', 'Domain', 'Loads', 'Supports', 'Reference models', 'Run', 'Results'];
+import { DomainPanel } from './ui/DomainPanel';
+import { ImportPanel } from './ui/ImportPanel';
+import { LoadsPanel } from './ui/LoadsPanel';
+import { NoticeBar } from './ui/NoticeBar';
+import { RefModelsPanel } from './ui/RefModelsPanel';
+import { ResultsPanel } from './ui/ResultsPanel';
+import { RunPanel } from './ui/RunPanel';
+import { SupportsPanel } from './ui/SupportsPanel';
+import { ViewportHost } from './ui/ViewportHost';
+import { useHotkeys } from './ui/hotkeys';
 
 export function App() {
+  useHotkeys();
   return (
     <div className="layout">
       <aside className="sidebar">
         <h1 className="brand">top-op</h1>
-        {PANELS.map((name) => (
-          <section className="panel" key={name}>
-            <h2>{name}</h2>
-          </section>
-        ))}
+        <NoticeBar />
+        <ImportPanel />
+        <DomainPanel />
+        <LoadsPanel />
+        <SupportsPanel />
+        <RefModelsPanel />
+        <RunPanel />
+        <ResultsPanel />
       </aside>
       <main className="main">
-        <canvas id="viewport" />
+        <ViewportHost />
       </main>
     </div>
   );

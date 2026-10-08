@@ -1,0 +1,176 @@
+// Mirrors store state into a Viewport (store -> viewport) and viewport edits back (viewport -> store).
+import type { DensityFrame } from '../api/client';
+import { SUPPORT_COLOR, bboxDiagonal, caseColor, designEntry, isPrimitive, selectionAnchor, toPrim } from '../state/derived';
+import { IDENTITY } from '../state/defaults';
+import { type State, useStore } from '../state/store';
+import type { DensityGrid } from './DensityView';
+import type { LoadMarker, SupportMarker } from './Markers';
+import type { FaceGroup, Viewport } from './Viewport';
+
+function gridFor(frame: DensityFrame, s: State): DensityGrid {
+  const st = s.run.stats ?? s.voxel.stats;
+  const [nx, ny, nz] = frame.shape;
+  if (st && st.nx === nx && st.ny === ny && st.nz === nz) return { origin: st.origin, h: st.h };
+  // no matching stats: fit the frame to the design bbox (padding cells on every side)
+  const d = designEntry(s);
+  const pad = s.project.grid.padding;
+  if (!d) return { origin: [0, 0, 0], h: 1 };
+  const { min, max } = d.data.bbox;
+  const h = Math.max(max[0] - min[0], max[1] - min[1], max[2] - min[2]) / Math.max(1, Math.max(nx, ny, nz) - 2 * pad);
+  return { origin: [min[0] - pad * h, min[1] - pad * h, min[2] - pad * h], h };
+}
+
+export function bindViewport(vp: Viewport): () => void {
+  const store = useStore;
+  const unsubs: Array<() => void> = [];
+
+  function watch<T>(sel: (s: State) => T, cb: (v: T, s: State) => void): void {
+    cb(sel(store.getState()), store.getState());
+    unsubs.push(
+      store.subscribe((s, prev) => {
+        const v = sel(s);
+        if (!Object.is(v, sel(prev))) cb(v, s);
+      }),
+    );
+  }
+
+  // ---- viewport -> store
+  vp.primitives.onChange = (p) => store.getState().setPrimitive(p);
+  vp.onRefTransform = (id, m) => store.getState().updateRef(id, { transform: m });
+
+  // ---- helpers
+  const applyFaces = () => {
+    const s = store.getState();
+    const design = designEntry(s);
+    if (!design) return;
+    const groups: FaceGroup[] = [];
+    for (const l of s.project.loads) {
+      if (l.selection.kind === 'faces' && l.selection.mesh_id === design.info.id) {
+        groups.push({ faces: l.selection.face_ids, color: caseColor(l.case) });
+      }
+    }
+    for (const x of s.project.supports) {
+      if (x.selection.kind === 'faces' && x.selection.mesh_id === design.info.id) {
+        groups.push({ faces: x.selection.face_ids, color: SUPPORT_COLOR });
+      }
+    }
+    vp.setFaceLayers(s.selection.faceIds, groups);
+  };
+
+  const applyAppearance = () => {
+    const s = store.getState();
+    const overlay = (!!s.run.densityFrame && !s.resultStl) || !!s.resultStl;
+    vp.setDesignAppearance(overlay ? (s.ghostDesign ? 'ghost' : 'hidden') : 'solid');
+    vp.density.setVisible(!s.resultStl);
+  };
+
+  const reportDensity = () =>
+    store.getState().setDensityInfo({ mode: vp.density.mode, count: vp.density.count, it: vp.density.it });
+
+  const syncMarkers = () => {
+    const s = store.getState();
+    const loads: LoadMarker[] = [];
+    const supports: SupportMarker[] = [];
+    const committed: { id: string; prim: ReturnType<typeof toPrim>; color: number }[] = [];
+    for (const l of s.project.loads) {
+      const at = selectionAnchor(l.selection, s.meshes);
+      if (at) loads.push({ id: l.id, at, force: l.force, color: caseColor(l.case) });
+      if (isPrimitive(l.selection)) committed.push({ id: l.id, prim: toPrim(l.selection), color: caseColor(l.case) });
+    }
+    for (const x of s.project.supports) {
+      const at = selectionAnchor(x.selection, s.meshes);
+      if (at) supports.push({ id: x.id, at, color: SUPPORT_COLOR });
+      if (isPrimitive(x.selection)) committed.push({ id: x.id, prim: toPrim(x.selection), color: SUPPORT_COLOR });
+    }
+    vp.markers.setLoads(loads);
+    vp.markers.setSupports(supports);
+    vp.primitives.setCommitted(committed);
+  };
+
+  const syncRefs = () => {
+    const s = store.getState();
+    const live = new Set<string>();
+    for (const r of s.project.ref_models) {
+      const entry = r.mesh_id ? s.meshes[r.mesh_id] : undefined;
+      if (!entry) continue;
+      live.add(r.id);
+      if (!vp.hasRefMesh(r.id)) vp.loadRefMesh(r.id, entry.buffer);
+      vp.setRefAppearance(r.id, r.mode, r.visible);
+      vp.setRefTransform(r.id, r.transform ?? IDENTITY);
+    }
+    for (const id of vp.refIds()) if (!live.has(id)) vp.removeRefMesh(id);
+    syncGizmoTarget();
+  };
+
+  /** One gizmo, two possible owners: an active primitive wins, otherwise the active reference model. */
+  function syncGizmoTarget(): void {
+    const s = store.getState();
+    if (s.selection.primitive) vp.primitives.attachGizmo();
+    else if (s.activeItem?.kind === 'ref') vp.setActiveRef(s.activeItem.id);
+    else vp.attachGizmo(null);
+  }
+
+  // ---- store -> viewport
+  watch(
+    (s) => designEntry(s),
+    (entry) => {
+      if (entry) {
+        vp.loadDesignMesh(entry.buffer, { meshId: entry.info.id, data: entry.data });
+        vp.markers.setScale(bboxDiagonal(entry.data));
+        vp.fitCamera();
+        applyFaces();
+        applyAppearance();
+        syncMarkers();
+      } else {
+        vp.clearDesignMesh();
+      }
+    },
+  );
+  watch((s) => s.project.ref_models, syncRefs);
+  watch((s) => s.meshes, syncRefs);
+  watch((s) => s.activeItem, syncGizmoTarget);
+  watch((s) => s.tool, (t) => vp.setMode(t));
+  watch((s) => s.gizmoMode, (m) => vp.setGizmoMode(m));
+  watch((s) => s.selection.faceIds, applyFaces);
+  watch((s) => s.selection.primitive, (p) => {
+    vp.primitives.setActive(p);
+    syncGizmoTarget();
+  });
+  watch((s) => s.project.loads, () => {
+    applyFaces();
+    syncMarkers();
+  });
+  watch((s) => s.project.supports, () => {
+    applyFaces();
+    syncMarkers();
+  });
+  watch((s) => s.preview, (p) => vp.markers.setPoints(p?.xyz ?? null));
+  watch(
+    (s) => s.run.densityFrame,
+    (f, s) => {
+      if (f) vp.density.setFrame(f, gridFor(f, s), s.threshold);
+      else vp.density.clear();
+      reportDensity();
+      applyAppearance();
+    },
+  );
+  watch((s) => s.threshold, (t) => {
+    vp.density.setThreshold(t);
+    reportDensity();
+  });
+  watch((s) => s.ghostDesign, applyAppearance);
+  watch(
+    (s) => s.resultStl,
+    (buf) => {
+      if (buf) vp.showResultMesh(buf);
+      else vp.clearResultMesh();
+      applyAppearance();
+    },
+  );
+
+  return () => {
+    unsubs.forEach((u) => u());
+    vp.primitives.onChange = null;
+    vp.onRefTransform = null;
+  };
+}
