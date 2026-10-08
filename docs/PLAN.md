@@ -313,9 +313,9 @@ Shipped, per work package (commit subjects in `git log`; numbers from `docs/PERF
 Deferred or open:
 - Not measured on the target M1 (PLAN targets: 100k <= 6 s/it, 250k <= 20 s/it and <= 8 GB). Re-run `uv run pytest tests/test_perf.py` there to recalibrate `estimate_seconds_per_iter`.
 - Symmetric assembly map (about 17 % of peak RSS and 1 s of setup at 100k); CHOLMOD when `libsuitesparse` is available.
-- Non-identity `design_mesh.transform` is unsupported in the viewport (the GUI never writes one).
-- Facets chain through fine tessellation and fillets; the angle tolerance is the only control.
-- Out of scope since v1: tet meshes, contact, stress constraints, MMA or multiple constraints, symmetry planes, overhang constraints, STEP import, GPU.
+- ~~Non-identity `design_mesh.transform` is unsupported in the viewport~~ (done in v0.2).
+- ~~Facets chain through fine tessellation and fillets~~ (v0.2: planar region growing + cylinder detection).
+- ~~Out of scope since v1: stress constraints, MMA, symmetry planes, overhang constraints, STEP import~~ (all in v0.2). Still out: tet meshes, contact, GPU.
 
 ---
 
@@ -335,6 +335,11 @@ facets, `trim_to_design` (manifold boolean). This pass exposes them through the 
 
 Deferred or open:
 - `FacetFaces` (response of the facet-faces endpoint) is defined in `routes_meshes.py`, not in `schemas.py`; move it there at the next contract revision.
+- Solver: the CG breakdown on warm-started adjoint solves is fixed (Lanczos bound for the Chebyshev smoother, see `docs/PERF.md`); +5 % per iteration at 100k.
+- Stress constraint: stable on the L-bracket only with `stress_pnorm=16` and `move=0.05`; p=8 or move >= 0.1 oscillates 12-18 % over the limit. The GUI defaults do not change automatically.
+- Facets: surfaces tessellated with section steps > 3x the angle tolerance (e.g. a 16-section sphere) can split into narrow per-meridian "cylinders".
+- Overhang: no support-structure generation; the base plate is the first active layer along the build axis.
+- Memory estimate for `dtype="float32"` is within 30 % in isolation but the measured peak varied up to 2x between runs on the CI box; the guard uses the estimate, so prefer float64 when near the cap.
 - Stress is the relaxed voxel stress `rho^0.5 * sigma_vm(solid)`; sharp corners and the clamped face overshoot. No stress-based remeshing or smoothing.
 - `trim=true` needs a closed, consistently oriented design mesh; otherwise it warns and returns the untrimmed surface. Trimming a ~200k-triangle surface takes under 5 s (`tests/test_export.py`).
 - Several stress limits (per region or per load case) and local (non-aggregated) constraints are not supported.
