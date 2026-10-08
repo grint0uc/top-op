@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import struct
 from typing import Annotated
 
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from topop.core.export import density_to_mesh, render_png, to_npz_bytes, to_stl_bytes, to_vti_bytes
+from topop.core.export import (
+    density_to_mesh,
+    render_png,
+    to_npz_bytes,
+    to_stl_bytes,
+    to_vti_bytes,
+)
 from topop.core.problem import Grid
 from topop.server.build import ProblemInvalid, build_problem
 from topop.server.jobs import CLOSE, RunManager, get_runs, runs_of
@@ -28,6 +35,13 @@ NOT_FOUND = {404: {"model": ErrorResponse}}
 DESIGN_RGB = (0.75, 0.75, 0.78)
 RESULT_RGB = (0.95, 0.55, 0.15)
 PREVIEW_SMOOTH = 3
+WARNINGS_HEADER = "X-Topop-Warnings"
+TRIM_HEADER_DOC = {
+    WARNINGS_HEADER: {
+        "description": "Why `trim=true` left the result untrimmed (joined with '; '); absent if fine",
+        "schema": {"type": "string"},
+    }
+}
 
 StoreDep = Annotated[Store, Depends(get_store)]
 RunsDep = Annotated[RunManager, Depends(get_runs)]
@@ -60,14 +74,22 @@ def _attachment(data: bytes, media_type: str, filename: str) -> Response:
     return Response(data, media_type=media_type, headers=headers)
 
 
-def _binary(media_type: str, description: str) -> dict:
-    return {
-        200: {
-            "description": description,
-            "content": {media_type: {"schema": {"type": "string", "format": "binary"}}},
-        },
-        **NOT_FOUND,
+def _binary(media_type: str, description: str, headers: dict | None = None) -> dict:
+    ok: dict = {
+        "description": description,
+        "content": {media_type: {"schema": {"type": "string", "format": "binary"}}},
     }
+    if headers:
+        ok["headers"] = headers
+    return {200: ok, **NOT_FOUND}
+
+
+def _warning_headers(warnings: list[str]) -> dict[str, str]:
+    """`X-Topop-Warnings` (latin-1 safe, single line) or no header at all."""
+    if not warnings:
+        return {}
+    text = "; ".join(" ".join(w.split()) for w in warnings)
+    return {WARNINGS_HEADER: text.encode("latin-1", "replace").decode("latin-1")}
 
 
 @router.post(
@@ -157,25 +179,30 @@ async def cancel_run(id: str, runs: RunsDep) -> RunInfo:
 @router.get(
     "/runs/{id}/result.stl",
     response_class=Response,
-    responses=_binary("model/stl", "Isosurface of the density field"),
-    summary="Export the result as STL",
+    responses=_binary("model/stl", "Isosurface of the density field", TRIM_HEADER_DOC),
+    summary="Export the result as STL (trim=true: intersected with the design mesh)",
 )
 async def result_stl(
     id: str,
     store: StoreDep,
     threshold: float = Query(0.5, ge=0, le=1),
     smooth: int = Query(3, ge=0, le=50),
+    trim: bool = Query(False),
 ) -> Response:
-    _, (rho, grid, _, _) = await _result(store, id)
+    rec, (rho, grid, _, _) = await _result(store, id)
 
-    def work() -> bytes:
-        return to_stl_bytes(density_to_mesh(rho, grid, threshold, smooth))
+    def work() -> tuple[bytes, list[str]]:
+        mesh = density_to_mesh(rho, grid, threshold, smooth)
+        mesh, warnings = store.trim_result(rec, mesh) if trim else (mesh, [])
+        return to_stl_bytes(mesh), warnings
 
     try:
-        data = await asyncio.to_thread(work)
+        data, warnings = await asyncio.to_thread(work)
     except ValueError as exc:  # threshold 0
         raise HTTPException(422, str(exc)) from exc
-    return _attachment(data, "model/stl", f"{id}.stl")
+    res = _attachment(data, "model/stl", f"{id}.stl")
+    res.headers.update(_warning_headers(warnings))
+    return res
 
 
 @router.get(
@@ -185,8 +212,9 @@ async def result_stl(
     summary="Export the density field as VTI",
 )
 async def result_vti(id: str, store: StoreDep) -> Response:
-    _, (rho, grid, _, passive) = await _result(store, id)
-    data = await asyncio.to_thread(to_vti_bytes, rho, passive, grid)
+    rec, (rho, grid, _, passive) = await _result(store, id)
+    stress = await asyncio.to_thread(store.run_stress, rec)
+    data = await asyncio.to_thread(to_vti_bytes, rho, passive, grid, stress)
     return _attachment(data, "application/xml", f"{id}.vti")
 
 
@@ -197,9 +225,37 @@ async def result_vti(id: str, store: StoreDep) -> Response:
     summary="Export the density field as NPZ",
 )
 async def result_npz(id: str, store: StoreDep) -> Response:
-    _, (rho, grid, active, passive) = await _result(store, id)
-    data = await asyncio.to_thread(to_npz_bytes, rho, grid, active, passive)
+    rec, (rho, grid, active, passive) = await _result(store, id)
+    stress = await asyncio.to_thread(store.run_stress, rec)
+    data = await asyncio.to_thread(to_npz_bytes, rho, grid, active, passive, stress)
     return _attachment(data, "application/octet-stream", f"{id}.npz")
+
+
+@router.get(
+    "/runs/{id}/stress",
+    response_class=Response,
+    responses={
+        **_binary(
+            "application/octet-stream",
+            "[u32 nx][u32 ny][u32 nz][f32 von Mises per element], little-endian, C-order, "
+            "0 on inactive elements",
+        ),
+        409: {"model": ErrorResponse},
+    },
+    summary="Von Mises stress field of the final design",
+)
+async def result_stress(id: str, store: StoreDep) -> Response:
+    rec, (_, _, active, _) = await _result(store, id)
+    stress = await asyncio.to_thread(store.run_stress, rec)
+    if stress is None:
+        raise HTTPException(409, f"run {id} has no stress field")
+
+    def pack() -> bytes:
+        field = np.where(np.asarray(active, dtype=bool), np.nan_to_num(stress), 0.0)
+        head = struct.pack("<3I", *field.shape)
+        return head + np.ascontiguousarray(field, dtype="<f4").tobytes()
+
+    return Response(await asyncio.to_thread(pack), media_type="application/octet-stream")
 
 
 @router.get(
@@ -226,22 +282,27 @@ async def get_run(id: str, store: StoreDep) -> RunInfo:
 @router.get(
     "/runs/{id}/preview.png",
     response_class=Response,
-    responses=_binary("image/png", "Offscreen render of the result"),
+    responses=_binary("image/png", "Offscreen render of the result", TRIM_HEADER_DOC),
     summary="PNG render of the result so an agent can look at it",
 )
 async def run_preview(
-    id: str, store: StoreDep, threshold: float = Query(0.5, ge=0, le=1), view: str = Query("iso")
+    id: str,
+    store: StoreDep,
+    threshold: float = Query(0.5, ge=0, le=1),
+    view: str = Query("iso"),
+    trim: bool = Query(False),
 ) -> Response:
     rec, (rho, grid, _, _) = await _result(store, id)
 
-    def work() -> bytes:
+    def work() -> tuple[bytes, list[str]]:
         design = store.design_world(rec)
         result = density_to_mesh(rho, grid, threshold, PREVIEW_SMOOTH)
+        result, warnings = store.trim_result(rec, result) if trim else (result, [])
         layers = [(design, DESIGN_RGB, 0.15), (result, RESULT_RGB, 1.0)]
-        return render_png([layer for layer in layers if layer[0] is not None], view)
+        return render_png([layer for layer in layers if layer[0] is not None], view), warnings
 
     try:
-        png = await asyncio.to_thread(work)
+        png, warnings = await asyncio.to_thread(work)
     except ValueError as exc:  # unknown view, threshold 0
         raise HTTPException(422, str(exc)) from exc
-    return Response(png, media_type="image/png")
+    return Response(png, media_type="image/png", headers=_warning_headers(warnings))

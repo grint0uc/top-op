@@ -16,7 +16,7 @@ Optional `"env": {"TOPOP_DATA_DIR": "/some/dir"}` keeps projects somewhere else.
 ## The loop: describe, select, run, look
 
 1. `load_mesh(path)` gives a `mesh_id`; `describe_mesh(mesh_id)` prints the bbox and a facet table
-   (id, area, normal, centroid, bbox of every coplanar face group, largest first). `preview_mesh` is the picture.
+   (id, area, kind, normal or axis+radius, centroid, bbox of every face group, largest first). `preview_mesh` is the picture.
 2. `create_project(name, design_mesh_id, elements_along_longest=30..40)`, then `add_support` and `add_load`
    with selections (below). Each call returns how many grid nodes the selection resolved to: 0 means it missed.
 3. `voxel_stats(project_id)`: grid size, `n_active`, memory/time estimate, warnings, node counts per load/support.
@@ -27,7 +27,11 @@ Optional `"env": {"TOPOP_DATA_DIR": "/some/dir"}` keeps projects somewhere else.
 
 CLI equivalent: `topop describe part.stl --png part.png`, write a case file, `topop run case.json --out out/`
 (writes `result.stl`, `result.png`, `result.vti`, `density.npz`, `run.json`; `run.json` re-runs with `topop run`).
-Exit codes: 0 done, 1 failed, 2 invalid case or project (issues printed), 3 out of memory.
+Exit codes: 0 done, 1 failed, 2 invalid case or project (issues printed), 3 out of memory. Overrides for the
+design rules below: `--symmetry y` (or `y=12.5`, repeatable), `--overhang +z` (write `--overhang=-z` for negative
+directions), `--stress-limit 200`, `--optimizer mma`; `--trim` clips `result.stl` to the CAD surface. The per-iteration
+table gains `stress_max` (and `constraint` with a limit); the summary names the final max stress and, with a limit,
+whether the constraint ended satisfied.
 `export_case` / `load_case` convert between a project and a case file (`examples/*.json`: a `ProjectIn` whose
 meshes are `path`s relative to the file; selections may use `"mesh_id": "design"`).
 
@@ -35,7 +39,7 @@ meshes are `path`s relative to the file; selections may use `"mesh_id": "design"
 
 | kind | JSON |
 |---|---|
-| facets | `{"kind":"facets","facet_ids":[0,3]}` ids from `describe_mesh` (add `"angle_deg"` if you changed it) |
+| facets | `{"kind":"facets","facet_ids":[0,3]}` ids from `describe_mesh`: planes and cylinders (add `"angle_deg"` if you changed it); STEP: B-rep faces |
 | normal | `{"kind":"normal","direction":[0,0,1],"angle_deg":10,"within":[[x0,y0,z0],[x1,y1,z1]]}` |
 | plane | `{"kind":"plane","point":[0,0,0],"normal":[1,0,0],"tol":0}` nodes on that plane, no mesh needed |
 | box | `{"kind":"box","min":[..],"max":[..]}` or `{"kind":"box","center":[..],"size":[sx,sy,sz]}` |
@@ -50,6 +54,34 @@ them. Canonical primitive form (what is stored, what the GUI writes): `transform
 
 Reference bodies (`add_ref_model`, any loaded mesh + `transform`): `keep_in` = forced solid (extends the domain),
 `keep_out` = forced void (clearance).
+
+## Holes: cylinder facets
+
+Every facet row has a `kind`: `plane` (unit `normal`), `cylinder` (`axis` and `radius`, normal `[0,0,0]`: holes, bosses, round
+fillets) or `other` (curved, normal 0). A hole is therefore the `cylinder` facet with the radius you want (radius is in mesh
+units, so a Ø12 hole has `radius` 6; in `examples/bracket.stl` that is facet 8, and the four Ø6 holes have radius 3):
+`{"kind":"facets","facet_ids":[8]}` selects its wall, e.g. as a bolt support or a pin load. Use `axis` and `centroid` to tell
+holes of equal radius apart. `facet_faces(mesh_id, facet_id)` returns the triangle ids of a facet
+(what the GUI highlights; the `faces` selection takes them, but `facets` does the same server-side).
+
+## Design rules: symmetry, stress, overhang (`set_params`)
+
+| field | effect |
+|---|---|
+| `optimizer` | `oc` (default: volume constraint only, fastest) or `mma` (any constraints, slower per iteration) |
+| `symmetry` | mirror planes, `[{"axis":"y","position":null}]`; `position` is a world coordinate, `null` = centre of the design's bbox, snapped to the nearest voxel boundary or centre. Design variables are tied across the plane, so the result is exactly mirror-symmetric. Loads, supports and domain should be symmetric too (else `run` warns). `[]` removes |
+| `stress_limit` | von Mises limit in the units of E (MCP: `0` removes). A p-norm aggregated constraint; forces `mma` (`voxel_stats` says so when `optimizer` is `oc`). `stress_pnorm` (2..40, default 8): larger tracks the true max better but is harder to optimize |
+| `overhang` | additive-manufacturing build direction, `+x` .. `-z` (MCP: `"none"` removes): 45 degree Langelaar filter, every voxel must be supported from below. The base plate is the domain's **min** face along the axis for `+`, **max** face for `-`; no support structures are generated |
+
+Reading the outcome: `run` returns `stress_max` (max von Mises of the last evaluated design) and `constraint` (`g`, null without a
+limit: `g <= 0` is satisfied, the optimizer accepts up to 0.01; a larger value needs more iterations or a higher limit).
+`result_stress_summary(run_id)` gives the final design's `max`, `mean_solid` (voxels with density >= 0.5) and the xyz `location`
+of the max; the whole field is the `stress` array in `result.vti` and `density.npz` (and `GET /api/runs/{id}/stress`). These are
+voxel stresses weighted by sqrt(density): sharp inner corners overshoot, so leave margin and compare relatively.
+
+`export_stl(run_id, path, trim=true)` (CLI `--trim`) intersects the iso-surface with the design mesh: the part stays inside the
+CAD surface and keeps its exact flat faces and hole walls where material reaches them. It needs a watertight design mesh; if that
+or the boolean fails, the untrimmed STL is written and the reason is returned (`warnings`; REST: `X-Topop-Warnings`).
 
 ## STEP input (optional extra)
 
@@ -66,7 +98,10 @@ and the primitives work on the tessellation as for any mesh. Without the extra, 
 - **`within` boxes**: grid nodes sit up to h/2 outside the true surface and `within` clips strictly on node coordinates.
   Pad a box derived from the mesh bbox by one voxel `h` per side (`h` is in `voxel_stats`, about longest side / elements)
   and re-check after changing the resolution (h changes). Prefer `facets` or `plane` when a whole face will do.
-- Facet ids are ranks by area for a given `angle_deg`; a changed angle renumbers them (STEP meshes: B-rep faces, never). Curved groups have normal 0.
+- Facet ids are ranks by area for a given `angle_deg`; a changed angle renumbers them (STEP meshes: B-rep faces, never). Cylinders and other curved groups have normal 0: use `kind`, `radius` and `axis`.
+- `overhang`: watch `volume` in the first iterations. If it sits far below `volfrac` and never recovers (the printed density
+  is near 0, the run "converges" with `change` 0), the filter found no supported base plate: known issue, see the open
+  items in docs/PLAN.md (Status v0.2).
 - Always check the node counts before running; "resolves to zero nodes" blocks the run. Supports must stop all rigid motion.
 - Size: keep `n_active` <= about 150k on a 16 GB machine (`est_bytes` and `est_sec_per_iter` in `voxel_stats`, about 30 KB per element).
   Debug at 30-40 elements along the longest side, refine to 60-100 at the end. Above the memory cap `run` fails fast (exit 3).

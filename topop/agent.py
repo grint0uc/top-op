@@ -11,7 +11,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,9 +27,11 @@ from topop.core.selection import node_xyz, resolved_preview
 from topop.server.build import (
     ProblemInvalid,
     build_problem,
+    params_warnings,
     resolve_project_selections,
     resolve_sel,
 )
+from topop.server.jobs import iteration_record
 from topop.server.routes_runs import DESIGN_RGB, PREVIEW_SMOOTH, RESULT_RGB
 from topop.server.schemas import (
     FacetInfo,
@@ -223,6 +225,10 @@ class Session:
             "facets": [FacetInfo(**f).model_dump() for f in shown],
         }
 
+    def facet_faces(self, mesh_id: str, facet_id: int, angle_deg: float = 5.0) -> list[int]:
+        """Triangle ids of one facet of `describe_mesh` (ValueError if the facet does not exist)."""
+        return self.store.facet_faces(mesh_id, [int(facet_id)], float(angle_deg)).tolist()
+
     def preview_mesh(self, mesh_id: str, view: str = "iso") -> bytes:
         return render_png([(self.store.get_mesh(mesh_id), DESIGN_RGB, 1.0)], view)
 
@@ -349,20 +355,27 @@ class Session:
         return self._remove(project_id, "ref_models", ref_id, "reference model")
 
     @staticmethod
-    def _merge(current: Any, spec_cls: type, fields: Mapping[str, Any], what: str) -> Any:
-        unknown = sorted(set(fields) - set(spec_cls.model_fields))
+    def _merge(
+        current: Any,
+        spec_cls: type,
+        fields: Mapping[str, Any],
+        what: str,
+        clear: Sequence[str] = (),
+    ) -> Any:
+        unknown = sorted((set(fields) | set(clear)) - set(spec_cls.model_fields))
         if unknown:
             raise ValueError(
                 f"unknown {what} field(s) {unknown}; valid: {sorted(spec_cls.model_fields)}"
             )
         given = {k: v for k, v in fields.items() if v is not None}
-        return spec_cls.model_validate({**current.model_dump(), **given})
+        return spec_cls.model_validate({**current.model_dump(), **given, **dict.fromkeys(clear)})
 
-    def set_params(self, project_id: str, **fields: Any) -> Project:
-        """Merge the given `ParamsSpec` fields (None = leave unchanged)."""
+    def set_params(self, project_id: str, clear: Sequence[str] = (), **fields: Any) -> Project:
+        """Merge the given `ParamsSpec` fields (None = leave unchanged). `clear` names optional
+        fields (`stress_limit`, `overhang`) to reset to None."""
 
         def fn(body: ProjectIn) -> None:
-            body.params = self._merge(body.params, ParamsSpec, fields, "params")
+            body.params = self._merge(body.params, ParamsSpec, fields, "params", clear)
 
         return self._edit(project_id, fn)[0]
 
@@ -391,7 +404,10 @@ class Session:
         """Grid statistics; warnings include loads/supports that resolve to nothing."""
         project, domain = self._domain(project_id)
         _, _, warnings, errors = resolve_project_selections(project, domain)
-        return VoxelStats(**{**domain.stats, "warnings": [*domain.warnings, *warnings, *errors]})
+        notes = params_warnings(project.params)
+        return VoxelStats(
+            **{**domain.stats, "warnings": [*domain.warnings, *warnings, *errors, *notes]}
+        )
 
     def boundaries(self, project_id: str) -> dict:
         """Per load/support: resolved node count and bbox (what the optimizer will actually use)."""
@@ -464,13 +480,7 @@ class Session:
                 rec.info.status = "running"
 
             def callback(info: IterationInfo, rho: np.ndarray) -> bool:
-                record = IterationRecord(
-                    it=int(info.it),
-                    compliance=float(info.compliance),
-                    volume=float(info.volume),
-                    change=float(info.change),
-                    t_iter=float(info.t_iter),
-                )
+                record = iteration_record(info)
                 with rec.lock:
                     rec.info.history.append(record)
                 if progress is not None:
@@ -500,6 +510,7 @@ class Session:
                 time.perf_counter() - t0,
                 rho=rho,
                 outcome=result.status,
+                stress=result.stress,
             )
         return rec.snapshot()
 
@@ -515,6 +526,7 @@ class Session:
         wall: float = 0.0,
         rho: np.ndarray | None = None,
         outcome: str = "cancelled",
+        stress: np.ndarray | None = None,
     ) -> None:
         with rec.lock:
             rec.info.status = status
@@ -525,7 +537,7 @@ class Session:
             if status == "error":
                 rec.info.error = message or "run failed"
             if rho is not None:
-                rec.rho = rho
+                rec.rho, rec.stress = rho, stress
         self._outcomes[rec.info.id] = _Outcome(outcome, message or "", wall)
         self.store.persist_run(rec)
 
@@ -573,43 +585,107 @@ class Session:
             )
         return mesh
 
-    def result_stl(self, run_id: str, threshold: float = 0.5, smooth: int = 0) -> bytes:
-        _, (rho, grid, _, _) = self._result(run_id)
-        return to_stl_bytes(self._isosurface(rho, grid, threshold, smooth))
+    def export_stl(
+        self, run_id: str, threshold: float = 0.5, smooth: int = 0, trim: bool = False
+    ) -> tuple[bytes, list[str]]:
+        """(binary STL, warnings). `trim` intersects the surface with the design mesh; if that is
+        impossible (open mesh, failed boolean) the untrimmed surface is returned plus a warning."""
+        rec, (rho, grid, _, _) = self._result(run_id)
+        mesh = self._isosurface(rho, grid, threshold, smooth)
+        mesh, warnings = self.store.trim_result(rec, mesh) if trim else (mesh, [])
+        return to_stl_bytes(mesh), warnings
 
-    def result_png(self, run_id: str, threshold: float = 0.5, view: str = "iso") -> bytes:
-        """The result in orange over the ghosted design mesh."""
+    def result_stl(
+        self, run_id: str, threshold: float = 0.5, smooth: int = 0, trim: bool = False
+    ) -> bytes:
+        return self.export_stl(run_id, threshold, smooth, trim)[0]
+
+    def render_result(
+        self, run_id: str, threshold: float = 0.5, view: str = "iso", trim: bool = False
+    ) -> tuple[bytes, list[str]]:
+        """(PNG, warnings): the result in orange over the ghosted design mesh."""
         rec, (rho, grid, _, _) = self._result(run_id)
         design = self.store.design_world(rec)
         result = self._isosurface(rho, grid, threshold, PREVIEW_SMOOTH)
+        result, warnings = self.store.trim_result(rec, result) if trim else (result, [])
         layers = [(design, DESIGN_RGB, 0.15), (result, RESULT_RGB, 1.0)]
-        return render_png([layer for layer in layers if layer[0] is not None], view)
+        png = render_png([layer for layer in layers if layer[0] is not None], view)
+        return png, warnings
+
+    def result_png(
+        self, run_id: str, threshold: float = 0.5, view: str = "iso", trim: bool = False
+    ) -> bytes:
+        return self.render_result(run_id, threshold, view, trim)[0]
 
     def result_vti(self, run_id: str) -> bytes:
-        _, (rho, grid, _, passive) = self._result(run_id)
-        return to_vti_bytes(rho, passive, grid)
+        rec, (rho, grid, _, passive) = self._result(run_id)
+        return to_vti_bytes(rho, passive, grid, self.store.run_stress(rec))
 
     def result_npz(self, run_id: str) -> bytes:
-        _, (rho, grid, active, passive) = self._result(run_id)
-        return to_npz_bytes(rho, grid, active, passive)
+        rec, (rho, grid, active, passive) = self._result(run_id)
+        return to_npz_bytes(rho, grid, active, passive, self.store.run_stress(rec))
+
+    def stress_summary(self, run_id: str) -> dict:
+        """Von Mises of the final design: max, mean over solid cells (rho >= 0.5) and where the max is.
+
+        `location` is the center of the element holding the maximum, in world coordinates.
+        """
+        rec, (rho, grid, active, _) = self._result(run_id)
+        stress = self.store.run_stress(rec)
+        if stress is None:
+            raise ValueError(f"run {run_id} has no stress field (it produced no result)")
+        stress = np.where(active, np.nan_to_num(stress), 0.0)
+        cell = np.unravel_index(int(np.argmax(stress)), stress.shape)
+        solid = active & (rho >= 0.5)
+        out: dict[str, Any] = {
+            "run_id": run_id,
+            "max": float(stress[cell]),
+            "mean_solid": float(stress[solid].mean()) if solid.any() else 0.0,
+            "n_solid": int(solid.sum()),
+            "location": (np.asarray(grid.origin) + grid.h * (np.asarray(cell) + 0.5)).tolist(),
+            "cell": [int(c) for c in cell],
+        }
+        limit = rec.project.params.stress_limit
+        if limit is not None:
+            out["stress_limit"] = float(limit)
+            out["max_over_limit"] = out["max"] / limit
+        return out
 
     def export(self, run_id: str) -> RunExport:
         rec = self.store.get_run(run_id)
         return RunExport(project=rec.project, run=rec.snapshot())
 
     def write_outputs(
-        self, run_id: str, out_dir: str | os.PathLike, threshold: float = 0.5, smooth: int = 0
-    ) -> dict[str, dict[str, str]]:
+        self,
+        run_id: str,
+        out_dir: str | os.PathLike,
+        threshold: float = 0.5,
+        smooth: int = 0,
+        trim: bool = False,
+    ) -> dict[str, Any]:
         """result.stl, result.png (iso), result.vti, density.npz, run.json into `out_dir`.
 
-        Returns {"files": {name: path}, "errors": {name: why}}; a file that cannot be made (e.g. a
-        threshold above every density) is reported, the others are still written.
+        Returns {"files": {name: path}, "errors": {name: why}, "warnings": [..]}; a file that
+        cannot be made (e.g. a threshold above every density) is reported, the others are still
+        written. `trim` intersects the STL (and the preview) with the design mesh; `warnings`
+        says why that was not possible.
         """
         out = Path(out_dir).expanduser()
         out.mkdir(parents=True, exist_ok=True)
+        warnings: list[str] = []
+
+        def with_warnings(make: Callable[[], tuple[bytes, list[str]]]) -> bytes:
+            data, ws = make()
+            warnings.extend(w for w in ws if w not in warnings)
+            return data
+
         makers = {
-            "result.stl": lambda: self.result_stl(run_id, threshold, smooth),
-            "result.png": lambda: self.result_png(run_id, threshold, "iso"),
+            "result.stl": lambda: with_warnings(
+                lambda: self.export_stl(run_id, threshold, smooth, trim)
+            ),
+            "result.png": lambda: with_warnings(
+                lambda: self.render_result(run_id, threshold, "iso", trim)
+            ),
             "result.vti": lambda: self.result_vti(run_id),
             "density.npz": lambda: self.result_npz(run_id),
             "run.json": lambda: pretty_json(self.export(run_id).model_dump(mode="json")).encode(),
@@ -622,7 +698,7 @@ class Session:
                 files[name] = str(out / name)
             except ValueError as exc:
                 errors[name] = str(exc)
-        return {"files": files, "errors": errors}
+        return {"files": files, "errors": errors, "warnings": warnings}
 
     # ---- case files ---------------------------------------------------------------------------
 

@@ -6,7 +6,12 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 
 from topop.core import selection as core_selection
-from topop.server.build import BuiltDomain, resolve_project_selections
+from topop.server.build import (
+    BuiltDomain,
+    params_warnings,
+    resolve_project_selections,
+    resolve_sel,
+)
 from topop.server.schemas import (
     ErrorResponse,
     Project,
@@ -77,7 +82,10 @@ async def voxelize_project(id: str, store: StoreDep) -> VoxelStats:
     domain = await project_domain(store, project)
     # loads/supports that resolve to nothing at this resolution are worth a warning here
     _, _, warnings, errors = await asyncio.to_thread(resolve_project_selections, project, domain)
-    return VoxelStats(**{**domain.stats, "warnings": [*domain.warnings, *warnings, *errors]})
+    notes = params_warnings(project.params)
+    return VoxelStats(
+        **{**domain.stats, "warnings": [*domain.warnings, *warnings, *errors, *notes]}
+    )
 
 
 @router.post(
@@ -91,9 +99,7 @@ async def resolve_selection(id: str, body: Selection, store: StoreDep) -> Resolv
     domain = await project_domain(store, project)
 
     def work() -> ResolvedNodes:
-        nodes = core_selection.resolve_selection(
-            body.model_dump(), domain.grid, domain.active, domain.meshes_world
-        )
+        nodes = resolve_sel(body.model_dump(), domain)
         return ResolvedNodes(**core_selection.resolved_preview(nodes, domain.grid))
 
     try:

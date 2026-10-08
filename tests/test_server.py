@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import struct
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
@@ -395,3 +396,192 @@ def test_mesh_get_info(client, examples_dir):
     r = client.get(f"/api/meshes/{mid}")
     assert r.status_code == 200 and r.json()["n_faces"] == up.json()["n_faces"]
     assert client.get("/api/meshes/0000000000000000").status_code == 404
+
+
+# ---- facet faces, STEP selections, v0.2 params ---------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def step_file(examples_dir: Path) -> Path:
+    pytest.importorskip("OCP", reason="STEP support not installed (uv sync --extra step)")
+    return examples_dir / "bracket.step"
+
+
+def hole_facet(client: TestClient, mesh_id: str, radius: float = 6.0) -> dict:
+    facets = client.get(f"/api/meshes/{mesh_id}/facets").json()["facets"]
+    holes = [f for f in facets if f["kind"] == "cylinder" and f["radius"] == pytest.approx(radius)]
+    assert len(holes) == 1, holes
+    return holes[0]
+
+
+@pytest.mark.parametrize("name", ["bracket.stl", "bracket.step"])
+def test_facet_faces_of_the_bracket_hole(api: TestClient, examples_dir: Path, name: str):
+    if name.endswith(".step"):
+        pytest.importorskip("OCP", reason="STEP support not installed (uv sync --extra step)")
+    info = upload(api, examples_dir / name)
+    hole = hole_facet(api, info["id"])
+    assert hole["axis"] is not None and hole["n_faces"] > 50
+    res = api.get(f"/api/meshes/{info['id']}/facets/{hole['id']}/faces", params={"angle_deg": 5})
+    assert res.status_code == 200, res.text
+    ids = res.json()["face_ids"]
+    assert len(ids) == hole["n_faces"] and len(set(ids)) == len(ids)
+    assert 0 <= min(ids) and max(ids) < info["n_faces"]
+    # the triangles really are the hole wall: centroids sit 6 from the hole axis
+    buf = api.get(f"/api/meshes/{info['id']}/buffer").content
+    n_vert, n_tri = struct.unpack("<2I", buf[:8])
+    xyz = np.frombuffer(buf, "<f4", 3 * n_vert, 8).reshape(-1, 3).astype(float)
+    tri = np.frombuffer(buf, "<u4", 3 * n_tri, 8 + 12 * n_vert).reshape(-1, 3)[ids]
+    axis = np.asarray(hole["axis"])
+    rel = xyz[tri].mean(1) - np.asarray(hole["centroid"])
+    radial = np.linalg.norm(rel - np.outer(rel @ axis, axis), axis=1)
+    assert np.allclose(radial, 6.0, atol=0.05)
+    # a facet that does not exist, and a mesh that does not exist
+    missing = api.get(f"/api/meshes/{info['id']}/facets/9999/faces")
+    assert missing.status_code == 404 and "unknown facet" in missing.json()["detail"]
+    assert api.get(f"/api/meshes/{info['id']}/facets/-1/faces").status_code == 404
+    assert api.get("/api/meshes/0123456789abcdef/facets/0/faces").status_code == 404
+
+
+def test_step_facet_faces_ignore_angle(api: TestClient, step_file: Path):
+    info = upload(api, step_file)
+    hole = hole_facet(api, info["id"])
+    first = api.get(f"/api/meshes/{info['id']}/facets/{hole['id']}/faces").json()
+    wide = api.get(
+        f"/api/meshes/{info['id']}/facets/{hole['id']}/faces", params={"angle_deg": 60}
+    ).json()
+    assert first == wide and len(first["face_ids"]) == hole["n_faces"]
+
+
+def test_resolve_selection_facets_on_step_mesh(api: TestClient, step_file: Path):
+    info = upload(api, step_file)
+    assert info["source"] == "step" and info["n_brep_faces"] == 14
+    hole = hole_facet(api, info["id"])
+    pid = create_project(
+        api,
+        {
+            "name": "step",
+            "design_mesh": {"mesh_id": info["id"]},
+            "grid": {"elements_along_longest": 40},
+        },
+    )["id"]
+    url = f"/api/projects/{pid}/resolve-selection"
+    sel = {"kind": "facets", "mesh_id": info["id"], "facet_ids": [hole["id"]]}
+    res = api.post(url, json=sel)
+    assert res.status_code == 200, res.text
+    nodes = res.json()
+    assert nodes["count"] > 0
+    # the wall of the Ø12 hole: nodes lie within a voxel of the cylinder surface
+    xyz = np.asarray(nodes["xyz"])
+    axis, centre = np.asarray(hole["axis"]), np.asarray(hole["centroid"])
+    rel = xyz - centre
+    radial = np.linalg.norm(rel - np.outer(rel @ axis, axis), axis=1)
+    h = api.post(f"/api/projects/{pid}/voxelize").json()["h"]
+    assert np.abs(radial - 6.0).max() <= h
+    assert api.post(url, json={**sel, "facet_ids": [99]}).status_code == 422
+
+
+def streamed(client: TestClient, project_id: str) -> tuple[str, list]:
+    run = client.post("/api/runs", json={"project_id": project_id})
+    assert run.status_code == 200, run.text
+    rid = run.json()["id"]
+    with client.websocket_connect(f"/api/runs/{rid}/stream") as ws:
+        return rid, collect(ws)
+
+
+def test_symmetry_overhang_run_stress_vti_and_trim(api: TestClient, cantilever: Path, tmp_path):
+    mid = upload(api, cantilever)["id"]
+    body = cantilever_project(
+        mid, max_iter=4, symmetry=[{"axis": "y", "position": None}], overhang="+z"
+    )
+    pid = create_project(api, body)["id"]
+    notes = api.post(f"/api/projects/{pid}/voxelize").json()["warnings"]
+    assert any("overhang +z" in w and "base plate" in w and "min z" in w for w in notes)
+    rid, msgs = streamed(api, pid)
+
+    progress = [m for m in msgs if isinstance(m, dict) and m["type"] == "progress"]
+    assert [m["it"] for m in progress] == [1, 2, 3, 4]
+    assert all(isinstance(m["stress_max"], float) and m["stress_max"] > 0 for m in progress)
+    assert all(m["constraint"] is None for m in progress)  # no stress_limit
+    done = msgs[-1]
+    assert done["type"] == "done"
+    assert isinstance(done["run"]["history"][-1]["stress_max"], float)
+
+    shape = (18, 8, 8)
+    res = api.get(f"/api/runs/{rid}/stress")
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "application/octet-stream"
+    assert struct.unpack("<3I", res.content[:12]) == shape
+    assert len(res.content) == 12 + 4 * 18 * 8 * 8
+    field = np.frombuffer(res.content, "<f4", offset=12).reshape(shape)
+    assert np.isfinite(field).all() and field.max() > 0
+    assert field[0].max() == field[-1].max() == 0  # padding layers are inactive
+    assert field.max() == pytest.approx(progress[-1]["stress_max"], rel=0.5)  # same design, +-1 it
+
+    vti = api.get(f"/api/runs/{rid}/result.vti").content
+    root = ET.fromstring(vti)
+    arrays = {a.attrib["Name"]: a.attrib["type"] for a in root.iter("DataArray")}
+    assert arrays == {"density": "Float32", "passive": "Int8", "stress": "Float32"}
+    with np.load(io.BytesIO(api.get(f"/api/runs/{rid}/result.npz").content)) as z:
+        assert np.array_equal(z["stress"].astype("<f4"), field)
+        rho = z["rho"]
+    assert np.abs(rho - rho[:, ::-1, :]).max() < 1e-9  # mirror symmetric in y
+
+    # trim: the AM filter leaves the density low after 4 iterations, so cut relative to its peak
+    thr = 0.5 * float(rho.max())
+    params = {"threshold": thr, "smooth": 0}
+    raw = api.get(f"/api/runs/{rid}/result.stl", params=params)
+    trimmed = api.get(f"/api/runs/{rid}/result.stl", params={**params, "trim": True})
+    assert raw.status_code == trimmed.status_code == 200
+    assert "x-topop-warnings" not in trimmed.headers
+    raw_mesh = trimesh.load(io.BytesIO(raw.content), file_type="stl")
+    cut = trimesh.load(io.BytesIO(trimmed.content), file_type="stl")
+    design_lo, design_hi = np.array([0.0, 0.0, 0.0]), np.array([60.0, 20.0, 20.0])
+    assert (raw_mesh.bounds[0] < design_lo - 0.5).any()  # the voxel skin pokes out of the CAD
+    assert (cut.bounds[0] >= design_lo - 1e-6).all() and (cut.bounds[1] <= design_hi + 1e-6).all()
+    assert cut.is_watertight and 0 < cut.volume < raw_mesh.volume
+    png = api.get(f"/api/runs/{rid}/preview.png", params={"threshold": thr, "trim": True})
+    assert png.status_code == 200 and png.content.startswith(PNG)
+    assert "x-topop-warnings" not in png.headers
+
+    # nothing above the threshold: the empty surface cannot be trimmed -> 200 plus a header
+    empty = api.get(f"/api/runs/{rid}/result.stl", params={"threshold": 1.0, "trim": True})
+    assert empty.status_code == 200 and len(empty.content) == 84
+    assert "not trimmed" in empty.headers["x-topop-warnings"]
+    shot = api.get(f"/api/runs/{rid}/preview.png", params={"trim": True})
+    assert shot.status_code == 200 and "not trimmed" in shot.headers["x-topop-warnings"]
+
+    with TestClient(app) as again:  # the stress field survives a restart (runs/{id}.npz)
+        assert again.get(f"/api/runs/{rid}/stress").content == res.content
+        assert b'Name="stress"' in again.get(f"/api/runs/{rid}/result.vti").content
+
+
+def test_stress_limit_with_oc_forces_mma(api: TestClient, cantilever: Path):
+    mid = upload(api, cantilever)["id"]
+    body = cantilever_project(mid, max_iter=3, optimizer="oc", stress_limit=5.0, stress_pnorm=6)
+    pid = create_project(api, body)["id"]
+    notes = api.post(f"/api/projects/{pid}/voxelize").json()["warnings"]
+    assert any("mma" in w and "stress_limit" in w for w in notes)
+    rid, msgs = streamed(api, pid)
+    progress = [m for m in msgs if isinstance(m, dict) and m["type"] == "progress"]
+    assert [m["it"] for m in progress] == [1, 2, 3]
+    assert all(isinstance(m["constraint"], float) for m in progress)  # only mma has a constraint
+    assert all(isinstance(m["stress_max"], float) for m in progress)
+    assert msgs[-1]["type"] == "done"
+    info = api.get(f"/api/runs/{rid}").json()
+    assert isinstance(info["history"][-1]["constraint"], float)
+    assert any("mma" in w for w in info["stats"]["warnings"])  # the run's own stats say it too
+
+
+def test_stress_endpoint_409_until_the_run_has_a_result(api: TestClient, cantilever: Path):
+    mid = upload(api, cantilever)["id"]
+    pid = create_project(api, cantilever_project(mid, max_iter=2))["id"]
+    sem = api.app.state.runs.semaphore
+    sem.acquire()
+    try:
+        rid = api.post("/api/runs", json={"project_id": pid}).json()["id"]
+        assert api.get(f"/api/runs/{rid}/stress").status_code == 409  # queued
+        api.post(f"/api/runs/{rid}/cancel")
+    finally:
+        sem.release()
+    assert api.get(f"/api/runs/{rid}/stress").status_code == 409  # cancelled, no result
+    assert api.get("/api/runs/nope/stress").status_code == 404

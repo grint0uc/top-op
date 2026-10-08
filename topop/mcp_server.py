@@ -34,6 +34,7 @@ from topop.server.schemas import (
     RefModel,
     RunInfo,
     SupportSpec,
+    SymmetrySpec,
 )
 
 INSTRUCTIONS = """\
@@ -41,6 +42,10 @@ top-op: 3D topology optimization (voxel SIMP compliance minimisation) of a mesh 
 Loop: load_mesh -> describe_mesh (+ preview_mesh) -> create_project -> add_support / add_load
 (select regions by facet id, face normal, plane or primitive) -> voxel_stats (node counts, warnings,
 size) -> run (try a coarse grid or few iterations first) -> result_preview -> adjust -> export_stl.
+Optional design rules via set_params: symmetry (mirror planes), stress_limit (von Mises, forces the
+mma optimizer; check it with result_stress_summary) and overhang (additive-manufacturing build
+direction). export_stl(trim=true) clips the result to the CAD surface. STEP files load like meshes;
+their facets are the exact B-rep faces, and a hole is the facet of kind "cylinder" with its radius.
 Units: whatever the mesh is in; E, forces and lengths must be consistent (compliance is in those units).
 Size: keep active elements <= ~150k on a 16 GB machine (voxel_stats shows n_active, memory and time
 estimates); 30-40 elements along the longest side to debug a setup, 60-100 for a real result.
@@ -49,7 +54,9 @@ Always check that a load/support resolved to a sensible node count before runnin
 
 SELECTION_HELP = """\
 SELECTION: a JSON object; "kind" picks the shape. Coordinates are in the mesh's own units.
- facets   {"kind":"facets","facet_ids":[0,3]}   coplanar groups from describe_mesh (same angle_deg, default 5)
+ facets   {"kind":"facets","facet_ids":[0,3]}   facet ids from describe_mesh: coplanar groups and cylinders
+          (same angle_deg, default 5); for STEP meshes the ids are exact B-rep faces. A hole = the facet
+          with kind "cylinder" and the radius you want; facet_faces(mesh_id, facet_id) lists its triangles
  normal   {"kind":"normal","direction":[0,0,1],"angle_deg":10,"within":[[xmin,ymin,zmin],[xmax,ymax,zmax]]}
           surface faces pointing within angle_deg of direction ("within" optionally clips to a box)
  plane    {"kind":"plane","point":[0,0,0],"normal":[1,0,0],"tol":0}   surface nodes on the plane x=0
@@ -173,6 +180,10 @@ def summarize_run(session: Session, info: RunInfo) -> dict:
         out["compliance"] = {"first": hist[0].compliance, "last": hist[-1].compliance}
         out["volume"] = hist[-1].volume
         out["change"] = hist[-1].change
+        out["stress_max"] = hist[-1].stress_max  # von Mises of the last evaluated design
+        out["constraint"] = hist[
+            -1
+        ].constraint  # stress constraint g (<= 0 satisfied), null if none
     if info.stats:
         s = info.stats
         out["grid"] = {"shape": [s.nx, s.ny, s.nz], "h": s.h, "n_active": s.n_active}
@@ -180,7 +191,10 @@ def summarize_run(session: Session, info: RunInfo) -> dict:
     if info.error:
         out["error"] = info.error
     if info.status == "done":
-        out["next"] = "result_preview(run_id) to look at it; export_stl(run_id, path) to save it."
+        out["next"] = (
+            "result_preview(run_id) to look at it; result_stress_summary(run_id) for the stress "
+            "field; export_stl(run_id, path) to save it."
+        )
     return _round(out)
 
 
@@ -206,20 +220,48 @@ def create_server(session: Session | None = None) -> MCPServer:
 
     @tool()
     def load_mesh(path: str) -> dict:
-        """Load an STL/OBJ/3MF/PLY file from disk. Returns its mesh_id plus faces, bbox, volume and
-        whether it is watertight (a non-watertight design voxelizes poorly). The id is a content hash,
-        so loading the same file again returns the same id. Units are whatever the file is in."""
+        """Load an STL/OBJ/3MF/PLY file, or a STEP file (.step/.stp, needs the optional STEP extra), from
+        disk. Returns its mesh_id plus faces, bbox, volume and whether it is watertight (a
+        non-watertight design voxelizes poorly); STEP meshes also report source "step" and
+        n_brep_faces. The id is a content hash, so loading the same file again returns the same id.
+        Units are whatever the file is in (STEP: as OpenCascade reports them, usually mm)."""
         return _round(_dump(session.load_mesh(path)))
 
     @tool()
     def describe_mesh(mesh_id: str, angle_deg: float = 5.0, top: int = 30) -> dict:
-        """Mesh info plus the facet table that lets you name faces without seeing them. A facet is
-        a group of coplanar triangles (neighbours within angle_deg of each other); ids are ranks by
-        area, largest first, stable for a given angle_deg. Each row has id, n_faces, area, unit
-        normal (a closed curved group has normal [0,0,0]), centroid and bbox [[min],[max]]. `top` rows
-        are returned (0 = all). Select a facet with {"kind":"facets","facet_ids":[id],"angle_deg":<same>}.
-        Combine with preview_mesh to check what you picked."""
-        return _round(session.describe_mesh(mesh_id, angle_deg, top))
+        """Mesh info plus the facet table that lets you name faces without seeing them. Each row has
+        id, n_faces, area, kind, unit normal, centroid and bbox [[min],[max]]. kind is "plane" (a group
+        of coplanar triangles, neighbours within angle_deg of each other; has a normal), "cylinder"
+        (a hole, boss or round fillet: has `axis` (unit vector) and `radius`; normal [0,0,0]) or
+        "other" (curved, normal [0,0,0]). To select a hole, take the cylinder facet with the right
+        radius and axis. Ids are ranks by area, largest first, stable for a given angle_deg. STEP
+        meshes list their exact B-rep faces instead (angle_deg is ignored, each row also has
+        `brep_face`, the face index in the file, and ids never renumber). `top` rows are returned
+        (0 = all). Select a facet with {"kind":"facets","facet_ids":[id],"angle_deg":<same>}. Combine
+        with preview_mesh to check what you picked."""
+        data = session.describe_mesh(mesh_id, angle_deg, top)
+        optional = ("axis", "radius", "brep_face")
+        data["facets"] = [
+            {k: v for k, v in f.items() if k not in optional or v is not None}
+            for f in data["facets"]
+        ]
+        return _round(data)
+
+    @tool()
+    def facet_faces(mesh_id: str, facet_id: int, angle_deg: float = 5.0) -> dict:
+        """Triangle ids (the mesh's face indices, as drawn by preview_mesh and used by the raw
+        {"kind":"faces"} selection) that make up one facet of describe_mesh. facet_id is the `id`
+        column; use the same angle_deg as for describe_mesh (STEP meshes ignore it: the facet is the
+        B-rep face). Returns n_faces and face_ids. You rarely need this: selecting
+        {"kind":"facets","facet_ids":[facet_id]} does the same server-side. Unknown ids raise."""
+        faces = session.facet_faces(mesh_id, facet_id, angle_deg)
+        return {
+            "mesh_id": mesh_id,
+            "facet_id": facet_id,
+            "angle_deg": angle_deg,
+            "n_faces": len(faces),
+            "face_ids": faces,
+        }
 
     @tool()
     def preview_mesh(mesh_id: str, view: str = "iso") -> Image:
@@ -305,15 +347,51 @@ def create_server(session: Session | None = None) -> MCPServer:
         continuation: bool | None = None,
         solver: Literal["auto", "amg", "direct"] | None = None,
         dtype: Literal["float64", "float32"] | None = None,
+        optimizer: Literal["oc", "mma"] | None = None,
+        symmetry: list[SymmetrySpec] | None = None,
+        stress_limit: float | None = None,
+        stress_pnorm: float | None = None,
+        overhang: Literal["+x", "-x", "+y", "-y", "+z", "-z", "none"] | None = None,
     ) -> dict:
         """Change optimizer parameters; omitted ones keep their value. volfrac (0..1) target volume
         fraction of free elements; penal (1..6) SIMP penalty; rmin >= 1 filter radius in voxels;
         max_iter (1..2000); tol = stop when the largest density change per iteration is below it
         (0.01); move = OC move limit (0.2); heaviside = projection for crisper edges; continuation
         = ramp penal 1 -> penal over 20 iterations (helps avoid local minima); solver auto|amg|
-        direct; dtype float32 halves memory. Returns the new params."""
+        direct; dtype float32 halves memory.
+        optimizer: "oc" (default, volume constraint only, fastest) or "mma" (handles the stress
+        constraint; slower per iteration).
+        symmetry: mirror planes, e.g. [{"axis":"y","position":null}]; position is a world coordinate
+        (null = centre of the design's bbox, snapped to the nearest voxel boundary or centre). The
+        design variables are tied across each plane, so the result is exactly mirror-symmetric. Use it
+        only when loads, supports and domain are symmetric too (otherwise the design is a compromise
+        and run warns); pass [] to remove all planes.
+        stress_limit: von Mises limit in the units of E (pass 0 to remove it). Sets a p-norm
+        aggregated stress constraint on the design and forces optimizer mma; the design gets heavier
+        and stiffer where stress concentrates. Check it afterwards: run reports `stress_max` and
+        `constraint` (g <= 0 means satisfied, within 0.01) and result_stress_summary gives the field's
+        max and where it is. Stresses are voxel stresses: sharp corners overshoot, so give some margin.
+        stress_pnorm (2..40, default 8): aggregation exponent; larger tracks the true max more
+        closely but optimizes less smoothly.
+        overhang: additive-manufacturing build direction ("+z" = printed upward): a 45-degree
+        overhang filter keeps every material voxel supported from below. The base plate is the
+        domain's min face along that axis for "+x/+y/+z" and its max face for "-x/-y/-z" (the part
+        must be able to grow from there; no support structures are generated, so keep the supports
+        or loads sensible); pass "none" to remove it. voxel_stats and run echo these as warnings.
+        Returns the new params."""
+        clear = [
+            name
+            for name, off in (("stress_limit", stress_limit == 0), ("overhang", overhang == "none"))
+            if off
+        ]
         p = session.set_params(
             project_id,
+            clear=clear,
+            stress_limit=None if stress_limit == 0 else stress_limit,
+            stress_pnorm=stress_pnorm,
+            overhang=None if overhang == "none" else overhang,
+            optimizer=optimizer,
+            symmetry=None if symmetry is None else [s.model_dump() for s in symmetry],
             volfrac=volfrac,
             penal=penal,
             rmin=rmin,
@@ -444,7 +522,8 @@ def create_server(session: Session | None = None) -> MCPServer:
         """Voxelize the project (cached) and report: grid shape nx,ny,nz and voxel size h, n_active
         elements (free / passive solid / passive void), nodes, dofs, estimated memory (bytes) and
         seconds per iteration, plus warnings (non-watertight mesh, disconnected parts, too many
-        elements, loads/supports that resolve to nothing). `boundaries` lists, per load and support,
+        elements, loads/supports that resolve to nothing, and notes on parameters such as the
+        mma optimizer being forced by a stress_limit or where the overhang base plate is). `boundaries` lists, per load and support,
         the number of grid nodes it resolved to and their bbox: check these before running."""
         stats = session.voxel_stats(project_id)
         return _round({**_dump(stats), "boundaries": session.boundaries(project_id)})
@@ -463,8 +542,12 @@ def create_server(session: Session | None = None) -> MCPServer:
         sent per iteration). max_iter overrides params.max_iter for this run only (e.g. 4 for a quick
         smoke test). Returns status (done | cancelled | error), outcome (converged | max_iter),
         compliance first/last (should fall and flatten), volume (should sit at volfrac), change (largest
-        density change of the last iteration; converged when below tol), wall seconds, and the history
-        every 10th iteration plus the last. Raises with the issue list if the project is not
+        density change of the last iteration; converged when below tol), stress_max (max von Mises of
+        the last evaluated design, units of E) and constraint (the stress constraint value when a
+        stress_limit is set: <= 0 satisfied, null otherwise; a run that ends with constraint > 0.01
+        needs more iterations or a higher limit), wall seconds, and the history every 10th iteration
+        plus the last (with stress_max and constraint per iteration). With symmetry/overhang/
+        stress_limit set the run is slower and may need 100+ iterations to settle. Raises with the issue list if the project is not
         runnable (no loads/supports, a selection that resolves to 0 nodes, ...)."""
         cancel = threading.Event()
         total = max_iter or session.get_project(project_id).params.max_iter
@@ -473,6 +556,8 @@ def create_server(session: Session | None = None) -> MCPServer:
             if ctx is None:
                 return
             msg = f"it {r.it}: compliance {r.compliance:.4g}, volume {r.volume:.3f}"
+            if r.stress_max is not None:
+                msg += f", stress_max {r.stress_max:.4g}"
             # best effort: never fail a run because a notification could not be sent
             with contextlib.suppress(Exception):
                 anyio.from_thread.run(ctx.report_progress, r.it, total, msg)
@@ -500,36 +585,63 @@ def create_server(session: Session | None = None) -> MCPServer:
     # ---- results --------------------------------------------------------------------------------
 
     @tool()
-    def result_preview(run_id: str, threshold: float = 0.5, view: str = "iso") -> list[Image | str]:
+    def result_preview(
+        run_id: str, threshold: float = 0.5, view: str = "iso", trim: bool = False
+    ) -> list[Image | str]:
         """PNG render of a finished run: the optimized material in ORANGE over the original design
         ghosted in light grey. threshold (0..1) is the density cut (0.5 default; raise it to see
         only the dense core). view: iso, +x, -x, +y, -y, +z, -z. Look from several views to judge
-        the load paths."""
-        png = session.result_png(run_id, threshold, view)
+        the load paths. trim=true shows the result clipped to the design surface, as
+        export_stl(trim=true) would write it."""
+        png, warnings = session.render_result(run_id, threshold, view, trim)
         caption = (
             f"run {run_id}, view {view}, density threshold {threshold}: orange = optimized material, "
             "grey = original design"
         )
-        return [Image(data=png, format="png"), caption]
+        notes = [f"warning: {w}" for w in warnings]
+        return [Image(data=png, format="png"), "\n".join([caption, *notes])]
 
     @tool()
-    def export_stl(run_id: str, path: str, threshold: float = 0.5, smooth: int = 0) -> dict:
+    def export_stl(
+        run_id: str, path: str, threshold: float = 0.5, smooth: int = 0, trim: bool = False
+    ) -> dict:
         """Write the result as a binary STL (marching-cubes iso-surface of the density at
         threshold; smooth = Laplacian smoothing iterations, 0-10, more shrinks thin members).
-        Parent directories are created. Returns path, byte size and triangle count."""
-        data = session.result_stl(run_id, threshold, smooth)
+        trim=true intersects the surface with the design mesh (a boolean in the design's world
+        space): the part never pokes outside the CAD surface and keeps its exact faces (flat
+        mounting faces, hole walls) wherever material reaches them, instead of the stair-stepped
+        voxel skin. It needs a watertight design mesh; if that or the boolean fails, the untrimmed
+        STL is written and the reason is returned under "warnings". Parent directories are created.
+        Returns path, byte size and triangle count."""
+        data, warnings = session.export_stl(run_id, threshold, smooth, trim)
         out = Path(path).expanduser().resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(data)
-        return {"path": str(out), "bytes": len(data), "triangles": (len(data) - 84) // 50}
+        result = {"path": str(out), "bytes": len(data), "triangles": (len(data) - 84) // 50}
+        return {**result, "warnings": warnings} if warnings else result
 
     @tool()
-    def export_files(run_id: str, directory: str, threshold: float = 0.5, smooth: int = 0) -> dict:
+    def export_files(
+        run_id: str, directory: str, threshold: float = 0.5, smooth: int = 0, trim: bool = False
+    ) -> dict:
         """Write everything into a directory: result.stl, result.png (iso), result.vti (ParaView
-        density + passive mask), density.npz (numpy arrays) and run.json (project + run record;
-        `topop run run.json` re-runs it headlessly). Returns the written paths and, under
-        "errors", any file that could not be made."""
-        return session.write_outputs(run_id, directory, threshold, smooth)
+        density + passive mask + von Mises "stress" cell data), density.npz (numpy arrays, with a
+        "stress" key) and run.json (project + run record; `topop run run.json` re-runs it
+        headlessly). trim=true clips result.stl (and the png) to the design surface, see
+        export_stl. Returns the written paths and, under "errors", any file that could not be made
+        and, under "warnings", why a trim was skipped."""
+        return session.write_outputs(run_id, directory, threshold, smooth, trim)
+
+    @tool()
+    def result_stress_summary(run_id: str) -> dict:
+        """Von Mises stress of a finished run's final design (units of E): `max`, `mean_solid` (mean
+        over solid voxels, density >= 0.5), `location` = [x, y, z] of the element centre holding the
+        max (world coordinates, mesh units) with its grid `cell`, and, when the project has a
+        stress_limit, `stress_limit` and `max_over_limit`. The field is the density-weighted voxel
+        stress, so grey voxels count less and sharp inner corners overshoot; use it to see whether
+        a stress_limit held and where the hot spot is, then look at that place with result_preview.
+        The full field is in result.vti ("stress") and density.npz."""
+        return session.stress_summary(run_id)
 
     @tool()
     def export_case(project_id: str, path: str) -> dict:

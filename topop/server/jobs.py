@@ -39,6 +39,18 @@ def density_frame(it: int, rho: np.ndarray, active: np.ndarray | None = None) ->
     return struct.pack("<4I", int(it), nx, ny, nz) + np.ascontiguousarray(q).tobytes()
 
 
+def iteration_record(info: IterationInfo) -> IterationRecord:
+    return IterationRecord(
+        it=int(info.it),
+        compliance=float(info.compliance),
+        volume=float(info.volume),
+        change=float(info.change),
+        t_iter=float(info.t_iter),
+        stress_max=None if info.stress_max is None else float(info.stress_max),
+        constraint=None if info.constraint is None else float(info.constraint),
+    )
+
+
 def _status_msg(kind: str, info: RunInfo, message: str | None = None) -> dict:
     return StatusMsg(type=kind, message=message, run=info).model_dump(mode="json")
 
@@ -102,13 +114,7 @@ class RunManager:
         active = built.active
 
         def callback(info: IterationInfo, rho: np.ndarray) -> bool:
-            record = IterationRecord(
-                it=int(info.it),
-                compliance=float(info.compliance),
-                volume=float(info.volume),
-                change=float(info.change),
-                t_iter=float(info.t_iter),
-            )
+            record = iteration_record(info)
             progress = ProgressMsg(**record.model_dump()).model_dump(mode="json")
             frame = density_frame(info.it, rho, active) if info.it % every == 0 else None
             with rec.lock:
@@ -122,7 +128,14 @@ class RunManager:
         result = optimize(built.problem, run_params(params), callback, cancel=rec.cancel.is_set)
         status = RESULT_STATUS.get(result.status, "error")
         rho = result.rho if result.history else None
-        self._finish(rec, status, result.message or None, rho=rho, outcome=result.status)
+        self._finish(
+            rec,
+            status,
+            result.message or None,
+            rho=rho,
+            outcome=result.status,
+            stress=result.stress,
+        )
 
     def _finish(
         self,
@@ -131,6 +144,7 @@ class RunManager:
         message: str | None,
         rho: np.ndarray | None = None,
         outcome: str | None = None,
+        stress: np.ndarray | None = None,
     ) -> None:
         final_frame = None
         with rec.lock:
@@ -144,7 +158,7 @@ class RunManager:
             if status == "error":
                 rec.info.error = message or "run failed"
             if rho is not None:
-                rec.rho = rho
+                rec.rho, rec.stress = rho, stress
                 last_it = rec.info.history[-1].it if rec.info.history else 0
                 if rec.latest_frame_it != last_it:
                     active = rec.built.active if rec.built is not None else None

@@ -6,6 +6,7 @@ import base64
 import io
 import warnings
 from collections.abc import Sequence
+from typing import Literal, overload
 
 import numpy as np
 import trimesh
@@ -98,13 +99,27 @@ def _vtk_b64(arr: np.ndarray) -> str:
     return base64.b64encode(np.uint64(len(raw)).tobytes() + raw).decode("ascii")
 
 
-def to_vti_bytes(rho: np.ndarray, passive: np.ndarray, grid: Grid) -> bytes:
-    """VTK XML ImageData with CellData 'density' (Float32) and 'passive' (Int8)."""
+def to_vti_bytes(
+    rho: np.ndarray, passive: np.ndarray, grid: Grid, stress: np.ndarray | None = None
+) -> bytes:
+    """VTK XML ImageData with CellData 'density' (Float32), 'passive' (Int8) and, when given,
+    'stress' (Float32, von Mises at the element centers)."""
     if np.shape(rho) != grid.shape or np.shape(passive) != grid.shape:
         raise ValueError("rho/passive shape does not match grid")
+    if stress is not None and np.shape(stress) != grid.shape:
+        raise ValueError("stress shape does not match grid")
     # VTK cell order is x-fastest, i.e. Fortran order of our [ix, iy, iz] arrays
     dens = np.asarray(rho, dtype="<f4").ravel(order="F")
     pas = np.asarray(passive, dtype=np.int8).ravel(order="F")
+    stress_xml = ""
+    if stress is not None:
+        sig = np.nan_to_num(np.asarray(stress, dtype="<f4")).ravel(order="F")
+        stress_xml = (
+            '        <DataArray type="Float32" Name="stress" NumberOfComponents="1" '
+            f'format="binary" RangeMin="{float(sig.min(initial=0))!r}" '
+            f'RangeMax="{float(sig.max(initial=0))!r}">\n'
+            f"          {_vtk_b64(sig)}\n        </DataArray>\n"
+        )
     nx, ny, nz = grid.shape
     ox, oy, oz = (repr(float(v)) for v in grid.origin)
     h = repr(float(grid.h))
@@ -123,6 +138,7 @@ def to_vti_bytes(rho: np.ndarray, passive: np.ndarray, grid: Grid) -> bytes:
         f"          {_vtk_b64(dens)}\n        </DataArray>\n"
         '        <DataArray type="Int8" Name="passive" NumberOfComponents="1" format="binary">\n'
         f"          {_vtk_b64(pas)}\n        </DataArray>\n"
+        f"{stress_xml}"
         "      </CellData>\n    </Piece>\n  </ImageData>\n</VTKFile>\n"
     )
     return xml.encode("ascii")
@@ -131,7 +147,15 @@ def to_vti_bytes(rho: np.ndarray, passive: np.ndarray, grid: Grid) -> bytes:
 # ---- NPZ -----------------------------------------------------------------------------------------
 
 
-def to_npz_bytes(rho: np.ndarray, grid: Grid, active: np.ndarray, passive: np.ndarray) -> bytes:
+def to_npz_bytes(
+    rho: np.ndarray,
+    grid: Grid,
+    active: np.ndarray,
+    passive: np.ndarray,
+    stress: np.ndarray | None = None,
+) -> bytes:
+    """Density archive; `stress` (von Mises per element) is stored under the key 'stress'."""
+    extra = {} if stress is None else {"stress": np.asarray(stress, dtype=np.float64)}
     buf = io.BytesIO()
     np.savez_compressed(
         buf,
@@ -141,19 +165,32 @@ def to_npz_bytes(rho: np.ndarray, grid: Grid, active: np.ndarray, passive: np.nd
         origin=np.asarray(grid.origin, dtype=np.float64),
         h=np.float64(grid.h),
         shape=np.asarray(grid.shape, dtype=np.int64),
+        **extra,
     )
     return buf.getvalue()
 
 
-def from_npz_bytes(data: bytes) -> tuple[np.ndarray, Grid, np.ndarray, np.ndarray]:
-    """Inverse of `to_npz_bytes`: (rho, grid, active, passive)."""
+@overload
+def from_npz_bytes(
+    data: bytes, with_stress: Literal[False] = False
+) -> tuple[np.ndarray, Grid, np.ndarray, np.ndarray]: ...
+@overload
+def from_npz_bytes(
+    data: bytes, with_stress: Literal[True]
+) -> tuple[np.ndarray, Grid, np.ndarray, np.ndarray, np.ndarray | None]: ...
+def from_npz_bytes(data: bytes, with_stress: bool = False) -> tuple:
+    """Inverse of `to_npz_bytes`: (rho, grid, active, passive), plus the stress array (None when
+    the archive has none) as a fifth item with `with_stress=True`."""
     with np.load(io.BytesIO(data), allow_pickle=False) as z:
         grid = Grid(
             origin=tuple(float(v) for v in z["origin"]),
             h=float(z["h"]),
             shape=tuple(int(v) for v in z["shape"]),
         )
-        return z["rho"], grid, z["active"], z["passive"]
+        out = (z["rho"], grid, z["active"], z["passive"])
+        if not with_stress:
+            return out
+        return (*out, z["stress"] if "stress" in z.files else None)
 
 
 # ---- headless renderer ---------------------------------------------------------------------------

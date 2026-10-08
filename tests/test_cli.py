@@ -297,3 +297,148 @@ def test_pretty_json_collapses_flat_arrays_only():
     assert json.loads(text) == obj
     assert '"a": [1, 2, 3]' in text and '"y": [[0, 1], [2, 3]]' in text
     assert '{"k": 1}' in text and "\n" in text
+
+
+# ---- v0.2: facet kinds, stress, symmetry, overhang, trim --------------------------------------
+
+
+def facet_rows(out: str) -> list[str]:
+    lines = out.splitlines()
+    header = next(i for i, ln in enumerate(lines) if ln.split()[:3] == ["id", "faces", "area"])
+    return [ln for ln in lines[header + 1 :] if re.match(r"\s*\d+\s", ln)]
+
+
+def test_describe_step_lists_cylinders_with_radius_and_brep_faces(examples_dir, capsys):
+    pytest.importorskip("OCP", reason="STEP support not installed (uv sync --extra step)")
+    assert cli("describe", examples_dir / "bracket.step", "--top", 0) == 0
+    out = capsys.readouterr().out
+    assert "B-rep faces" in out and "coplanar groups" not in out
+    header = next(ln for ln in out.splitlines() if ln.split()[:3] == ["id", "faces", "area"])
+    assert header.split() == [
+        "id", "faces", "area", "normal", "kind", "radius", "axis", "brep", "centroid", "bbox",
+        "min", "..", "max",
+    ]  # fmt: skip
+    rows = facet_rows(out)
+    assert len(rows) == 14
+    cyl = [
+        re.search(r"cylinder\s+(\S+)\s+\(([^)]*)\)\s+(\d+)\s", r) for r in rows if " cylinder " in r
+    ]
+    assert len(cyl) == 6 and all(cyl)
+    assert sorted(float(m.group(1)) for m in cyl) == [3.0] * 5 + [6.0]
+    big = next(m for m in cyl if m.group(1) == "6")
+    axis = [float(v) for v in big.group(2).split(",")]
+    assert axis == [1.0, 0.0, 0.0]  # the Ø12 hole runs along x
+    assert len({m.group(3) for m in cyl}) == 6  # every row names its own B-rep face
+    planes = [r for r in rows if " plane " in r]
+    assert len(planes) == 8
+    for row in planes:
+        before, after = row.split(" plane ", 1)
+        assert re.search(r"\(([+-]\d\.\d{3}(, )?){3}\)\s*$", before)  # the normal is shown
+        assert re.match(r"\s*\d+\s+\(", after)  # B-rep index, then the centroid: no radius/axis
+
+
+def test_describe_mesh_shows_kind_and_radius_for_holes(examples_dir, capsys):
+    assert cli("describe", examples_dir / "bracket.stl", "--top", 0) == 0
+    out = capsys.readouterr().out
+    assert "coplanar groups" in out and "B-rep" not in out
+    cyl = [r for r in facet_rows(out) if " cylinder " in r]
+    radii = sorted(float(re.search(r"cylinder\s+(\S+)", r).group(1)) for r in cyl)
+    assert radii[-1] == pytest.approx(6.0, abs=1e-3) and radii[0] == pytest.approx(3.0, abs=1e-3)
+    assert all(not re.search(r"^\s*\d+\s+\d+\s+[\d.]+\s+\(", r) for r in cyl)  # no plane normal
+
+
+def test_run_symmetry_overhang_trim_writes_everything(examples_dir, capsys, tmp_path):
+    out = tmp_path / "out"
+    args = ["run", examples_dir / "cantilever.json", "--out", out, "--resolution", 16]
+    # a low density cut: the overhang filter leaves the density low in the first iterations
+    flags = ["--max-iter", 3, "--symmetry", "y", "--overhang", "+z", "--trim", "--threshold", 0.005]
+    assert cli(*args, *flags) == 0
+    text = capsys.readouterr().out
+    assert re.search(r"^\s+it\s+compliance .* t_iter\s+stress_max$", text, re.MULTILINE)
+    its = [ln for ln in text.splitlines() if re.match(r"\s*\d+\s+[\d.e+-]+\s+0\.\d+\s", ln)]
+    assert len(its) == 3
+    assert all(re.search(r"\d\.\d{4}e[+-]\d\d$", ln) for ln in its)  # stress_max closes the line
+    assert "features    symmetry y; overhang +z" in text
+    assert "base plate is the domain's min z face" in text  # voxelize warning
+    assert re.search(r"^stress\s+max [\d.e+-]+ von Mises at \(", text, re.MULTILINE)
+    assert "trim        result.stl intersected with the design mesh" in text
+    assert "constraint" not in text.split("status")[1]  # no stress limit -> no verdict
+    for name in ("result.stl", "result.png", "result.vti", "density.npz", "run.json"):
+        assert (out / name).stat().st_size > 0, name
+    stl = trimesh.load(out / "result.stl", force="mesh")
+    assert (stl.bounds[0] >= -1e-6).all() and (
+        stl.bounds[1] <= [60 + 1e-6, 20 + 1e-6, 20 + 1e-6]
+    ).all()
+    assert b'Name="stress"' in (out / "result.vti").read_bytes()
+    with np.load(out / "density.npz") as z:
+        assert z["stress"].shape == z["rho"].shape
+        assert np.abs(z["rho"] - z["rho"][:, ::-1, :]).max() < 1e-9
+    export = RunExport.model_validate_json((out / "run.json").read_text())
+    assert export.project.params.overhang == "+z"
+    assert [(s.axis, s.position) for s in export.project.params.symmetry] == [("y", None)]
+    assert all(r.stress_max is not None and r.constraint is None for r in export.run.history)
+
+
+def test_run_reports_why_a_trim_was_skipped(examples_dir, capsys, tmp_path, monkeypatch):
+    def refuse(result, design):
+        return result, ["not trimmed to the design: the design mesh is not watertight"]
+
+    monkeypatch.setattr("topop.server.store.trim_to_design", refuse)
+    out = tmp_path / "out"
+    args = ["run", examples_dir / "cantilever.json", "--out", out, "--resolution", 12, "--trim"]
+    assert cli(*args, "--max-iter", 2, "--threshold", 0.2, "--quiet") == 0
+    captured = capsys.readouterr()
+    assert "warning: not trimmed to the design" in captured.err
+    assert "intersected" not in captured.out
+    assert (out / "result.stl").stat().st_size > 84  # the untrimmed STL is still written
+
+
+def test_run_stress_limit_forces_mma_and_reports_the_verdict(examples_dir, capsys, tmp_path):
+    out = tmp_path / "out"
+    args = ["run", examples_dir / "cantilever.json", "--out", out, "--resolution", 16]
+    assert cli(*args, "--max-iter", 3, "--optimizer", "oc", "--stress-limit", 5) == 0
+    text = capsys.readouterr().out
+    assert "forced to mma" in text and "optimizer mma" in text
+    head = next(ln for ln in text.splitlines() if ln.split()[:2] == ["it", "compliance"])
+    assert head.split()[-2:] == ["stress_max", "constraint"]
+    its = [ln for ln in text.splitlines() if re.match(r"\s*\d+\s+[\d.e+-]+\s+0\.\d+\s", ln)]
+    assert len(its) == 3 and all(re.search(r"[+-]\d+\.\d{4}$", ln) for ln in its)
+    verdict = re.search(
+        r"^constraint\s+stress <= 5: (NOT satisfied|satisfied) \(g = ", text, re.MULTILINE
+    )
+    assert verdict, text
+    export = RunExport.model_validate_json((out / "run.json").read_text())
+    assert export.project.params.stress_limit == 5 and export.project.params.optimizer == "oc"
+    assert isinstance(export.run.history[-1].constraint, float)
+
+
+@pytest.mark.parametrize(
+    "flags, needle",
+    [
+        (["--symmetry", "q"], "expected x, y or z"),
+        (["--symmetry", "y=left"], "not a number"),
+        (["--overhang", "up"], "invalid choice"),
+        (["--optimizer", "sqp"], "invalid choice"),
+    ],
+)
+def test_run_rejects_bad_v02_flags(examples_dir, capsys, flags, needle):
+    assert cli("run", examples_dir / "cantilever.json", *flags) == 2  # argparse usage error
+    assert needle in capsys.readouterr().err
+
+
+def test_run_rejects_a_negative_stress_limit(examples_dir, capsys, tmp_path):
+    args = ["run", examples_dir / "cantilever.json", "--out", tmp_path / "o", "--stress-limit=-1"]
+    assert cli(*args) == 2
+    assert "stress_limit" in capsys.readouterr().err
+    assert not (tmp_path / "o").exists()
+
+
+def test_symmetry_flag_takes_a_position_and_repeats(examples_dir, tmp_path):
+    out = tmp_path / "out"
+    args = ["run", examples_dir / "cantilever.json", "--out", out, "--resolution", 12, "--quiet"]
+    assert cli(*args, "--max-iter", 2, "--symmetry", "y", "--symmetry", "z=10.5") == 0
+    export = RunExport.model_validate_json((out / "run.json").read_text())
+    assert [(s.axis, s.position) for s in export.project.params.symmetry] == [
+        ("y", None),
+        ("z", 10.5),
+    ]

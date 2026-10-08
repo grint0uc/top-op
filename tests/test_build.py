@@ -7,7 +7,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from topop.core.problem import SymmetryPlane
 from topop.core.selection import node_xyz
+from topop.core.step import META_FACETS, load_step
 from topop.core.voxelize import load_mesh
 from topop.server.build import (
     DESIGN,
@@ -16,8 +18,11 @@ from topop.server.build import (
     build_problem,
     domain_key,
     load_project_meshes,
+    params_warnings,
+    resolve_sel,
     run_params,
     size_warnings,
+    step_facets_to_faces,
 )
 from topop.server.schemas import (
     IDENTITY,
@@ -31,6 +36,7 @@ from topop.server.schemas import (
     ProjectIn,
     RefModel,
     SupportSpec,
+    SymmetrySpec,
     VoxelStats,
 )
 
@@ -172,3 +178,70 @@ def test_params_and_size_warnings():
     assert size_warnings(1000) == []
     assert "slow" in size_warnings(200_000)[0]
     assert "out of memory" in size_warnings(400_000)[0]
+
+
+def test_run_params_v02_fields():
+    spec = ParamsSpec(
+        optimizer="mma",
+        symmetry=[SymmetrySpec(axis="y"), SymmetrySpec(axis="z", position=12.5)],
+        stress_limit=2.5,
+        stress_pnorm=10,
+        overhang="-z",
+    )
+    rp = run_params(spec)
+    assert rp.optimizer == "mma" and rp.stress_limit == 2.5 and rp.stress_pnorm == 10
+    assert rp.overhang == "-z"
+    assert rp.symmetry == (SymmetryPlane("y"), SymmetryPlane("z", 12.5))
+    assert isinstance(rp.symmetry, tuple) and rp.symmetry[0].position is None
+    plain = run_params(ParamsSpec())
+    assert plain.symmetry == () and plain.stress_limit is None and plain.overhang is None
+    assert plain.optimizer == "oc"
+
+
+def test_params_warnings():
+    assert params_warnings(ParamsSpec()) == []
+    assert params_warnings(ParamsSpec(optimizer="mma", stress_limit=1.0)) == []
+    (forced,) = params_warnings(ParamsSpec(stress_limit=1.0))  # optimizer defaults to oc
+    assert "stress_limit" in forced and "mma" in forced
+    (up,) = params_warnings(ParamsSpec(overhang="+y"))
+    assert "base plate" in up and "min y" in up
+    (down,) = params_warnings(ParamsSpec(overhang="-x"))
+    assert "base plate" in down and "max x" in down
+
+
+def test_build_problem_reports_param_notes_and_carries_the_params(bracket: str):
+    project = bracket_project(
+        bracket,
+        params=ParamsSpec(
+            stress_limit=3.0, symmetry=[SymmetrySpec(axis="y", position=30)], overhang="+z"
+        ),
+    )
+    built = build_problem(project, load_project_meshes(project, resolver))
+    assert any("mma" in w for w in built.warnings) and any(
+        "base plate" in w for w in built.warnings
+    )
+    assert built.stats["warnings"] == built.warnings
+    VoxelStats(**built.stats)
+    assert built.params.symmetry == (SymmetryPlane("y", 30.0),)
+    assert built.params.stress_limit == 3.0 and built.params.overhang == "+z"
+    # the cached domain itself knows nothing about params
+    assert not any(
+        "base plate" in w
+        for w in build_domain_from_project(project, load_project_meshes(project, resolver)).warnings
+    )
+    assert domain_key(project) == domain_key(bracket_project(bracket))
+
+
+def test_resolve_sel_turns_step_facets_into_brep_faces(examples_dir: Path):
+    pytest.importorskip("OCP", reason="STEP support not installed (uv sync --extra step)")
+    mesh = load_step(examples_dir / "bracket.step").mesh
+    key = str(examples_dir / "bracket.step")
+    project = ProjectIn(design_mesh=MeshRef(path=key), grid=GridSpec(elements_along_longest=40))
+    domain = build_domain_from_project(project, load_project_meshes(project, lambda _: mesh))
+    facets = mesh.metadata[META_FACETS]
+    hole = next(i for i, f in enumerate(facets) if abs((f.get("radius") or 0) - 6) < 1e-6)
+    sel = {"kind": "facets", "mesh_id": key, "facet_ids": [hole]}
+    assert step_facets_to_faces(sel, {key: mesh})["kind"] == "faces"
+    assert step_facets_to_faces({"kind": "plane"}, {key: mesh}) == {"kind": "plane"}
+    assert resolve_sel(sel, domain).size > 0
+    assert step_facets_to_faces(sel, {key: load_mesh(examples_dir / "bracket.stl")}) is sel

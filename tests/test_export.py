@@ -228,3 +228,35 @@ def test_render_png_views_layers_and_bounds(bracket, examples_dir):
     assert _pixels(render_png([], view="+z")).shape == (700, 900, 3)
     with pytest.raises(ValueError):
         render_png([(bracket, (1, 0, 0), 1.0)], view="sideways")
+
+
+def test_vti_and_npz_carry_an_optional_stress_field(box_case):
+    grid, rho, _ = box_case
+    passive = np.zeros(grid.shape, dtype=np.int8)
+    stress = np.linspace(0.0, 50.0, grid.nel).reshape(grid.shape) * (rho > 0)
+    root = ET.fromstring(to_vti_bytes(rho, passive, grid, stress))
+    arrays = {a.attrib["Name"]: a for a in root.iter("DataArray")}
+    assert list(arrays) == ["density", "passive", "stress"]  # stress is the third array
+    assert arrays["stress"].attrib["type"] == "Float32"
+    sig = _decode_vtk(arrays["stress"].text, "<f4")
+    assert np.allclose(sig.reshape(grid.shape, order="F"), stress, atol=1e-4)
+    assert float(arrays["stress"].attrib["RangeMax"]) == pytest.approx(
+        float(stress.max()), rel=1e-6
+    )
+    # without stress the output is what it was
+    plain = ET.fromstring(to_vti_bytes(rho, passive, grid))
+    assert [a.attrib["Name"] for a in plain.iter("DataArray")] == ["density", "passive"]
+    with pytest.raises(ValueError, match="stress"):
+        to_vti_bytes(rho, passive, grid, np.zeros((2, 2, 2)))
+
+    active = rho > 0
+    data = to_npz_bytes(rho, grid, active, passive, stress)
+    assert from_npz_bytes(data)[0].shape == grid.shape  # the 4-tuple form is unchanged
+    *base, loaded = from_npz_bytes(data, with_stress=True)
+    assert len(base) == 4 and np.array_equal(loaded, stress)
+    with np.load(io.BytesIO(data)) as z:
+        assert "stress" in z.files
+    old = to_npz_bytes(rho, grid, active, passive)  # an archive without the key
+    with np.load(io.BytesIO(old)) as z:
+        assert "stress" not in z.files
+    assert from_npz_bytes(old, with_stress=True)[4] is None

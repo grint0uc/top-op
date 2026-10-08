@@ -7,6 +7,7 @@ from typing import Annotated
 import numpy as np
 import trimesh
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
+from pydantic import BaseModel
 
 from topop.core.export import render_png
 from topop.server.schemas import ErrorResponse, FacetInfo, MeshFacets, MeshInfo
@@ -19,6 +20,12 @@ MAX_FACETS = 300
 MESH_RGB = (0.75, 0.75, 0.78)
 
 StoreDep = Annotated[Store, Depends(get_store)]
+
+
+class FacetFaces(BaseModel):
+    """Triangle ids (of GET /meshes/{id}/buffer) that make up one facet."""
+
+    face_ids: list[int]
 
 
 async def _with_mesh[T](store: Store, mesh_id: str, fn: Callable[[trimesh.Trimesh], T]) -> T:
@@ -128,6 +135,24 @@ async def mesh_facets(
         facets=[FacetInfo(**f) for f in facets[:MAX_FACETS]],
         n_facets_total=total,
     )
+
+
+@router.get(
+    "/meshes/{id}/facets/{facet_id}/faces",
+    response_model=FacetFaces,
+    responses=NOT_FOUND,
+    summary="Triangle ids of one facet (GUI highlight; STEP meshes ignore angle_deg)",
+)
+async def mesh_facet_faces(
+    id: str, facet_id: int, store: StoreDep, angle_deg: float = Query(5.0, ge=0, le=90)
+) -> FacetFaces:
+    try:
+        faces = await asyncio.to_thread(store.facet_faces, id, [facet_id], angle_deg)
+    except NotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:  # facet id outside the table
+        raise HTTPException(404, str(exc)) from exc
+    return FacetFaces(face_ids=faces.tolist())
 
 
 @router.get(

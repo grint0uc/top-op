@@ -19,7 +19,7 @@ import numpy as np
 import trimesh
 from fastapi import Request
 
-from topop.core.export import from_npz_bytes, to_npz_bytes
+from topop.core.export import from_npz_bytes, to_npz_bytes, trim_to_design
 from topop.core.problem import Grid
 from topop.core.selection import compute_facets
 from topop.core.selection import facet_faces as mesh_facet_faces
@@ -68,6 +68,7 @@ class RunRecord:
     project: Project  # snapshot taken when the run was created
     built: BuiltProblem | None = None
     rho: np.ndarray | None = None
+    stress: np.ndarray | None = None  # von Mises per element of the final design (or None)
     latest_frame: bytes | None = None
     latest_frame_it: int = -1
     message: str | None = None  # final status message (StatusMsg.message)
@@ -76,6 +77,7 @@ class RunRecord:
     subscribers: list = field(default_factory=list)  # (asyncio loop, asyncio.Queue)
     # result loaded back from runs/{id}.npz after a restart: (rho, grid, active, passive)
     _from_disk: tuple[np.ndarray, Grid, np.ndarray, np.ndarray] | None = None
+    _stress_from_disk: np.ndarray | None = None
 
     @property
     def finished(self) -> bool:
@@ -366,7 +368,7 @@ class Store:
                 b = rec.built
                 _write_atomic(
                     self.run_dir / f"{rec.info.id}.npz",
-                    to_npz_bytes(rec.rho, b.grid, b.active, b.passive),
+                    to_npz_bytes(rec.rho, b.grid, b.active, b.passive, rec.stress),
                 )
             exp = RunExport(project=rec.project, run=rec.snapshot())
             _write_atomic(self.run_dir / f"{rec.info.id}.json", exp.model_dump_json().encode())
@@ -377,12 +379,26 @@ class Store:
         """(rho, grid, active, passive) of a finished run, from memory or runs/{id}.npz."""
         if rec.rho is not None and rec.built is not None:
             return rec.rho, rec.built.grid, rec.built.active, rec.built.passive
+        return self._load_npz(rec)
+
+    def _load_npz(self, rec: RunRecord) -> tuple[np.ndarray, Grid, np.ndarray, np.ndarray] | None:
         if rec._from_disk is None:
             path = self.run_dir / f"{rec.info.id}.npz"
             if not _SAFE_ID.fullmatch(rec.info.id) or not path.is_file():
                 return None
-            rec._from_disk = from_npz_bytes(path.read_bytes())
+            rho, grid, active, passive, stress = from_npz_bytes(path.read_bytes(), with_stress=True)
+            rec._stress_from_disk = stress
+            rec._from_disk = (rho, grid, active, passive)
         return rec._from_disk
+
+    def run_stress(self, rec: RunRecord) -> np.ndarray | None:
+        """Von Mises field (nx,ny,nz) of a finished run from memory or runs/{id}.npz, else None."""
+        if rec.stress is not None:
+            return rec.stress
+        if rec.rho is None or rec.built is None:  # not in memory: a run loaded from disk
+            self._load_npz(rec)
+            return rec._stress_from_disk
+        return None
 
     def design_world(self, rec: RunRecord) -> trimesh.Trimesh | None:
         """The run's design mesh in world space (for the ghosted result preview)."""
@@ -395,6 +411,15 @@ class Store:
         except (NotFoundError, ValueError):
             return None
         return meshes.get("design")
+
+    def trim_result(
+        self, rec: RunRecord, mesh: trimesh.Trimesh
+    ) -> tuple[trimesh.Trimesh, list[str]]:
+        """`mesh` intersected with the run's world-space design mesh, plus why it could not be."""
+        design = self.design_world(rec)
+        if design is None:
+            return mesh, ["not trimmed to the design: the design mesh is not available"]
+        return trim_to_design(mesh, design)
 
 
 def store_of(app) -> Store:

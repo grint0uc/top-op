@@ -89,6 +89,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/meshes/{id}/facets/{facet_id}/faces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Triangle ids of one facet (GUI highlight; STEP meshes ignore angle_deg) */
+        get: operations["mesh_facet_faces_api_meshes__id__facets__facet_id__faces_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/meshes/{id}/preview.png": {
         parameters: {
             query?: never;
@@ -218,7 +235,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Export the result as STL */
+        /** Export the result as STL (trim=true: intersected with the design mesh) */
         get: operations["result_stl_api_runs__id__result_stl_get"];
         put?: never;
         post?: never;
@@ -254,6 +271,23 @@ export interface paths {
         };
         /** Export the density field as NPZ */
         get: operations["result_npz_api_runs__id__result_npz_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/runs/{id}/stress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Von Mises stress field of the final design */
+        get: operations["result_stress_api_runs__id__stress_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -356,6 +390,14 @@ export interface components {
             kind: "faces";
             /** Mesh Id */
             mesh_id: string;
+            /** Face Ids */
+            face_ids: number[];
+        };
+        /**
+         * FacetFaces
+         * @description Triangle ids (of GET /meshes/{id}/buffer) that make up one facet.
+         */
+        FacetFaces: {
             /** Face Ids */
             face_ids: number[];
         };
@@ -1128,6 +1170,49 @@ export interface operations {
             };
         };
     };
+    mesh_facet_faces_api_meshes__id__facets__facet_id__faces_get: {
+        parameters: {
+            query?: {
+                angle_deg?: number;
+            };
+            header?: never;
+            path: {
+                id: string;
+                facet_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FacetFaces"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     mesh_preview_api_meshes__id__preview_png_get: {
         parameters: {
             query?: {
@@ -1507,6 +1592,7 @@ export interface operations {
             query?: {
                 threshold?: number;
                 smooth?: number;
+                trim?: boolean;
             };
             header?: never;
             path: {
@@ -1519,6 +1605,8 @@ export interface operations {
             /** @description Isosurface of the density field */
             200: {
                 headers: {
+                    /** @description Why `trim=true` left the result untrimmed (joined with '; '); absent if fine */
+                    "X-Topop-Warnings"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1625,6 +1713,55 @@ export interface operations {
             };
         };
     };
+    result_stress_api_runs__id__stress_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description [u32 nx][u32 ny][u32 nz][f32 von Mises per element], little-endian, C-order, 0 on inactive elements */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     run_project_api_runs__id__project_json_get: {
         parameters: {
             query?: never;
@@ -1710,6 +1847,7 @@ export interface operations {
             query?: {
                 threshold?: number;
                 view?: string;
+                trim?: boolean;
             };
             header?: never;
             path: {
@@ -1722,6 +1860,8 @@ export interface operations {
             /** @description Offscreen render of the result */
             200: {
                 headers: {
+                    /** @description Why `trim=true` left the result untrimmed (joined with '; '); absent if fine */
+                    "X-Topop-Warnings"?: string;
                     [name: string]: unknown;
                 };
                 content: {

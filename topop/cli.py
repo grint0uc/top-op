@@ -55,11 +55,20 @@ def _vec(v, fmt: str) -> str:
 
 
 def format_description(data: dict) -> str:
-    """MeshInfo block + fixed-width facet table."""
+    """MeshInfo block + fixed-width facet table.
+
+    Planes show their normal; cylinders their radius and axis (a hole is a cylinder facet); STEP
+    meshes also show the B-rep face index. Cells that do not apply stay blank.
+    """
     m = data["mesh"]
     lo, hi = m["bbox"]
     size = [b - a for a, b in zip(lo, hi, strict=True)]
     volume = "n/a (not watertight)" if m["volume"] is None else f"{m['volume']:.6g}"
+    what = (
+        "B-rep faces"
+        if m.get("source") == "step"
+        else f"coplanar groups and cylinders, angle {data['angle_deg']:g} deg"
+    )
     lines = [
         f"mesh {m['name']}  id {m['id']}",
         (
@@ -67,16 +76,22 @@ def format_description(data: dict) -> str:
             f"  volume {volume}"
         ),
         f"  bbox min {_vec(lo, '.6g')}  max {_vec(hi, '.6g')}  size {_vec(size, '.6g')}",
+        f"facets ({what}, by area): showing {len(data['facets'])} of {data['n_facets_total']}",
         (
-            f"facets (coplanar groups, angle {data['angle_deg']:g} deg, by area): "
-            f"showing {len(data['facets'])} of {data['n_facets_total']}"
+            f"{'id':>4} {'faces':>6} {'area':>11}  {'normal':<24}  {'kind':<8}  {'radius':>8}  "
+            f"{'axis':<24}  {'brep':>4}  {'centroid':<30}  bbox min .. max"
         ),
-        f"{'id':>4} {'faces':>6} {'area':>11}  {'normal':<24}  {'centroid':<30}  bbox min .. max",
     ]
     for f in data["facets"]:
+        kind = f.get("kind", "other")
+        normal = _vec(f["normal"], "+.3f") if any(f["normal"]) else ""
+        radius = "" if f.get("radius") is None else format(f["radius"], ".5g")
+        axis = "" if kind == "plane" or not f.get("axis") else _vec(f["axis"], "+.3f")
+        brep = "" if f.get("brep_face") is None else str(f["brep_face"])
         lines.append(
-            f"{f['id']:>4} {f['n_faces']:>6} {f['area']:>11.5g}  {_vec(f['normal'], '+.3f'):<24}  "
-            f"{_vec(f['centroid'], '.5g'):<30}  {_vec(f['bbox'][0], '.5g')} .. {_vec(f['bbox'][1], '.5g')}"
+            f"{f['id']:>4} {f['n_faces']:>6} {f['area']:>11.5g}  {normal:<24}  {kind:<8}  "
+            f"{radius:>8}  {axis:<24}  {brep:>4}  {_vec(f['centroid'], '.5g'):<30}  "
+            f"{_vec(f['bbox'][0], '.5g')} .. {_vec(f['bbox'][1], '.5g')}"
         )
     return "\n".join(lines)
 
@@ -119,8 +134,28 @@ def _print_setup(case: str, project, stats, bounds: dict) -> None:
     for sp in bounds["supports"]:
         axes = "".join(a for a, f in zip("xyz", sp["fix"], strict=True) if f) or "none"
         print(f"support {sp['name'] or sp['id']}: fixes {axes} -> {sp['n_nodes']} nodes")
+    extras = _feature_summary(project.params)
+    if extras:
+        print(f"features    {extras}")
     for w in stats.warnings:
         print(f"warning: {w}")
+
+
+def _feature_summary(params) -> str:
+    """Non-default v0.2 options of the project, for the setup block."""
+    parts = []
+    if params.optimizer == "mma" or params.stress_limit is not None:  # a limit forces mma
+        parts.append("optimizer mma")
+    if params.symmetry:
+        planes = ", ".join(
+            s.axis if s.position is None else f"{s.axis}={s.position:g}" for s in params.symmetry
+        )
+        parts.append(f"symmetry {planes}")
+    if params.stress_limit is not None:
+        parts.append(f"stress_limit {params.stress_limit:g} (p-norm {params.stress_pnorm:g})")
+    if params.overhang is not None:
+        parts.append(f"overhang {params.overhang}")
+    return "; ".join(parts)
 
 
 def _install_sigint(cancel: threading.Event):
@@ -148,19 +183,28 @@ def _run(args: argparse.Namespace) -> int:
         pid = project.id
         if args.resolution is not None:
             session.set_grid(pid, elements_along_longest=args.resolution)
+        overrides = _param_overrides(args)
+        if overrides:
+            session.set_params(pid, **overrides)
         stats = session.voxel_stats(pid)
         bounds = session.boundaries(pid)
         project = session.get_project(pid)
     except (ValueError, OSError, NotFoundError) as exc:
         _report_invalid(exc)
         return EXIT_INVALID
+    with_constraint = project.params.stress_limit is not None
     if not args.quiet:
         _print_setup(args.case, project, stats, bounds)
-        print(f"{'it':>4} {'compliance':>13} {'volume':>8} {'change':>8} {'t_iter':>8}", flush=True)
+        head = f"{'it':>4} {'compliance':>13} {'volume':>8} {'change':>8} {'t_iter':>8}"
+        head += f" {'stress_max':>11}" + (f" {'constraint':>10}" if with_constraint else "")
+        print(head, flush=True)
 
     def progress(r) -> None:
         if not args.quiet:
             line = f"{r.it:>4} {r.compliance:>13.6e} {r.volume:>8.4f} {r.change:>8.4f} {r.t_iter:>7.2f}s"
+            line += f" {'-' if r.stress_max is None else format(r.stress_max, '11.4e'):>11}"
+            if with_constraint:
+                line += f" {'-' if r.constraint is None else format(r.constraint, '+10.4f'):>10}"
             print(line, flush=True)
 
     cancel = threading.Event()
@@ -183,6 +227,33 @@ def _run(args: argparse.Namespace) -> int:
     return _finish_run(session, info, args, time.perf_counter() - t0)
 
 
+def _param_overrides(args: argparse.Namespace) -> dict:
+    """`topop run` flags -> `ParamsSpec` fields (only the ones given)."""
+    fields: dict = {}
+    if args.optimizer is not None:
+        fields["optimizer"] = args.optimizer
+    if args.stress_limit is not None:
+        fields["stress_limit"] = args.stress_limit
+    if args.overhang is not None:
+        fields["overhang"] = args.overhang
+    if args.symmetry:
+        fields["symmetry"] = args.symmetry
+    return fields
+
+
+def _symmetry_arg(text: str) -> dict:
+    """`y` or `y=12.5` -> {"axis": "y", "position": None | 12.5}."""
+    axis, sep, pos = text.partition("=")
+    axis = axis.strip().lower()
+    if axis not in ("x", "y", "z"):
+        raise argparse.ArgumentTypeError(f"{text!r}: expected x, y or z, optionally =POSITION")
+    try:
+        position = float(pos) if sep else None
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r}: position {pos!r} is not a number") from None
+    return {"axis": axis, "position": position}
+
+
 def _report_invalid(exc: BaseException) -> None:
     from topop.agent import ProjectInvalid
 
@@ -202,23 +273,54 @@ def _finish_run(session, info, args: argparse.Namespace, wall: float) -> int:
         return 1
     out = Path(args.out) if args.out else Path.cwd() / f"{Path(args.case).stem}-out"
     try:
-        result = session.write_outputs(info.id, out, args.threshold, args.smooth)
+        result = session.write_outputs(info.id, out, args.threshold, args.smooth, args.trim)
     except OSError as exc:
         _err("run", f"could not write to {out}: {exc}")
         return 1
     written = result["files"]
     for name, why in result["errors"].items():
         _err("run", f"{name} not written: {why}")
+    for why in result["warnings"]:
+        _err("run", f"warning: {why}")
     last = info.history[-1]
     detail = outcome.get("message") or status
     print(f"status      {status} ({detail})  run {info.id}")
     print(
         f"iterations  {len(info.history)}   compliance {last.compliance:.6e}   volume {last.volume:.4f}"
     )
+    print(_stress_line(session, info, last))
+    if args.trim and "result.stl" in written and not result["warnings"]:
+        print("trim        result.stl intersected with the design mesh")
     print(f"wall time   {wall:.1f} s total, {outcome.get('wall_s', 0.0):.1f} s optimizing")
     print(f"files       {out}/ : {', '.join(written)}")
     print(f"rerun       topop run {Path(out) / 'run.json'}")
     return EXIT_INTERRUPTED if status == "cancelled" else 0
+
+
+def _stress_line(session, info, last) -> str:
+    """Max von Mises of the final design and, with a stress limit, whether the constraint held."""
+    from topop.core.optimize import STRESS_FEAS_TOL
+
+    try:
+        summary = session.stress_summary(info.id)
+    except ValueError:
+        summary = None
+    peak = summary["max"] if summary else last.stress_max
+    if peak is None:
+        return "stress      not available"
+    where = ""
+    if summary:
+        where = (
+            f" at {_vec(summary['location'], '.4g')}, mean over solid {summary['mean_solid']:.4e}"
+        )
+    line = f"stress      max {peak:.4e} von Mises{where}"
+    limit = session.get_project(info.project_id).params.stress_limit
+    if limit is None:
+        return line
+    ok = last.constraint is not None and last.constraint <= STRESS_FEAS_TOL
+    g = "n/a" if last.constraint is None else f"{last.constraint:+.4f}"
+    verdict = "satisfied" if ok else "NOT satisfied"
+    return f"{line}\nconstraint  stress <= {limit:g}: {verdict} (g = {g}, max/limit {peak / limit:.2f})"
 
 
 # ---- mcp ----------------------------------------------------------------------------------------
@@ -256,11 +358,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--threshold", type=float, default=0.5, help="STL iso level (default 0.5)")
     p_run.add_argument("--smooth", type=int, default=0, help="STL Laplacian smoothing iterations")
     p_run.add_argument("--quiet", action="store_true", help="no per-iteration lines")
+    p_run.add_argument(
+        "--trim",
+        action="store_true",
+        help="intersect result.stl with the design mesh (exact CAD skin)",
+    )
+    p_run.add_argument(
+        "--optimizer", choices=("oc", "mma"), default=None, help="override params.optimizer"
+    )
+    p_run.add_argument(
+        "--stress-limit",
+        type=float,
+        metavar="SIGMA",
+        default=None,
+        help="von Mises limit (units of E); forces the mma optimizer",
+    )
+    p_run.add_argument(
+        "--overhang",
+        choices=("+x", "-x", "+y", "-y", "+z", "-z"),
+        default=None,
+        metavar="+z",
+        help="additive-manufacturing build direction (45 deg overhang filter; base plate on the "
+        "domain face opposite it). Write negative ones as --overhang=-z",
+    )
+    p_run.add_argument(
+        "--symmetry",
+        type=_symmetry_arg,
+        action="append",
+        metavar="AXIS[=POS]",
+        help="mirror the design about the plane AXIS=POS (default: domain center); repeatable",
+    )
     p_run.set_defaults(func=_run)
 
     p_describe = sub.add_parser("describe", help="print the facet table of a mesh")
     p_describe.add_argument("mesh", metavar="MESH")
-    p_describe.add_argument("--angle", type=float, default=5.0, help="coplanarity angle, degrees")
+    p_describe.add_argument(
+        "--angle", type=float, default=5.0, help="coplanarity angle, degrees (STEP: ignored)"
+    )
     p_describe.add_argument("--top", type=int, default=30, help="facets to list (0 = all)")
     p_describe.add_argument("--png", metavar="OUT.png", default=None, help="also render a preview")
     p_describe.add_argument("--view", default="iso", help="iso, +x, -x, +y, -y, +z or -z")

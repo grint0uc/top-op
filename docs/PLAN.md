@@ -316,3 +316,29 @@ Deferred or open:
 - Non-identity `design_mesh.transform` is unsupported in the viewport (the GUI never writes one).
 - Facets chain through fine tessellation and fillets; the angle tolerance is the only control.
 - Out of scope since v1: tet meshes, contact, stress constraints, MMA or multiple constraints, symmetry planes, overhang constraints, STEP import, GPU.
+
+---
+
+## Status (v0.2)
+
+Core features landed before this wiring pass (commit subjects in `git log`): MMA optimizer, symmetry planes, von Mises recovery
+and p-norm stress constraint, Langelaar overhang filter, STEP import with B-rep facets, planar region-growing and cylinder
+facets, `trim_to_design` (manifold boolean). This pass exposes them through the server, CLI and MCP.
+
+| Area | Status |
+|------|--------|
+| Params | `build.run_params` maps `optimizer`, `symmetry` (`SymmetrySpec` -> `SymmetryPlane`), `stress_limit`, `stress_pnorm`, `overhang`. `build.params_warnings` adds notes to `VoxelStats.warnings` (voxelize route, `voxel_stats`, run stats): mma forced by a stress limit, location of the overhang base plate. The cached domain does not depend on params. |
+| Progress | `IterationRecord` (WS `progress`, `RunInfo.history`, `Session.run`) carries `stress_max` and `constraint`. `Result.stress` is kept on the run record, persisted as the `stress` key of `runs/{id}.npz` (older archives load without it) and written as the third VTI cell array. |
+| Endpoints | `GET /api/meshes/{id}/facets/{facet_id}/faces?angle_deg=` -> `{"face_ids":[..]}` (404 unknown facet; STEP ignores the angle). `GET /api/runs/{id}/stress` -> `<u4 nx,ny,nz` + `f32[nx*ny*nz]` C-order, 0 on inactive cells (409 until the run has a result). `result.stl` and `preview.png` take `trim=true` (intersect with the world-space design mesh; reasons for skipping in the `X-Topop-Warnings` header). `resolve-selection` goes through `build.resolve_sel`, so `facets` previews correctly on STEP meshes. |
+| CLI | `describe`: kind / radius / axis / brep columns ("B-rep faces" for STEP). `run`: `--trim`, `--optimizer`, `--stress-limit`, `--overhang`, `--symmetry AXIS[=POS]` (repeatable); `stress_max` (and `constraint`) per iteration; summary line with the final max stress and the constraint verdict. Exit codes unchanged. |
+| MCP | 27 tools. `set_params` takes the v0.2 fields (`stress_limit=0` and `overhang="none"` clear them), `export_stl` / `export_files` / `result_preview` take `trim`, `run` reports `stress_max` and `constraint`, new `facet_faces` and `result_stress_summary`; docstrings and `docs/AGENT.md` explain symmetry, overhang, stress, trim and cylinder facets. |
+
+Deferred or open:
+- **AMFilter ignores the first active layer.** `core/filters.py` sets `xi[0] = x[0]` on layer 0 of the grid, which is the empty padding layer
+  (`GridSpec.padding` defaults to 1), so every real layer sees an unsupported (zero) layer below. With `overhang` set the printed density
+  collapses (the bracket at `--overhang +z` ends at volume 0.016 against volfrac 0.3 and "converges" with change 0 after 5 iterations).
+  The base plate should be the first layer holding active cells. Until then the overhang tests only check plumbing.
+- `FacetFaces` (response of the facet-faces endpoint) is defined in `routes_meshes.py`, not in `schemas.py`; move it there at the next contract revision.
+- Stress is the relaxed voxel stress `rho^0.5 * sigma_vm(solid)`; sharp corners and the clamped face overshoot. No stress-based remeshing or smoothing.
+- `trim=true` needs a closed, consistently oriented design mesh; otherwise it warns and returns the untrimmed surface. Trimming a ~200k-triangle surface takes under 5 s (`tests/test_export.py`).
+- Several stress limits (per region or per load case) and local (non-aggregated) constraints are not supported.

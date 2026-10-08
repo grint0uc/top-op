@@ -7,6 +7,15 @@ drive the whole workflow without the GUI.
 
 Python (numpy/scipy) core, FastAPI server, Three.js frontend. One run at a time, on the CPU. No cloud.
 
+## Features
+
+- Voxel SIMP compliance minimization with the OC or MMA optimizer, multiple load cases, keep-in / keep-out reference bodies.
+- Von Mises **stress constraint** (p-norm, `stress_limit`), per-iteration `stress_max`, stress field in the VTI and NPZ exports.
+- **Symmetry planes** (mirror any axis, exact symmetry) and an **overhang filter** for additive manufacturing (45 degrees, any build direction).
+- **STEP import** (optional extra): faces are exact B-rep faces, holes are cylinder facets with their radius and axis.
+- **Trim to CAD**: `result.stl` can be intersected with the design mesh, so flat faces and hole walls come out exact.
+- The same workflow from the GUI, the CLI (`topop run`) and an MCP server for Claude.
+
 ![Setup: bracket with a load (red face), a support (blue) and a keep-out cylinder](docs/img/bracket-setup.png)
 
 ![Result after 8 iterations: optimized arch over the ghosted bracket](docs/img/bracket-result.png)
@@ -58,11 +67,15 @@ Hotkeys 1-5 switch Orbit / Pick / Paint / Gizmo / Query. Projects persist in `~/
 uv run topop describe examples/bracket.stl                     # bbox + facet table, largest first
 uv run topop describe examples/bracket.stl --png bracket.png   # plus a preview render
 uv run topop run examples/bracket.json --out out/              # 40 iterations, about 16 s
+uv run topop run examples/bracket.json --symmetry y --trim     # mirror-symmetric, STL clipped to the CAD
+uv run topop run examples/cantilever.json --stress-limit 0.1 --out out/   # stress-constrained (mma)
 ```
 
 `topop run` writes `result.stl`, `result.png`, `result.vti`, `density.npz` and `run.json` (re-runnable).
 Exit codes: 0 done, 1 failed, 2 invalid case, 3 out of memory. Flags: `--max-iter`, `--resolution`,
-`--threshold`, `--smooth`, `--quiet`. A case file is the project JSON with meshes as `path`s; see
+`--threshold`, `--smooth`, `--quiet`, `--trim`, `--optimizer oc|mma`, `--stress-limit`, `--overhang +z`
+(`--overhang=-z` for negative directions), `--symmetry y[=pos]` (repeatable). The summary names the max
+von Mises stress and, with a limit, whether the constraint ended satisfied. A case file is the project JSON with meshes as `path`s; see
 `examples/bracket.json` (facet support, normal-query load, keep-out slot) and `examples/README.md`.
 
 ## Claude / MCP
@@ -72,8 +85,8 @@ claude mcp add top-op -- uv run --directory /path/to/top-op topop mcp
 ```
 
 Tools cover the whole workflow: `load_mesh`, `describe_mesh`, `preview_mesh`, `create_project`,
-`add_load`, `add_support`, `add_ref_model`, `set_params`, `set_grid`, `voxel_stats`, `run`,
-`result_preview`, `export_stl`, and more. A session looks like this:
+`add_load`, `add_support`, `add_ref_model`, `set_params` (symmetry, stress, overhang), `set_grid`,
+`voxel_stats`, `run`, `result_preview`, `result_stress_summary`, `export_stl(trim=true)`, `facet_faces`, and more. A session looks like this:
 
 ```
 you:    Optimize examples/bracket.stl. Fix the plate bottom, push the wall's outer face in +X, keep 30 %.
@@ -94,7 +107,7 @@ mesh's own units. `mesh_id` defaults to `"design"` (`"ref:<id>"` names a referen
 | kind | what it picks | JSON |
 |---|---|---|
 | faces | raw triangle ids (GUI clicks and paint) | `{"kind":"faces","face_ids":[12,13,40]}` |
-| facets | coplanar face groups from `describe` | `{"kind":"facets","facet_ids":[0],"angle_deg":5}` |
+| facets | face groups from `describe`: planes, cylinders (holes); STEP: B-rep faces | `{"kind":"facets","facet_ids":[0],"angle_deg":5}` |
 | normal | faces pointing along a direction | `{"kind":"normal","direction":[0,0,1],"angle_deg":10,"within":[[x0,y0,z0],[x1,y1,z1]]}` |
 | plane | grid nodes on a plane, no mesh needed | `{"kind":"plane","point":[0,0,0],"normal":[1,0,0],"tol":0}` |
 | box | surface nodes inside a box | `{"kind":"box","min":[0,0,0],"max":[10,60,20]}` |
@@ -102,7 +115,8 @@ mesh's own units. `mesh_id` defaults to `"design"` (`"ref:<id>"` names a referen
 | cylinder | surface nodes inside a cylinder | `{"kind":"cylinder","center":[40,30,10],"radius":6,"height":14,"axis":"z"}` |
 
 The `within` box clips on node coordinates, and nodes sit up to h/2 outside the true surface: pad a box
-derived from the mesh bbox by one voxel per side. Facet ids are ranks by area for a given `angle_deg`.
+derived from the mesh bbox by one voxel per side. Facet ids are ranks by area for a given `angle_deg`
+(`kind`, `radius` and `axis` tell a Ø12 hole from a plane; STEP ids are stable B-rep faces).
 
 **Units.** None are enforced. Whatever the mesh is in (the examples are mm) is the length unit; E,
 forces and lengths must be consistent. Compliance comes out in those units and is only comparable between
@@ -130,13 +144,15 @@ Solver details: [docs/PERF.md](docs/PERF.md).
 
 - The boundary is stair-stepped: resolution is the only fix. Smoothing on export is cosmetic. Features
   thinner than about 2 voxels vanish, and `rmin` limits the smallest member.
-- Facets chain through fine tessellation and fillets: neighbouring triangles within the angle tolerance
-  merge, so a filleted or finely tessellated surface can become one huge facet (shown with normal 0).
-  Check area and bbox in `describe`, lower `angle_deg`, or use `normal`, `plane` or a primitive.
+- Facets of a mesh (not STEP) are found from the tessellation: a finely tessellated freeform surface can still become one
+  huge `other` facet (normal 0). Check area and bbox in `describe`, lower `angle_deg`, or use `normal`, `plane` or a
+  primitive. STEP input has none of this: its facets are the exact B-rep faces.
 - A non-identity `design_mesh.transform` in an imported `project.json` is not drawn correctly by the
   viewport. The GUI never writes one.
-- Not in v0.1: stress constraints, MMA or multiple constraints, symmetry planes, overhang constraints,
-  STEP import, tet meshes, contact, GPU.
+- Stress is a voxel stress (density-weighted, stair-stepped boundaries): sharp inner corners overshoot, so keep margin.
+  The stress constraint forces MMA and is slower per iteration; the overhang filter does not generate support structures.
+  `--trim` needs a watertight design mesh (it warns and falls back to the untrimmed STL).
+- Not supported: tet meshes, contact, plasticity or fatigue, several stress limits, GPU.
 - One run at a time per process; further runs queue.
 
 ## Layout

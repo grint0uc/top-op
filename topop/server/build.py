@@ -19,7 +19,15 @@ from dataclasses import dataclass, field
 import numpy as np
 import trimesh
 
-from topop.core.problem import Grid, Load, Material, Problem, RunParams, Support
+from topop.core.problem import (
+    Grid,
+    Load,
+    Material,
+    Problem,
+    RunParams,
+    Support,
+    SymmetryPlane,
+)
 from topop.core.selection import resolve_selection
 from topop.core.step import facet_triangles
 from topop.core.voxelize import apply_transform, build_domain, domain_stats, transform_matrix
@@ -216,7 +224,29 @@ def resolve_project_selections(
 
 def run_params(spec: ParamsSpec) -> RunParams:
     names = {f.name for f in dataclasses.fields(RunParams)}
-    return RunParams(**{k: v for k, v in spec.model_dump().items() if k in names})
+    fields = {k: v for k, v in spec.model_dump().items() if k in names}
+    fields["symmetry"] = tuple(SymmetryPlane(s.axis, s.position) for s in spec.symmetry)
+    return RunParams(**fields)
+
+
+def params_warnings(spec: ParamsSpec) -> list[str]:
+    """Notes about parameter combinations that do not do what they look like they do.
+
+    Not part of the cached domain (`BuiltDomain.warnings`): params do not change the voxels.
+    """
+    out: list[str] = []
+    if spec.stress_limit is not None and spec.optimizer == "oc":
+        out.append(
+            "stress_limit is set: the optimizer is forced to mma (oc has no stress constraint)"
+        )
+    if spec.overhang is not None:
+        sign, axis = spec.overhang[0], spec.overhang[1]
+        face = "min" if sign == "+" else "max"
+        out.append(
+            f"overhang {spec.overhang}: the base plate is the domain's {face} {axis} face "
+            "(the part grows from it; no support structures are generated)"
+        )
+    return out
 
 
 def material(spec: MaterialSpec) -> Material:
@@ -251,7 +281,7 @@ def build_problem(
     issues = sel_errors + problem.validate()
     if issues:
         raise ProblemInvalid(issues)
-    warnings = [*domain.warnings, *sel_warnings]
+    warnings = [*domain.warnings, *sel_warnings, *params_warnings(project.params)]
     return BuiltProblem(
         grid=domain.grid,
         active=domain.active,

@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import anyio
+import numpy as np
 import pytest
 import trimesh
 from mcp import Client
@@ -22,7 +23,7 @@ EXPECTED_TOOLS = {
     "set_params", "set_grid", "set_material", "add_load", "add_support", "add_ref_model",
     "remove_load", "remove_support", "remove_ref_model", "voxel_stats", "resolve_selection", "run",
     "get_run", "cancel_run", "result_preview", "export_stl", "export_files", "export_case",
-    "load_case",
+    "load_case", "facet_faces", "result_stress_summary",
 }  # fmt: skip
 SUPPORT = {"kind": "plane", "point": [0, 0, 0], "normal": [1, 0, 0]}
 TIP = {"kind": "normal", "direction": [0, 0, 1], "within": [[48, -4, 16], [64, 24, 24]]}
@@ -94,6 +95,19 @@ def test_all_tools_listed_with_manual_style_descriptions():
             "Units" in tools["load_mesh"].description or "units" in tools["load_mesh"].description
         )
         assert "150k" in tools["create_project"].description
+        params = tools["set_params"].description
+        for needle in ("symmetry", "stress_limit", "stress_pnorm", "overhang", "base plate",
+                       "mma", "position", "forces optimizer mma"):  # fmt: skip
+            assert needle in params, needle
+        assert "trim" in tools["export_stl"].description
+        assert "design mesh" in tools["export_stl"].description
+        describe = tools["describe_mesh"].description
+        for needle in ("cylinder", "radius", "axis", "B-rep", "brep_face", "hole"):
+            assert needle in describe, needle
+        assert "B-rep" in tools["add_support"].description  # SELECTION_HELP: STEP facet ids
+        assert "stress_max" in tools["run"].description and "constraint" in tools["run"].description
+        assert "mean_solid" in tools["result_stress_summary"].description
+        assert "facet_id" in tools["facet_faces"].description
 
     drive(scenario)
 
@@ -252,6 +266,158 @@ def test_errors_are_readable(examples_dir):
         msg = await agent.fails("run", project_id=pid)
         assert "project is not runnable" in msg and "no loads defined" in msg
         assert "not found" in await agent.fails("result_preview", run_id="missing")
+
+    drive(scenario)
+
+
+def test_set_params_v02_fields_set_and_clear(examples_dir):
+    async def scenario(agent: Agent):
+        pid = await setup_cantilever(agent, examples_dir)
+        new = (
+            await agent(
+                "set_params",
+                project_id=pid,
+                optimizer="mma",
+                symmetry=[{"axis": "y", "position": None}, {"axis": "z", "position": 10.0}],
+                stress_limit=5.0,
+                stress_pnorm=6.0,
+                overhang="+z",
+            )
+        )["params"]
+        assert new["optimizer"] == "mma" and new["stress_limit"] == 5.0
+        assert new["stress_pnorm"] == 6.0 and new["overhang"] == "+z"
+        assert new["symmetry"] == [{"axis": "y", "position": None}, {"axis": "z", "position": 10.0}]
+        # omitted fields keep their value
+        assert (await agent("set_params", project_id=pid, volfrac=0.4))["params"][
+            "overhang"
+        ] == "+z"
+        notes = (await agent("voxel_stats", project_id=pid))["warnings"]
+        assert any("overhang +z" in w and "base plate" in w for w in notes)
+        assert not any("forced to mma" in w for w in notes)  # optimizer is already mma
+        # 0 / "none" / [] remove a feature
+        gone = (
+            await agent("set_params", project_id=pid, stress_limit=0, overhang="none", symmetry=[])
+        )["params"]
+        assert gone["stress_limit"] is None and gone["overhang"] is None and gone["symmetry"] == []
+        assert gone["optimizer"] == "mma" and gone["stress_pnorm"] == 6.0
+        # oc + stress_limit: valid, with a note
+        await agent("set_params", project_id=pid, optimizer="oc", stress_limit=2.0)
+        notes = (await agent("voxel_stats", project_id=pid))["warnings"]
+        assert any("forced to mma" in w for w in notes)
+        # errors are readable
+        assert "stress_limit" in await agent.fails("set_params", project_id=pid, stress_limit=-1.0)
+        assert "axis" in await agent.fails(
+            "set_params", project_id=pid, symmetry=[{"axis": "w", "position": None}]
+        )
+        assert "stress_pnorm" in await agent.fails("set_params", project_id=pid, stress_pnorm=1.0)
+        assert (await agent("get_project", project_id=pid))["params"]["stress_limit"] == 2.0
+
+    drive(scenario)
+
+
+def test_run_summary_stress_trim_and_stress_summary(examples_dir, tmp_path):
+    async def scenario(agent: Agent):
+        pid = await setup_cantilever(agent, examples_dir)
+        await agent("set_params", project_id=pid, symmetry=[{"axis": "y", "position": None}])
+        plain = await agent("run", project_id=pid, max_iter=6)
+        assert isinstance(plain["stress_max"], float) and plain["stress_max"] > 0
+        assert plain["constraint"] is None  # no stress_limit
+        assert all(isinstance(h["stress_max"], float) for h in plain["history"])
+        assert "result_stress_summary" in plain["next"]
+
+        s = await agent("result_stress_summary", run_id=plain["run_id"])
+        assert set(s) >= {"max", "mean_solid", "location", "cell", "n_solid", "run_id"}
+        assert "stress_limit" not in s
+        assert s["max"] > s["mean_solid"] > 0 and s["n_solid"] > 0
+        x, y, z = s["location"]
+        assert 0 <= x <= 60 and -2 <= y <= 22 and -2 <= z <= 22  # inside the beam's voxel box
+        # the cell holding the max, read back from density.npz
+        files = await agent("export_files", run_id=plain["run_id"], directory=str(tmp_path / "f"))
+        assert files["errors"] == {} and files["warnings"] == []
+        with np.load(tmp_path / "f" / "density.npz") as z_:
+            stress, rho = z_["stress"], z_["rho"]
+            origin, h = z_["origin"], float(z_["h"])
+        cell = np.unravel_index(int(np.argmax(stress)), stress.shape)
+        assert list(cell) == s["cell"] and s["max"] == pytest.approx(stress.max(), rel=1e-5)
+        assert np.allclose(s["location"], origin + h * (np.asarray(cell) + 0.5), rtol=1e-4)
+        assert s["mean_solid"] == pytest.approx(stress[rho >= 0.5].mean(), rel=1e-4)
+        assert b'Name="stress"' in (tmp_path / "f" / "result.vti").read_bytes()
+
+        out = tmp_path / "trimmed.stl"
+        saved = await agent("export_stl", run_id=plain["run_id"], path=str(out), trim=True)
+        assert "warnings" not in saved and saved["triangles"] > 0
+        mesh = trimesh.load(out, force="mesh")
+        assert (mesh.bounds[0] >= -1e-6).all() and (
+            mesh.bounds[1] <= [60.000001, 20.000001, 20.000001]
+        ).all()
+        raw = tmp_path / "raw.stl"
+        await agent("export_stl", run_id=plain["run_id"], path=str(raw))
+        poke = trimesh.load(raw, force="mesh").bounds
+        assert (poke[0] < -1e-3).any() or (poke[1] > [60.001, 20.001, 20.001]).any()  # voxel skin
+        look = await agent.raw("result_preview", run_id=plain["run_id"], trim=True)
+        assert not look.is_error and look.content[0].type == "image"
+
+        # with a stress limit (oc is forced to mma) the run reports the constraint
+        await agent("set_params", project_id=pid, stress_limit=3.0)
+        limited = await agent("run", project_id=pid, max_iter=3)
+        assert isinstance(limited["constraint"], float) and isinstance(limited["stress_max"], float)
+        assert any("forced to mma" in w for w in limited["warnings"])
+        sl = await agent("result_stress_summary", run_id=limited["run_id"])
+        assert sl["stress_limit"] == 3.0 and sl["max_over_limit"] == pytest.approx(sl["max"] / 3.0)
+
+    drive(scenario)
+
+
+def test_stress_summary_errors_are_readable():
+    async def scenario(agent: Agent):
+        assert "not found" in await agent.fails("result_stress_summary", run_id="missing")
+
+    drive(scenario)
+
+
+def test_facet_faces_and_facet_kinds(examples_dir):
+    async def scenario(agent: Agent):
+        mesh = await agent("load_mesh", path=str(examples_dir / "cantilever.stl"))
+        desc = await agent("describe_mesh", mesh_id=mesh["id"])
+        assert [f["kind"] for f in desc["facets"]] == ["plane"] * 6
+        assert all(
+            "radius" not in f and "axis" not in f and "brep_face" not in f for f in desc["facets"]
+        )
+        faces = await agent("facet_faces", mesh_id=mesh["id"], facet_id=0)
+        assert faces["n_faces"] == desc["facets"][0]["n_faces"] == len(faces["face_ids"]) == 2
+        assert max(faces["face_ids"]) < mesh["n_faces"]
+        assert "unknown facet" in await agent.fails("facet_faces", mesh_id=mesh["id"], facet_id=99)
+        assert "not found" in await agent.fails(
+            "facet_faces", mesh_id="deadbeefdeadbeef", facet_id=0
+        )
+
+        bracket = await agent("load_mesh", path=str(examples_dir / "bracket.stl"))
+        table = await agent("describe_mesh", mesh_id=bracket["id"], top=0)
+        holes = [f for f in table["facets"] if f["kind"] == "cylinder"]
+        big = max(holes, key=lambda f: f["radius"])
+        assert big["radius"] == pytest.approx(6.0, abs=1e-3) and len(big["axis"]) == 3
+        got = await agent("facet_faces", mesh_id=bracket["id"], facet_id=big["id"])
+        assert got["n_faces"] == big["n_faces"] == len(got["face_ids"]) > 50
+
+    drive(scenario)
+
+
+def test_step_facets_through_mcp(examples_dir):
+    pytest.importorskip("OCP", reason="STEP support not installed (uv sync --extra step)")
+
+    async def scenario(agent: Agent):
+        mesh = await agent("load_mesh", path=str(examples_dir / "bracket.step"))
+        assert mesh["source"] == "step" and mesh["n_brep_faces"] == 14
+        table = await agent("describe_mesh", mesh_id=mesh["id"], top=0)
+        assert all(isinstance(f["brep_face"], int) for f in table["facets"])
+        hole = next(f for f in table["facets"] if f.get("radius") == pytest.approx(6.0))
+        got = await agent("facet_faces", mesh_id=mesh["id"], facet_id=hole["id"], angle_deg=40)
+        assert got["n_faces"] == hole["n_faces"]  # angle_deg is ignored for B-rep faces
+        pid = (await agent("create_project", name="step", design_mesh_id=mesh["id"],
+                           elements_along_longest=40))["project_id"]  # fmt: skip
+        sel = {"kind": "facets", "facet_ids": [hole["id"]]}
+        resolved = await agent("resolve_selection", project_id=pid, selection=sel)
+        assert resolved["count"] > 0
 
     drive(scenario)
 
