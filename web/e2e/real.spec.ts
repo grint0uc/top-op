@@ -482,6 +482,7 @@ test('11. Stop cancels a running job; the partial result is exportable', async (
   await expect.poll(() => state(page, (s) => [s.project.loads.length, s.project.supports.length])).toEqual([1, 1]);
   await expect.poll(() => state(page, (s) => Object.keys(s.meshes).length), { timeout: 30_000 }).toBe(2);
   await page.getByTestId('p-max-iter').fill('400');
+  await page.getByTestId('p-tol').fill('0.000001'); // a fast runner must not converge to `done` before Stop is clicked
   await page.getByTestId('run-start').click();
   await expect.poll(() => state(page, (s) => s.run.history.length), { timeout: 60_000 }).toBeGreaterThanOrEqual(2);
   await page.getByTestId('run-stop').click();
