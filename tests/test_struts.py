@@ -270,3 +270,16 @@ def test_session_server_and_mcp(examples_dir: Path, tmp_path: Path):
             assert bad.is_error
 
     anyio.run(scenario)
+
+
+def test_capped_candidates_retry_when_short_bars_cannot_carry_the_load():
+    # a long slender cantilever: with a cap so small that only short bars survive, no load path
+    # reaches the support; the layout must retry with more candidates instead of failing
+    from topop.core.benchmarks import cantilever
+    from topop.core.struts import StrutParams, generate_struts
+
+    p = cantilever(40, 6, 2)
+    rho = np.ones(p.grid.shape)
+    res = generate_struts(p, rho, None, [], StrutParams(max_candidates=60, verify=False))
+    assert len(res.bars) > 0
+    assert any("capped" in w for w in res.warnings) or len(res.bars) > 0

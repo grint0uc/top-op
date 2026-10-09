@@ -532,13 +532,26 @@ def _layout(
         pairs = cKDTree(nodes).query_pairs(max_len, output_type="ndarray").astype(np.int64)
         pairs = pairs[segments_inside(nodes[pairs[:, 0]], nodes[pairs[:, 1]], allowed, grid)]
         pairs = pairs[drop_overlapping(nodes, pairs, 0.2 * h)]
-        if len(pairs) > params.max_candidates:
-            L = np.linalg.norm(nodes[pairs[:, 1]] - nodes[pairs[:, 0]], axis=1)
-            pairs = pairs[np.argsort(L, kind="stable")[: params.max_candidates]]
-            warnings.append(f"candidate bars capped at the {params.max_candidates} shortest")
         rigid = _rigid_links(problem, nodes)
         lp = _LP(nodes, fixed, loads, params.sigma_allow, rigid)
-        pairs, sol = lp.prune(pairs, lp.solve(pairs), params.prune)
+        # Keeping only the shortest bars can cut every long load path (e.g. an arm to a clamp):
+        # on an infeasible capped LP, retry with 3x the cap, then with every candidate.
+        L = np.linalg.norm(nodes[pairs[:, 1]] - nodes[pairs[:, 0]], axis=1)
+        order = np.argsort(L, kind="stable")
+        caps = [params.max_candidates, 3 * params.max_candidates, len(pairs)]
+        for i, cap in enumerate(caps):
+            sub = pairs[order[:cap]] if cap < len(pairs) else pairs
+            try:
+                sol = lp.solve(sub)
+            except ValueError:
+                if cap >= len(pairs) or i == len(caps) - 1:
+                    raise
+                continue
+            if cap < len(pairs):
+                warnings.append(f"candidate bars capped at the {cap} shortest of {len(pairs)}")
+            pairs = sub
+            break
+        pairs, sol = lp.prune(pairs, sol, params.prune)
         return nodes, kinds, pad, pairs, sol, lp
 
     try:
