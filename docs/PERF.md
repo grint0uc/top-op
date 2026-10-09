@@ -242,3 +242,187 @@ refresh (≥ 0.967x the true λmax over 170 recorded matrices; the cycle needs �
 iteration at 100k elements (1.37-1.39 → 1.44-1.50 s). Fallbacks inside `solve`: restart from zero →
 Gershgorin bounds (`gmg-safe`) → Jacobi-PCG, each tagged in `SolveInfo.method`. The replayed failure is
 `tests/data/lbracket_gmg_breakdown.npz` (`tests/test_solver.py`).
+
+## v0.3: peak-RSS measurement, symmetric assembly map, band vs multigrid
+
+Same 4-vCPU container. Other jobs came and went during this work (0 to ~2.5 busy cores); every
+benchmark recorded that foreign load (system busy time minus its own CPU time), and the numbers
+below are from runs with less than 0.3 foreign cores unless marked. Scripts lived in the session
+scratchpad.
+
+### 1. The float32 peak "only inside the full suite"
+
+`test_peak_memory_matches_estimate` read the child's peak from `ru_maxrss`. On Linux that value
+survives `exec`: `exec_mmap` folds the high-water RSS of the address space being replaced into the
+process's `signal->maxrss`, and `subprocess` starts children with vfork, so the replaced address
+space is the *parent's*. The child reported max(own peak, pytest's peak so far). Instrumented child
+in a full `uv run pytest -q` (327 passed): `ru_maxrss` was 2.138 GB at its first line, before
+importing topop, for both dtypes, equal to the pytest process's `ru_maxrss` at the spawn; its own
+`VmHWM` was 1.33 GB (float64) / 1.09 GB (float32), tracemalloc peak 1.10 / 0.87 GB; every solve
+`gmg`, 4 threads, no `TOPOP_*`/`OMP_*`/`OPENBLAS_*`/`MKL_*` variables. A pytest plugin logging the
+pytest process's `ru_maxrss` after every test (one run instead of bisecting files) shows where the
+2.1 GB came from: 0.85 GB after the server/CLI/MCP/export tests, 2.09 GB after
+`test_seconds_per_iteration_and_estimate[50x50x40]`, which runs the 100k optimization in-process
+just before the memory test. `tests/test_stress.py tests/test_solver.py` alone leave pytest well
+below 1.2 GB, hence no reproduction. Minimal reproduction: a parent touches and frees 2 GB, then
+spawns `python -c` printing its own numbers: `ru_maxrss` 2.03 GB, `VmHWM` 0.01 GB. Not an
+environment variable, a fallback, a leftover process or transparent huge pages (THP is `madvise`,
+no compaction stalls recorded).
+
+Fix (test only): the child reports `VmHWM` from `/proc/self/status` (`ru_maxrss` where there is no
+procfs), the float32 lower bound is 0.7 again, and the test asserts that every solve was `gmg`.
+
+### 2. Symmetric assembly map
+
+`Assembler(..., symmetric_map=True)` (default): P has slots only for K entries with col >= row.
+Which element-matrix entries those are depends only on the corner pair (`fem._UPPER`, 300 of 576),
+because free DOFs are ordered by (node, axis) and node ids grow with the stencil offset. Rows of
+the lower triangle are empty in P, so the threaded `P @ E_e` writes 0 there, and a threaded gather
+`K.data[dst] = K.data[src]` fills them. The int32 index pairs come from the slot tables while the
+pattern is built, with no sort. K is now exactly symmetric. `symmetric_map=False` keeps the full
+map; `tests/test_fem.py` checks that both agree to 1e-12.
+
+| | 100k full | 100k symmetric | 250k full | 250k symmetric |
+|---|---:|---:|---:|---:|
+| map + mirror indices | 797 MB | 558 MB | 1999 MB | 1401 MB |
+| peak RSS (VmHWM, 4-7 its) | 1.56 GB | **1.32-1.34 GB (-15 %)** | 3.64-3.66 GB | **3.02-3.05 GB (-17 %)** |
+| `Assembler` build, fresh process | 2.4-2.5 s (6.5 s once) | 2.6-3.2 s | 12.6-14.1 s | **6.9-8.1 s** |
+| `assemble()`, min of 15 | 33 ms | 54 ms | 85 ms | 140 ms |
+| setup to first iteration (`optimize`) | 3.6-6.4 s | 4.9-6.1 s | 15.1-15.2 s | 9.0-14.9 s |
+| s/it, its 2-6 (BLAS pinned, quiet box) | 1.43-1.53 (mean 1.47) | 1.43-1.53 (mean 1.48, **+0.4 %**) | 3.46-3.50 (mean 3.48) | 3.54-3.55 (mean 3.55, **+1.9 %**) |
+
+CG iteration counts are identical (the same K up to rounding), so the per-iteration cost of the
+symmetric map is the extra assembly time: +21 ms at 100k and +55 ms at 250k, about 1.5 % of an
+iteration. The mirror is 23 ms at 100k with int64 indices and 31 ms with int32, using 8 chunks in
+the pool. int32 is kept because it saves 48 MB; sub-chunking did not help. At 100k the build is not
+faster: the extra row-loop work cancels the smaller allocations. At 250k it halves, because 600 MB
+less is touched for the first time.
+
+`estimate_bytes` recalibrated to (305 map entries x (4 + item) + K + 4 B per K entry of mirror +
+edof, vectors, MG level 1) x 1.15 + 200 MB:
+
+| elements | float64 measured / estimate | float32 measured / estimate |
+|---:|---|---|
+| 12 000 | 0.31 / 0.34 GB | 0.31 / 0.31 GB |
+| 30 000 | 0.68 / 0.55 GB | 0.64 / 0.48 GB |
+| 100 000 | 1.32 / 1.35 GB | 1.09 / 1.10 GB |
+| 250 880 | 3.05 / 3.06 GB | 2.48 / 2.44 GB |
+
+The 30k runs peak above the estimate. Mid-size temporaries stay on the glibc heap below the 32 MB
+mmap threshold; the old formula was also -12 / -22 % there. 1M elements now estimate 11.5 GB,
+still refused at the 6 GB default cap.
+
+### 3. The 12k-30k "gap"
+
+**Main cause: OpenBLAS outside the solve.** A profile of 30x20x20 under foreign load found
+`optimize._linear_volume` taking 4.5 of 9.3 s. It is one `dv @ (x - x0)` per OC bisection step,
+~31 per iteration. OpenBLAS threads `ddot` above n = 10 000, and with the cores busy every such
+call waits for its workers. Median of 200 calls under load:
+
+| n | 4 800 | 9 000 | 12 000 | 30 000 | 100 000 |
+|---|---:|---:|---:|---:|---:|
+| default threads | 1.7 us | 2.3 us | 8.0 ms | 8.0 ms | 8.0 ms |
+| pinned to 1 (`solver._BLAS`) | 1.7 us | 2.3 us | 3.4 us | 5.7 us | 26 us |
+
+`LinearSolver.solve` pins OpenBLAS only for the duration of a solve. This is why the gap starts at
+~10k free elements (60x20x4 has 4 800 and never pays it) and why it comes and goes with load.
+30x20x20, 8 iterations, ~2.4 foreign cores: 0.62-0.76 s/it as shipped, 0.30-0.32 s/it with the
+whole `optimize` call inside `with solver._BLAS:`. On a quiet box the difference is ~10 %. The fix
+belongs in `optimize.py`, which is outside this work package: run the iteration loop inside
+`with _BLAS:`, which is re-entrant. Unpinned GEMMs elsewhere (element energies) are one call per
+32k elements and matter much less.
+
+**(a) Reverse Cuthill-McKee.** Bandwidth in DOFs: axis sweep / RCM on the node graph:
+
+| part | n | sweep | RCM | | part | n | sweep | RCM |
+|---|---:|---:|---:|---|---|---:|---:|---:|
+| 60x20x4 | 18 900 | **335** | 629 | | 20x20x20 | 26 460 | **1391** | 3659 |
+| 80x16x8 | 36 720 | **491** | 917 | | 30x30x30 | 86 490 | **2981** | 8189 |
+| 60x30x6 | 39 060 | **677** | 1301 | | bracket res 40 | 32 169 | 2837 | **1871** |
+| L-bracket 40x4 | 16 320 | **620** | 779 | | bracket res 60 | 109 590 | 6206 | **4355** |
+| ring R40 w5 t4 | 21 540 | 665 | **350** | | ring R30 w4 t6 | 18 774 | 740 | **428** |
+
+Compact parts cannot get near the band's range in any ordering. A graph with N nodes and diameter D
+has bandwidth >= (N - 1) / D, so 21^3 nodes with D = 20 need >= 463 nodes (~1390 DOFs). A
+20x20x20 box on the band takes 1.34 s/it vs 0.18 s/it with GMG. RCM is 2-3x wider than the sweep
+on boxes and beams, but ~2x narrower on closed loops. `band_ordering()` now takes the narrower of
+the two, compared on the node graph (11-70 ms in the band-eligible range).
+
+**(b) Crossover.** Iterations 2-8, s/it, band / GMG (`solver="direct"` / `"amg"`):
+
+| part | bw | band | GMG | GMG CG its |
+|---|---:|---:|---:|---|
+| 120x20x4 | 335 | **0.25** | 0.35 | 6-15 |
+| ring R40 w5 t4 | 350 | **0.15** | 0.47 | 13-40 |
+| 120x20x5 | 401 | **0.35-0.36** | 0.38-0.39 | 6-15 |
+| 100x26x4 | 425 | 0.34-0.35 | **0.29-0.30** | 5-14 |
+| ring R30 w4 t6 | 428 | **0.17** | 0.38 | 14-28 |
+| 100x20x6 | 467 | 0.43 | **0.35** | 6-14 |
+| 80x16x8 | 491 | 0.38 | **0.31** | 6-10 |
+| 80x24x6 | 551 | 0.51 | **0.31** | 6-14 |
+| L-bracket 40x4 | 620 | 0.24 | **0.17** | 6-11 |
+| 60x30x6 | 677 | 0.65 | **0.29** | 5-14 |
+
+Band time is ~n bw^2 / 2.4e10 s (1.8e10 at bw 335 up to 2.8e10 at 677), or 0.0285 bw - 3.2 us per
+unknown. GMG costs 0.6-1.0 us per unknown per CG iteration, and its CG count grows as voids form.
+Over whole runs, s/it for iterations 2-50:
+
+| part | bw | auto (new) | band | GMG |
+|---|---:|---|---:|---:|
+| 80x16x8 | 491 | **0.384** (GMG for 11 solves, then band) | 0.376 | 0.609 (late CG its 22-51) |
+| 80x24x6 | 551 | **0.486** (GMG for 13 solves, then band) | 0.506 | 0.554 |
+| L-bracket 40x4 | 620 | 0.253 (stays GMG) | 0.230 | 0.245 |
+
+New `auto` policy: band from the start when bw <= `BAND_AUTO_BW = 410`, the beam crossover at
+early iterations. Otherwise GMG, switching for good to the band once two consecutive solves need
+more CG iterations than (0.0285 bw - 3.2) / 0.7, provided the band fits `BAND_MAX_BYTES`. That is
+~15 iterations at bw 491 and ~24 at 700. Compact parts never qualify, because their band storage
+is above 512 MB or the break-even is above 50 iterations. The switch counts iterations, not
+seconds, so the choice is deterministic; the hierarchy is freed when it happens. `solver="amg"`
+never switches.
+
+**(c) Multigrid on small problems.** One solve at change 0.01, min of 3:
+
+| variant | 30x20x20 (12k): solve / CG its | 40x30x25 (30k) |
+|---|---|---|
+| default (coarse <= 1000 unknowns; 3 / 4 levels) | 315 ms / 11 | 558 ms / 14 |
+| coarse <= 300 (4 / 5 levels) | 310 ms / 13 | 571 ms / 15 |
+| coarse <= 3000 (dense Cholesky of 972 / 2376) | 315 ms / 11 | 1154 ms / 10 |
+| coarse <= 8000 (2 levels, SuperLU of 5 808) | 586 ms / 7 | 1143 ms / 10 |
+| float32 level-0 hierarchy, float64 CG | 314 ms / 11 | 530 ms / 14 |
+| 1 / 2 / 4 threads | 274 / 269 / 307 ms | 795 / 555 / 546 ms |
+
+At 12k the setup is 83-93 ms: the level-0 Galerkin product is 43 ms and level-0 Lanczos 14 ms. A
+V-cycle is 14-16 ms, and a level-0 SpMV is 1.3 ms with 4 threads or 2.1 ms with 1. A
+single-threaded CG iteration costs about 8 level-0 SpMVs, so there is no large overhead left to
+cut. A larger coarse solve costs more than the iterations it saves. Defaults are kept.
+
+**Before / after** (HEAD `fem.py`/`solver.py` vs this version, same tree otherwise; 30
+iterations, s/it its 2-30, foreign load ~2.4 cores during these pairs, so both columns include
+OpenBLAS stalls):
+
+| part | elements | before | after |
+|---|---:|---|---|
+| 30x20x20 (quiet) | 12 000 | 0.323 (GMG) | 0.333 (GMG) |
+| bracket res 40 | 9 340 | 0.322 (GMG) | 0.322 (GMG) |
+| ring R40 w5 t4 | 4 688 | 0.480 (GMG) | **0.244** (band, RCM) |
+| ring R30 w4 t6 | 4 200 | 0.488 (GMG) | **0.278** (GMG for 2 solves, then band) |
+| 80x16x8 | 10 240 | 1.134 (GMG) | **0.899** (GMG, then band) |
+
+Quiet-box run averages of the current code: 4 800 (band) 0.129, bracket 9 340 0.309, 12k 0.326,
+30k 0.666, bracket 33k 0.687, 100k 1.74 (N=21), 250k 4.14 (N=11) s/it.
+
+**Target** (no size between 5k and 100k above 0.35 s/it). On a quiet box, or with OpenBLAS pinned
+for the whole loop, the target holds up to ~12k elements for compact parts, and for thin parts and
+rings on the band. It is not reachable at 30k-100k with this design. Multigrid costs 0.6-1 us per
+unknown and CG iteration at 10-25 iterations, which gives 0.67 s/it at 30k and 1.7-1.9 s/it at
+100k. The band costs n bw^2, and compact bandwidths are bounded by the cross-section. Closing that
+would need a nested-dissection sparse Cholesky (CHOLMOD, not installed) or a substantially
+stronger preconditioner.
+
+### 4. Time estimate
+
+`estimate_seconds_per_iter` points are now 4 800: 0.14, 12k: 0.34, 30k: 0.70, 100k: 1.9,
+250k: 4.4 s. These are run averages of the measurements above, rounded up for longer runs. They
+assume no foreign load; under load, compact parts above 10k free elements pay the OpenBLAS stalls
+until `optimize.py` pins BLAS.

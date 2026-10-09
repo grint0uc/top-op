@@ -24,7 +24,14 @@ import scipy.sparse.linalg as sla
 from topop.core.benchmarks import cantilever, l_bracket
 from topop.core.fem import Assembler
 from topop.core.optimize import ADAPTIVE_TOL
-from topop.core.solver import GMG_METHODS, GeometricMG, LinearSolver, _jacobi_gershgorin
+from topop.core.solver import (
+    BAND_AUTO_BW,
+    BAND_MAX_BYTES,
+    GMG_METHODS,
+    GeometricMG,
+    LinearSolver,
+    _jacobi_gershgorin,
+)
 
 DATA = Path(__file__).parent / "data" / "lbracket_gmg_breakdown.npz"
 
@@ -235,3 +242,48 @@ def test_stalled_cg_escalates_and_returns_the_best_attempt(small):
     assert "did not converge in 3 its" in messages[0] and "did not reach rtol" in messages[-1]
     assert info.method == "jacobi-pcg" and info.iterations == 3 + 3 + 15
     assert info.rtol < info.residual < 1.0  # reported honestly, from the best (multigrid) attempt
+
+
+# ---- method choice (auto) -----------------------------------------------------------------------
+
+
+def auto_solver(asm: Assembler) -> LinearSolver:
+    return LinearSolver("auto", prolongators=asm.prolongators, ordering=asm.band_ordering)
+
+
+def test_auto_takes_the_band_for_slender_and_multigrid_for_compact_parts():
+    slender = Assembler(cantilever(60, 20, 4))
+    s = auto_solver(slender)
+    assert s.method(slender.assemble(np.ones(slender.n_elements))) == "band"
+    assert s._band_est[0] == 335 <= BAND_AUTO_BW  # one 21x5-node slab per x station
+    compact = Assembler(cantilever(30, 30, 30))
+    s = auto_solver(compact)
+    assert s.method(compact.assemble(np.ones(compact.n_elements))) == "gmg"
+    # a cube's bandwidth is bounded below by its cross-section (n / diameter): 3 * 31^2 + ...,
+    # in any ordering (RCM gives 8189), so the band never pays off and is never switched to
+    bw, _, nbytes = s._band_est
+    assert bw == 3 * (31 * 31 + 31 + 1) + 2
+    assert nbytes > BAND_MAX_BYTES and s._switch_its is None
+
+
+def test_auto_switches_to_the_band_when_multigrid_cg_gets_expensive(monkeypatch):
+    import topop.core.solver as solver_mod
+
+    asm = Assembler(cantilever(40, 16, 8))  # bandwidth 491: multigrid first
+    K = asm.assemble(simp_design(asm.n_elements, "simp", np.random.default_rng(5)) + 1e-3)
+    s = auto_solver(asm)
+    assert s.method(K) == "gmg"
+    assert 12 < s._switch_its < 20  # the band costs as much as ~15 CG iterations here
+    monkeypatch.setattr(solver_mod, "GMG_US_PER_IT", 1e3)  # every CG iteration "costs" more
+    s = auto_solver(asm)
+    U1, i1 = s.solve(K, asm.F_free)
+    assert i1.method == "gmg" and s.method(K) == "gmg"  # one expensive solve is not enough
+    _, i2 = s.solve(K, asm.F_free)
+    assert i2.method == "gmg" and s.method(K) == "band" and s._mg is None
+    U3, i3 = s.solve(K, asm.F_free)
+    assert i3.method == "band" and i3.kind == "direct" and i3.residual < 1e-10
+    assert np.allclose(U3, U1, rtol=1e-4, atol=1e-5 * np.abs(U3).max())
+    s = LinearSolver("amg", prolongators=asm.prolongators, ordering=asm.band_ordering)
+    for _ in range(3):  # an explicit "amg" stays on multigrid
+        _, info = s.solve(K, asm.F_free)
+    assert info.method == "gmg"

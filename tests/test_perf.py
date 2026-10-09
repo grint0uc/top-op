@@ -36,17 +36,35 @@ def test_seconds_per_iteration_and_estimate(shape, budget):
     assert est / 2 <= t <= 2 * est, f"{shape}: measured {t:.3f} s, estimate {est:.3f} s"
 
 
+# Peak RSS of the child itself: VmHWM (high-water mark of this process's address space). Not
+# ru_maxrss: on Linux exec() records the replaced address space's high-water mark into the new
+# program's ru_maxrss, and subprocess vforks, so the child reported the *pytest process's* peak
+# (2.14-2.19 GB inside the full suite, after the in-process 50x50x40 timing test above) for a run
+# that peaks at 1.1-1.3 GB. `rss0`, ru_maxrss before any allocation, shows the inherited value.
 _RSS_SCRIPT = """
 import dataclasses, json, resource, sys
+from topop.core import solver
 from topop.core.benchmarks import cantilever, cantilever_params
 from topop.core.optimize import optimize
+scale = 1 if sys.platform == "darwin" else 1024  # ru_maxrss: bytes on macOS, KiB on Linux
+rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+methods = set()
+real = solver.LinearSolver.solve
+def solve(self, *a, **k):
+    U, info = real(self, *a, **k)
+    methods.add(info.method)
+    return U, info
+solver.LinearSolver.solve = solve
 shape, dtype = tuple(json.loads(sys.argv[1])), sys.argv[2]
 p = cantilever(*shape)
-params = dataclasses.replace(cantilever_params(), max_iter=3, dtype=dtype)
-optimize(p, params)
-scale = 1 if sys.platform == "darwin" else 1024  # ru_maxrss: bytes on macOS, KiB on Linux
-print(json.dumps({"rss": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale,
-                  "nel": p.n_active}))
+optimize(p, dataclasses.replace(cantilever_params(), max_iter=3, dtype=dtype))
+try:
+    with open("/proc/self/status") as f:
+        peak = next(int(ln.split()[1]) * 1024 for ln in f if ln.startswith("VmHWM:"))
+except (OSError, StopIteration):  # not Linux: ru_maxrss (may include the parent's peak)
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+print(json.dumps({"rss": peak, "rss0": rss0, "nel": p.n_active, "methods": sorted(methods),
+                  "threads": solver.default_threads()}))
 """
 
 
@@ -62,10 +80,8 @@ def test_peak_memory_matches_estimate(dtype):
     )
     m = json.loads(out.stdout.strip().splitlines()[-1])
     est = Assembler.estimate_bytes(m["nel"], np.dtype(dtype))
-    # a memory guard may overestimate; it must not underestimate. float32 peaks measured 1.19 GB
-    # in isolation but up to 2.19 GB inside the full suite on the CI box (cause not found), so its
-    # lower bound is looser; docs/PLAN.md tells users to prefer float64 near the cap.
-    lo = 0.7 if dtype == "float64" else 0.5
-    assert lo * m["rss"] <= est <= 2.0 * m["rss"], (
-        f"RSS {m['rss'] / 1e9:.2f} GB, est {est / 1e9:.2f}"
+    # a memory guard may overestimate; it must not underestimate
+    assert 0.7 * m["rss"] <= est <= 2.0 * m["rss"], (
+        f"RSS {m['rss'] / 1e9:.2f} GB, est {est / 1e9:.2f} ({m})"
     )
+    assert m["methods"] == ["gmg"]  # a fallback (Jacobi-PCG, SA) would change the footprint

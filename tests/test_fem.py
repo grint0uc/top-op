@@ -95,6 +95,29 @@ def test_assembly_matches_naive_coo_on_irregular_domain():
         assert abs(K - K.T).max() < 1e-13
 
 
+@pytest.mark.parametrize("dtype", [np.float64, np.float32])
+def test_symmetric_map_matches_full_assembly(dtype):
+    # upper-triangle map + mirror vs the full 576-entry map, with partially fixed nodes and holes
+    rng = np.random.default_rng(8)
+    shape = (7, 5, 4)
+    prob = box_problem(shape, h=0.6, active=rng.random(shape) > 0.3)
+    nodes = np.flatnonzero(prob.active_node_mask())
+    prob.supports = [Support(nodes[:9], (True, False, True)), Support(nodes[30:34])]
+    prob.loads = [Load(nodes[-3:], (0.0, 0.0, 1.0))]
+    sym = Assembler(prob, dtype=dtype)
+    full = Assembler(prob, dtype=dtype, symmetric_map=False)
+    assert sym.symmetric_map and not full.symmetric_map
+    assert sym._P.nnz < 0.55 * full._P.nnz  # 300 of 576 entries per element (+ padding)
+    assert sym._mirror_dst.size == (sym._K.nnz - sym.n_free) // 2
+    tol = 1e-12 if dtype == np.float64 else 1e-6  # float32: summation order of the rounding
+    for _ in range(2):  # the CSR object is reused and refreshed in place
+        E = 1e-9 + rng.random(sym.n_elements) ** 3
+        Ks, Kf = sym.assemble(E), full.assemble(E)
+        assert np.array_equal(Ks.indptr, Kf.indptr) and np.array_equal(Ks.indices, Kf.indices)
+        assert np.abs(Ks.data - Kf.data).max() <= tol * np.abs(Kf.data).max()
+        assert abs(Ks - Ks.T).max() == 0  # mirrored: exactly symmetric
+
+
 def test_patch_test_constant_strain_is_exact():
     # 2x2x2 elements, one interior node; prescribe u = A x on every boundary node
     prob = box_problem((2, 2, 2), h=0.5, origin=(0.3, -0.2, 1.0), nu=0.3)
@@ -326,6 +349,41 @@ def test_band_ordering_puts_the_longest_axis_slowest():
         assert bw <= bw_nat
         assert bw <= 3 * (5 * 4 + 4 + 1) + 2  # one node slab of the 4x3 cross-section
     assert g.shape == (30, 4, 3)
+
+
+def ring_problem(radius: int, width: int, thickness: int) -> Problem:
+    n = 2 * radius + 2
+    shape = (n, n, thickness)
+    c = np.arange(n) - n / 2 + 0.5
+    r = np.hypot(*np.meshgrid(c, c, indexing="ij"))
+    active = ((r < radius) & (r > radius - width))[:, :, None] & np.ones(shape, dtype=bool)
+    prob = box_problem(shape, active=active)
+    ids = np.flatnonzero(prob.active_node_mask())
+    ix = np.unravel_index(ids, prob.grid.node_shape)[0]
+    prob.supports = [Support(ids[ix <= 2])]
+    prob.loads = [Load(ids[ix >= n - 2], (1.0, 0.0, 0.0))]
+    return prob
+
+
+def test_band_ordering_takes_rcm_on_rings_and_the_axis_sweep_on_beams():
+    from topop.core.solver import _BandCholesky
+
+    for prob, rcm_wins in ((ring_problem(16, 3, 3), True), (tip_loaded_beam(30, 4, 3), False)):
+        asm = Assembler(prob)
+        K = asm.assemble(np.ones(asm.n_elements))
+        ijk = np.stack(np.unravel_index(asm.node_ids, prob.grid.node_shape), axis=1)
+        extent = ijk.max(axis=0) - ijk.min(axis=0)
+        axes = np.argsort(-extent, kind="stable")
+        node = asm.free_dofs // 3
+        sweep = np.lexsort([asm.free_dofs % 3] + [ijk[node, a] for a in axes[::-1]])
+        bw_sweep = _BandCholesky.estimate(K, sweep)[0]
+        perm = asm.band_ordering()
+        assert np.array_equal(np.sort(perm), np.arange(asm.n_free))
+        bw = _BandCholesky.estimate(K, perm)[0]
+        if rcm_wins:  # around a ring every axis sweep cuts it twice; RCM follows the loop
+            assert bw < 0.7 * bw_sweep
+        else:
+            assert bw == bw_sweep
 
 
 @pytest.mark.parametrize("method", ["band", "band-perm", "splu", "gmg", "sa"])

@@ -46,9 +46,17 @@ except ImportError:  # pragma: no cover
 # SuperLU is single-threaded: ~0.5 s at 19k DOFs (60x20x4) but ~6 s at 41k (40x30x10, AMG ~1 s).
 # `select` keeps this split; "direct" itself prefers the banded Cholesky when it is cheap.
 DIRECT_MAX_DOFS = 20_000
-# auto: banded Cholesky (~ n bw^2 / 1.5e10 s) below this bandwidth, geometric MG (~ 9.5 us per
-# unknown) above; crossover measured on thin beams in PERF.md
-BAND_AUTO_BW = 380
+# auto: banded Cholesky from the first solve below this bandwidth (it beats geometric MG there
+# already at the first SIMP iterations; crossover measured on thin beams, PERF.md v0.3) ...
+BAND_AUTO_BW = 410
+# ... and later, when multigrid CG needs more iterations per solve (min over BAND_SWITCH_WINDOW
+# solves) than the factorization costs: band ~ BAND_US_PER_BW * bw - BAND_US_OFFSET microseconds
+# per unknown (LAPACK pbtrf, measured at bw 335-677), GMG ~ GMG_US_PER_IT per unknown and CG
+# iteration (setup not counted, so the switch is conservative). GMG's count grows as void regions
+# form (10 -> 20-50 on an 80x16x8 beam, bw 491), so thin parts end up on the band.
+BAND_US_PER_BW, BAND_US_OFFSET = 0.0285, 3.2
+GMG_US_PER_IT = 0.7
+BAND_SWITCH_WINDOW = 2
 # "direct" uses the band (instead of SuperLU) up to this n bw^2 and band storage
 BAND_MAX_WORK = 4.0e10
 BAND_MAX_BYTES = 512 * 2**20
@@ -584,6 +592,8 @@ class LinearSolver:
         self._band_key = None
         self._plan_key = None
         self._plan: str | None = None
+        self._switch_its: float | None = None  # auto: GMG -> band above this many CG its per solve
+        self._gmg_its: list[int] = []
 
     def select(self, n_free: int) -> Literal["amg", "direct"]:
         kind = self.kind
@@ -619,7 +629,8 @@ class LinearSolver:
 
         auto: banded Cholesky when the bandwidth is below BAND_AUTO_BW (both it and multigrid
         scale linearly in n there, see PERF.md), else geometric MG when prolongators are known,
-        else the old split (direct below `direct_max_dofs`, pyamg SA above).
+        else the old split (direct below `direct_max_dofs`, pyamg SA above). An auto GMG plan
+        turns into "band" once CG needs more iterations than the band would cost (`solve`).
         """
         key = (K.shape, K.nnz, id(getattr(K, "indices", None)), self.kind)
         if self._plan_key == key:
@@ -641,6 +652,10 @@ class LinearSolver:
             plan = "band" if work <= BAND_MAX_WORK and nbytes <= BAND_MAX_BYTES else "splu"
         else:
             plan = "sa"
+        self._switch_its = None
+        self._gmg_its = []
+        if self.kind == "auto" and plan == "gmg" and nbytes <= BAND_MAX_BYTES:
+            self._switch_its = (BAND_US_PER_BW * bw - BAND_US_OFFSET) / GMG_US_PER_IT
         self._plan_key, self._plan = key, plan
         return plan
 
@@ -691,12 +706,21 @@ class LinearSolver:
             X0 = None if x0 is None else np.asarray(x0).reshape(Fm.shape)
             if method == "gmg":
                 U, its, setup, method = self._gmg(K, Fm, X0, rtol)
+                self._maybe_switch_to_band(its)
             else:
                 U, its, setup = self._amg(K, Fm, X0, rigid_modes, rtol)
         self.last_method = method
         res = self._residual(K, Fm, U)
         info = SolveInfo(kind, its, res, time.perf_counter() - t0, method, rtol, setup)
         return U.reshape(F.shape), info
+
+    def _maybe_switch_to_band(self, its: int) -> None:
+        if self._switch_its is None:
+            return
+        self._gmg_its.append(its)
+        recent = self._gmg_its[-BAND_SWITCH_WINDOW:]
+        if len(recent) == BAND_SWITCH_WINDOW and min(recent) > self._switch_its:
+            self._plan, self._switch_its, self._mg = "band", None, None  # frees the hierarchy
 
     def _residual(self, K: sp.spmatrix, Fm: np.ndarray, U: np.ndarray) -> float:
         out = 0.0

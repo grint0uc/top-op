@@ -6,6 +6,7 @@ import itertools
 
 import numpy as np
 import scipy.sparse as sp
+from scipy.sparse.csgraph import reverse_cuthill_mckee
 
 from topop.core.problem import HEX8_OFFSETS, Problem
 
@@ -117,12 +118,15 @@ class Assembler:
 
     The CSR pattern of K_free and a sparse map P with K_free.data = P @ E_e are built once;
     `assemble` only refreshes the data array. The returned matrix object is reused.
+    `symmetric_map` (default): P holds only the upper-triangle entries (300 of 576 per element)
+    and the lower triangle is mirrored by a gather; False keeps the full map (reference/tests).
     """
 
-    def __init__(self, problem: Problem, dtype=np.float64):
+    def __init__(self, problem: Problem, dtype=np.float64, *, symmetric_map: bool = True):
         grid = problem.grid
         self.problem = problem
         self.dtype = np.dtype(dtype)
+        self.symmetric_map = bool(symmetric_map)
         self.h = float(grid.h)
         self.KE = hex8_stiffness(problem.material.nu)
         self.KE_h = self.h * self.KE
@@ -185,8 +189,12 @@ class Assembler:
         # element-matrix entry's CSR position is a sum of small gathered tables -- no sort.
         # The assembly map P (K entries x elements, CSR) gives K entry q with node offset d
         # exactly _STENCIL_MULT[d] slots, one per corner pair (a, b) with that offset
-        # (_PAIR_RANK); slots of missing elements stay (0, 0.0). Element and row loops run in
-        # chunks so no temporary exceeds a few MB (large temporaries are fresh mmaps per call).
+        # (_PAIR_RANK); slots of missing elements stay (0, 0.0). With the symmetric map only
+        # entries with col >= row get slots (rows of the lower triangle are empty in P) and
+        # `assemble` copies K[c, r] into K[r, c] through (_mirror_dst, _mirror_src). Element and
+        # row loops run in chunks so no temporary exceeds a few tens of MB (large temporaries are
+        # fresh mmaps per call).
+        sym = self.symmetric_map
         nel = enodes.shape[0]
         n_nodes = self.n_dof // 3
         coupled = np.zeros((n_nodes, 27), dtype=bool)
@@ -197,7 +205,8 @@ class Assembler:
         slot_of = np.cumsum(coupled, axis=1) - 1 + slot_start[:, None]
         full_ids = self.node_ids[:, None] + _stencil_full_offsets(self.problem.grid)[None, :]
         nbr = self.node_map[full_ids[coupled]]  # neighbour node of every slot
-        mult = _STENCIL_MULT[np.nonzero(coupled)[1]]  # P slots per K entry of every slot
+        soff = np.nonzero(coupled)[1]  # stencil offset of every slot
+        mult = _STENCIL_MULT[soff]  # P slots per K entry of every slot
         del full_ids
 
         free3 = free.reshape(n_nodes, 3)
@@ -215,7 +224,8 @@ class Assembler:
         keep = fm >= 0
         cols_by_node = fm[keep]  # node n's column list, concatenated over nodes
         mult_by_node = np.broadcast_to(mult[:, None], fm.shape)[keep].astype(np.int8)
-        del fm, keep, nbr, mult
+        soff_by_node = np.broadcast_to(soff[:, None], fm.shape)[keep].astype(np.int8)
+        del fm, keep, nbr, mult, soff
         node_col_start = np.concatenate([[0], np.cumsum(row_nnz)[:-1]])
         # gather index of K entry q of free row r: node_col_start[node(r)] + (q - indptr[r])
         p_len = np.empty(nnz, dtype=np.int8)
@@ -223,14 +233,35 @@ class Assembler:
         idx_dtype = np.int64 if idx64 else np.int32
         indices = np.empty(nnz, dtype=idx_dtype)
         row_node = self.free_dofs // 3
+        row_axis = self.free_dofs % 3
+        n_low = (nnz - self.n_free) // 2 if sym else 0  # strictly lower entries
+        dst = np.empty(n_low, dtype=idx_dtype)
+        src = np.empty(n_low, dtype=idx_dtype)
+        done = 0
         for lo, hi in _chunks(self.n_free, _ROW_CHUNK):
             a, b = indptr[lo], indptr[hi]
             g = np.arange(a, b) + np.repeat(
                 node_col_start[row_node[lo:hi]] - indptr[lo:hi], row_len[lo:hi]
             )
-            indices[a:b] = cols_by_node[g]
-            p_len[a:b] = mult_by_node[g]
-        del cols_by_node, mult_by_node
+            cols = cols_by_node[g]
+            indices[a:b] = cols
+            pl = mult_by_node[g]
+            if sym:
+                rows = np.repeat(np.arange(lo, hi), row_len[lo:hi])
+                k = np.flatnonzero(cols < rows)
+                pl[k] = 0
+                c, r = cols[k], rows[k]
+                # K[r, c] (r at node n, c at its neighbour m with stencil offset s) is K[c, r]:
+                # row c, slot of n in m's list (offset 26 - s), axis of r among n's free axes
+                mslot = slot_of[row_node[c], 26 - soff_by_node[g[k]].astype(np.int64)]
+                src[done : done + k.size] = (
+                    indptr[c] + col_before[mslot] + axis_before[row_node[r], row_axis[r]]
+                )
+                dst[done : done + k.size] = a + k
+                done += k.size
+            p_len[a:b] = pl
+        assert done == n_low
+        del cols_by_node, mult_by_node, soff_by_node
         p_indptr = np.zeros(nnz + 1, dtype=idx_dtype)
         np.cumsum(p_len, out=p_indptr[1:], dtype=idx_dtype)
         del p_len
@@ -244,6 +275,7 @@ class Assembler:
         axis_before = axis_before.astype(idx_dtype)
         ke = self.KE_h.astype(self.dtype).reshape(8, 3, 8, 3)
         rank = _PAIR_RANK.astype(idx_dtype)[None, :, None, :, None]
+        upper = (_UPPER if sym else np.ones((8, 3, 8, 3), dtype=bool))[None]
         for lo, hi in _chunks(nel, _ELEM_CHUNK):
             en = enodes[lo:hi]
             m = hi - lo
@@ -252,7 +284,7 @@ class Assembler:
             ab = axis_before[en]  # (m, 8, 3)
             # entry (e, a, ai, b, aj) == KE_h[3a+ai, 3b+aj]
             q = rs[:, :, :, None, None] + cb[:, :, None, :, None] + ab[:, None, None, :, :]
-            valid = (rs >= 0)[:, :, :, None, None] & free3[en][:, None, None, :, :]
+            valid = (rs >= 0)[:, :, :, None, None] & free3[en][:, None, None, :, :] & upper
             pos = p_indptr[q[valid]] + np.broadcast_to(rank, valid.shape)[valid]
             p_indices[pos] = np.broadcast_to(
                 np.arange(lo, hi, dtype=idx_dtype)[:, None, None, None, None], valid.shape
@@ -265,6 +297,7 @@ class Assembler:
         )
         self._K.has_sorted_indices = True
         self._P_blocks = None
+        self._mirror_dst, self._mirror_src = (dst, src) if sym else (None, None)
 
     @property
     def n_elements(self) -> int:
@@ -279,7 +312,24 @@ class Assembler:
             from topop.core.solver import _Blocks, default_threads
 
             self._P_blocks = _Blocks(self._P, default_threads())
-        self._P_blocks.matvec(E_e, self._K.data)
+        data = self._K.data
+        self._P_blocks.matvec(E_e, data)  # upper triangle; empty (lower) rows get 0
+        if self._mirror_dst is not None:
+            dst, src = self._mirror_dst, self._mirror_src
+
+            def mirror(a: int, b: int) -> None:  # dst (lower) and src (upper) never overlap
+                data[dst[a:b]] = data[src[a:b]]
+
+            n = dst.size
+            k = 1 if n < _MIRROR_PAR_MIN else 2 * self._P_blocks.threads
+            bounds = np.linspace(0, n, k + 1).astype(np.int64)
+            pairs = [(int(a), int(b)) for a, b in itertools.pairwise(bounds) if b > a]
+            if len(pairs) <= 1:
+                mirror(0, n)
+            else:
+                from topop.core.solver import _pool
+
+                list(_pool(self._P_blocks.threads).map(lambda ab: mirror(*ab), pairs))
         return self._K
 
     def expand(self, U_free: np.ndarray) -> np.ndarray:
@@ -323,17 +373,39 @@ class Assembler:
         return out
 
     def band_ordering(self) -> np.ndarray:
-        """Permutation of the free DOFs ordering nodes by (longest axis, middle, shortest).
+        """Permutation of the free DOFs for the banded Cholesky (nodes in order, axes within).
 
-        Gives the smallest bandwidth of the axis-sweep orderings for the banded Cholesky
-        (reverse Cuthill-McKee is ~2x wider on these grids).
+        The narrower of two node orders: sweeping the longest axis slowest (best on beams and
+        plates; reverse Cuthill-McKee is ~2x wider there) and reverse Cuthill-McKee on the node
+        graph (best on rings and curved strips, ~2x narrower). Compact parts stay wide either way.
         """
-        ijk = np.stack(np.unravel_index(self.node_ids, self.problem.grid.node_shape), axis=1)
-        extent = ijk.max(axis=0) - ijk.min(axis=0)
-        order = np.argsort(-extent, kind="stable")  # slowest first
         node = self.free_dofs // 3
-        keys = [self.free_dofs % 3] + [ijk[node, a] for a in order[::-1]]
-        return np.lexsort(keys)
+        un, inv = np.unique(node, return_inverse=True)  # free nodes, increasing
+        ijk = np.stack(np.unravel_index(self.node_ids[un], self.problem.grid.node_shape), axis=1)
+        extent = ijk.max(axis=0, initial=0) - ijk.min(axis=0, initial=0)
+        order = np.argsort(-extent, kind="stable")  # slowest first
+        sweep = np.lexsort([ijk[:, a] for a in order[::-1]])
+        best = sweep
+        if un.size > 2:
+            g = self._node_graph(un, inv)
+            rcm = reverse_cuthill_mckee(g, symmetric_mode=True)
+            if _node_bandwidth(g, rcm) < _node_bandwidth(g, sweep):
+                best = rcm
+        rank = np.empty(un.size, dtype=np.int64)
+        rank[best] = np.arange(un.size)
+        return np.lexsort([self.free_dofs % 3, rank[inv]])
+
+    def _node_graph(self, un: np.ndarray, inv: np.ndarray) -> sp.csr_matrix:
+        """Coupling graph of the free nodes `un` (K's pattern, one row per node)."""
+        K = self._K
+        first = np.flatnonzero(np.r_[True, inv[1:] != inv[:-1]])  # first free row of each node
+        lens = (K.indptr[first + 1] - K.indptr[first]).astype(np.int64)
+        idx = np.repeat(K.indptr[first].astype(np.int64) - np.cumsum(lens) + lens, lens)
+        cols = inv[K.indices[np.arange(int(lens.sum())) + idx]]
+        rows = np.repeat(np.arange(un.size), lens)
+        g = sp.csr_matrix((np.ones(cols.size, dtype=np.int8), (rows, cols)), shape=(un.size,) * 2)
+        g.sum_duplicates()
+        return g
 
     def element_energies(self, U_free: np.ndarray) -> np.ndarray:
         """(nel_active,) u_e^T (h KE) u_e summed over load cases."""
@@ -424,25 +496,28 @@ class Assembler:
     def estimate_bytes(nel_active: int, dtype=np.float64) -> int:
         """Peak bytes of a run for `nel_active` elements of a box-like domain.
 
-        Assembly map (576 entries per element plus boundary padding, CSR) + K_free + edof +
-        multigrid level 1 + work vectors + interpreter, x1.12 for allocator slack and the
-        Galerkin/pattern temporaries. Calibrated on peak RSS (docs/PERF.md: 2-6 % at 100k and
-        250k elements); thin domains have more nodes per element and need somewhat more.
+        Symmetric assembly map (~305 upper-triangle entries per element incl. boundary padding,
+        CSR with row pointers over all K entries) + mirror index pairs + K_free + edof +
+        multigrid level 1 + work vectors + interpreter, x1.15 for allocator slack and the
+        Galerkin/pattern temporaries. Calibrated on peak RSS (VmHWM, docs/PERF.md v0.3: within
+        3 % at 100k and 250k elements, both dtypes); ~30k-element runs peak up to 25 % above it
+        and thin domains (more nodes per element) somewhat above.
         """
         item = np.dtype(dtype).itemsize
         n = int(nel_active)
         nodes = n + 3 * n ** (2 / 3) + 8
         nnz = 228 * nodes  # K_free nonzeros (81 per interior DOF row)
-        entries = 583 * n
+        entries = 305 * n
         persistent = entries * (4 + item) + nnz * (8 + item)  # map, its row pointers, K
+        persistent += 4 * nnz  # mirror: (nnz - n_free) / 2 int32 pairs
         persistent += 192 * n + 900 * nodes + 0.124 * nnz * 12  # edof, vectors, MG level 1
-        return int(1.12 * persistent + 160_000_000)  # interpreter + chunk temporaries
+        return int(1.15 * persistent + 200_000_000)  # interpreter + chunk temporaries
 
 
 # (active elements, seconds per SIMP iteration averaged over a run) on full-box cantilevers,
-# 4-core CI VM, see docs/PERF.md "Time estimate"
+# 4-core CI VM without foreign load, see docs/PERF.md "Time estimate" and v0.3
 _SEC_PER_ITER = np.array(
-    [[0, 0.01], [4_800, 0.15], [12_000, 0.4], [30_000, 0.85], [100_000, 2.0], [250_000, 4.6]]
+    [[0, 0.01], [4_800, 0.14], [12_000, 0.34], [30_000, 0.7], [100_000, 1.9], [250_000, 4.4]]
 )
 
 
@@ -468,6 +543,23 @@ _PAIR_RANK = np.zeros((8, 8), dtype=np.int64)  # rank of corner pair (a, b) amon
 for _s in range(27):
     _ab = np.argwhere(_PAIR_OFFSET == _s)
     _PAIR_RANK[_ab[:, 0], _ab[:, 1]] = np.arange(len(_ab))
+
+
+# (8, 3, 8, 3): element-matrix entries (a, ai, b, aj) on or above K's diagonal. Free DOFs are
+# ordered by (node, axis) and node ids increase with the stencil offset, so this depends only
+# on the corner pair: b's node after a's, or the same node and aj >= ai (300 of 576 entries)
+_UPPER = (_PAIR_OFFSET > 13)[:, None, :, None] | (
+    (np.arange(8)[:, None] == np.arange(8)[None, :])[:, None, :, None]
+    & (np.arange(3)[None, :, None, None] <= np.arange(3)[None, None, None, :])
+)
+_MIRROR_PAR_MIN = 200_000  # lower-triangle entries below which the mirror gather runs serially
+
+
+def _node_bandwidth(g: sp.csr_matrix, order: np.ndarray) -> int:
+    rank = np.empty(g.shape[0], dtype=np.int64)
+    rank[order] = np.arange(g.shape[0])
+    rows = np.repeat(rank, np.diff(g.indptr))
+    return int(np.abs(rank[g.indices] - rows).max(initial=0))
 
 
 def _chunks(n: int, size: int):
