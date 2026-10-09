@@ -286,3 +286,18 @@ def test_am_base_plate_is_first_active_layer():
             - np.sum(w * AMFilter(active, "+z").apply(xm))
         ) / (2 * h)
         assert abs(fd - g[i]) <= 1e-6 * max(1.0, abs(fd))
+
+
+@pytest.mark.parametrize("rmin", [2.5, 3.0, 4.5])
+def test_fft_filtered_densities_stay_in_unit_interval(rmin):
+    # FFT round-off put ~1e-17 below 0 far from any solid (and above 1 inside it)
+    rng = np.random.default_rng(int(10 * rmin))
+    active = irregular_active(5)
+    filt = DensityFilter(SHAPE, rmin, active)
+    assert filt.use_fft
+    for density in (0.002, 0.05, 0.5, 1.0):
+        x = (rng.random(SHAPE) < density).astype(np.float64)
+        y = filt.apply(x)
+        assert y.min() >= 0.0 and y.max() <= 1.0
+    x = rng.random(SHAPE)
+    assert filt.apply(x).min() >= 0.0

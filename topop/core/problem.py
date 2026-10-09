@@ -139,11 +139,17 @@ class Problem:
         return 1 + max((ld.case for ld in self.loads), default=0)
 
     def active_node_mask(self) -> np.ndarray:
-        """bool (n_nodes,): nodes touched by at least one active element."""
-        en = self.grid.element_nodes()[self.active.ravel()]
-        mask = np.zeros(self.grid.n_nodes, dtype=bool)
-        mask[en.ravel()] = True
-        return mask
+        """bool (n_nodes,): nodes touched by at least one active element.
+
+        OR of the 8 shifted copies of the zero-padded active mask: ~2 bytes per node, no
+        (nel, 8) connectivity table.
+        """
+        nx, ny, nz = self.grid.shape
+        pad = np.pad(np.asarray(self.active, dtype=bool), 1)
+        mask = np.zeros(self.grid.node_shape, dtype=bool)
+        for dx, dy, dz in HEX8_OFFSETS.tolist():
+            mask |= pad[dx : dx + nx + 1, dy : dy + ny + 1, dz : dz + nz + 1]
+        return mask.ravel()
 
     def validate(self) -> list[str]:
         """Return human-readable problems. Empty list == runnable."""
@@ -196,22 +202,21 @@ class Problem:
         nodes = np.flatnonzero(fixed.any(axis=1))
         if nodes.size == 0:
             return ["supports fix no DOF"]
-        xyz = self.grid.node_coords()[nodes] - self.grid.node_coords()[nodes].mean(axis=0)
-        # rigid modes restricted to the fixed DOFs: 3 translations + 3 rotations (r x e_k)
-        rows = []
-        for node_i, (x, y, z) in enumerate(xyz):
-            for axis in range(3):
-                if not fixed[nodes[node_i], axis]:
-                    continue
-                t = np.zeros(6)
-                t[axis] = 1.0
-                # rotation about x: (0, -z, y); about y: (z, 0, -x); about z: (-y, x, 0)
-                rot = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
-                t[3:] = rot[axis]
-                rows.append(t)
-        rank = np.linalg.matrix_rank(
-            np.asarray(rows), tol=1e-9 * max(1.0, float(np.abs(xyz).max()))
+        ijk = np.stack(np.unravel_index(nodes, self.grid.node_shape), axis=1)
+        xyz = self.grid.h * ijk.astype(np.float64)  # the origin drops out of the centering
+        xyz -= xyz.mean(axis=0)
+        x, y, z = xyz.T
+        zero = np.zeros_like(x)
+        # rigid modes restricted to the fixed DOFs: 3 translations + 3 rotations (r x e_k);
+        # rotation about x: (0, -z, y); about y: (z, 0, -x); about z: (-y, x, 0)
+        rows = np.zeros((nodes.size, 3, 6))
+        rows[:, [0, 1, 2], [0, 1, 2]] = 1.0
+        rows[:, :, 3:] = np.stack(
+            [np.stack([zero, z, -y], 1), np.stack([-z, zero, x], 1), np.stack([y, -x, zero], 1)],
+            axis=2,
         )
+        rows = rows[fixed[nodes]]
+        rank = np.linalg.matrix_rank(rows, tol=1e-9 * max(1.0, float(np.abs(xyz).max())))
         if rank < 6:
             msg = f"supports leave {6 - rank} rigid-body mode(s) free (rank {rank}/6)"
             return [msg + ": fix more directions or a second region"]

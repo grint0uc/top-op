@@ -260,3 +260,14 @@ def test_vti_and_npz_carry_an_optional_stress_field(box_case):
     with np.load(io.BytesIO(old)) as z:
         assert "stress" not in z.files
     assert from_npz_bytes(old, with_stress=True)[4] is None
+
+
+def test_truncated_or_corrupt_npz_is_a_value_error():
+    grid = Grid((0.0, 0.0, 0.0), 1.0, (3, 2, 2))
+    data = to_npz_bytes(np.full(grid.shape, 0.5), grid, np.ones(grid.shape, bool),
+                        np.zeros(grid.shape, np.int8))  # fmt: skip
+    for bad in (data[: len(data) // 2], data[:-10], b"", b"PK\x03\x04garbage"):
+        with pytest.raises(ValueError, match="unreadable result archive"):
+            from_npz_bytes(bad)
+        with pytest.raises(ValueError):
+            from_npz_bytes(bad, with_stress=True)

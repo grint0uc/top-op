@@ -287,3 +287,29 @@ def test_auto_switches_to_the_band_when_multigrid_cg_gets_expensive(monkeypatch)
     for _ in range(3):  # an explicit "amg" stays on multigrid
         _, info = s.solve(K, asm.F_free)
     assert info.method == "gmg"
+
+
+@pytest.mark.parametrize("path", ["band", "splu"])
+def test_singular_stiffness_is_an_error_not_garbage(path, monkeypatch):
+    # roller-only support (z on the bottom face) bypassing validate(): K has 3 free rigid-body
+    # modes and the x load drives one of them. The factorizations used to "succeed".
+    import topop.core.solver as solver_mod
+
+    p = cantilever(8, 4, 4)
+    g = p.grid
+    ii, jj = np.meshgrid(np.arange(9), np.arange(5), indexing="ij")
+    bottom = g.node_ids(ii, jj, np.zeros_like(ii)).ravel()
+    p.supports = [type(p.supports[0])(nodes=bottom, fix=(False, False, True))]
+    p.loads = [type(p.loads[0])(nodes=p.loads[0].nodes, force=(1.0, 0.0, -1.0))]
+    if path == "splu":
+        monkeypatch.setattr(solver_mod, "BAND_MAX_WORK", 0.0)
+    A = Assembler(p)
+    K = A.assemble(np.ones(A.n_elements))
+    s = LinearSolver("direct", ordering=A.band_ordering)
+    with pytest.raises(np.linalg.LinAlgError, match="singular or badly conditioned"):
+        s.solve(K, A.F_free)
+    # a consistent load (orthogonal to the free modes) still solves: u is defined up to them
+    p.loads = [type(p.loads[0])(nodes=p.loads[0].nodes, force=(0.0, 0.0, -1.0))]
+    A = Assembler(p)
+    U, info = LinearSolver("direct").solve(A.assemble(np.ones(A.n_elements)), A.F_free)
+    assert info.residual < 1e-9 and np.isfinite(U).all()

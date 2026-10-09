@@ -535,3 +535,36 @@ def test_gmg_on_irregular_domain_with_roller_supports():
     U, info = s.solve(K, asm.F_free)
     assert info.method == "gmg" and len(s._mg.levels) >= 2
     assert np.allclose(U[:, 0], ref, rtol=1e-5, atol=1e-6 * np.abs(ref).max())
+
+
+def test_estimate_bytes_counts_load_cases():
+    n = 100_000
+    one = Assembler.estimate_bytes(n, np.float64)
+    assert Assembler.estimate_bytes(n, np.float64, n_cases=1) == one  # calibration unchanged
+    two, sixteen = (Assembler.estimate_bytes(n, np.float64, n_cases=c) for c in (2, 16))
+    assert one < two < sixteen
+    # each extra case: dense float64 F/U columns over ~3 DOFs per node, several copies
+    assert two - one > 3 * 8 * n
+
+
+def test_assembler_products_run_with_blas_pinned():
+    # the chunked GEMMs wake OpenBLAS's pool (~8 ms per call under load) unless pinned
+    with _BLAS:  # discovers the OpenBLAS copies
+        pass
+    if not _BLAS._fns:
+        pytest.skip("no OpenBLAS loaded (nothing to pin)")
+    seen: list[list[int]] = []
+
+    class Probe(np.ndarray):
+        def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+            seen.append([get() for get, _ in (_BLAS._fns or [])])
+            return getattr(ufunc, method)(*(np.asarray(x) for x in inputs), **kwargs)
+
+    A = Assembler(cantilever(6, 3, 3))
+    A.KE_h, A._KS = A.KE_h.view(Probe), A._KS.view(Probe)
+    U = np.random.default_rng(0).standard_normal(A.n_free)
+    A.element_energies(U)
+    A.element_energies_and_stress(U)
+    A.element_cross_energies(U, U)
+    assert len(seen) == 3
+    assert all(n == _BLAS.n for threads in seen for n in threads)

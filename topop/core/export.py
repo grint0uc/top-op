@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import io
 import warnings
+import zipfile
+import zlib
 from collections.abc import Sequence
 from typing import Literal, overload
 
@@ -180,17 +182,21 @@ def from_npz_bytes(
 ) -> tuple[np.ndarray, Grid, np.ndarray, np.ndarray, np.ndarray | None]: ...
 def from_npz_bytes(data: bytes, with_stress: bool = False) -> tuple:
     """Inverse of `to_npz_bytes`: (rho, grid, active, passive), plus the stress array (None when
-    the archive has none) as a fifth item with `with_stress=True`."""
-    with np.load(io.BytesIO(data), allow_pickle=False) as z:
-        grid = Grid(
-            origin=tuple(float(v) for v in z["origin"]),
-            h=float(z["h"]),
-            shape=tuple(int(v) for v in z["shape"]),
-        )
-        out = (z["rho"], grid, z["active"], z["passive"])
-        if not with_stress:
-            return out
-        return (*out, z["stress"] if "stress" in z.files else None)
+    the archive has none) as a fifth item with `with_stress=True`.
+
+    ValueError if the archive is unreadable (truncated, corrupt, missing arrays)."""
+    try:
+        with np.load(io.BytesIO(data), allow_pickle=False) as z:
+            grid = Grid(
+                origin=tuple(float(v) for v in z["origin"]),
+                h=float(z["h"]),
+                shape=tuple(int(v) for v in z["shape"]),
+            )
+            out = (z["rho"], grid, z["active"], z["passive"])
+            stress = z["stress"] if with_stress and "stress" in z.files else None
+    except (OSError, KeyError, ValueError, EOFError, zipfile.BadZipFile, zlib.error) as exc:
+        raise ValueError(f"unreadable result archive: {exc}") from exc
+    return (*out, stress) if with_stress else out
 
 
 # ---- headless renderer ---------------------------------------------------------------------------

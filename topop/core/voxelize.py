@@ -60,7 +60,23 @@ def load_mesh(src: str | bytes | os.PathLike, file_type: str | None = None) -> t
     mesh.remove_unreferenced_vertices()
     if len(mesh.faces) == 0:
         raise ValueError("mesh has no (non-degenerate) faces")
+    orient_outward(mesh)
     return mesh
+
+
+def orient_outward(mesh: trimesh.Trimesh) -> None:
+    """Closed meshes in place: consistent winding, then normals pointing out (volume > 0).
+
+    Only flips the vertex order of triangles, so face ids are unchanged. Open meshes are left
+    alone (no inside to point away from). A closed mesh with several bodies is inverted as a whole
+    only when its total volume is negative: a single inverted shell may be an intended cavity.
+    """
+    if not mesh.is_watertight:
+        return
+    if not mesh.is_winding_consistent:
+        trimesh.repair.fix_winding(mesh)
+    if mesh.is_winding_consistent and mesh.volume < 0:
+        mesh.invert()
 
 
 def mesh_info(mesh: trimesh.Trimesh) -> dict:
@@ -323,6 +339,25 @@ def _union_bounds(meshes: Sequence[trimesh.Trimesh]) -> np.ndarray:
     return np.stack([bb[:, 0].min(0), bb[:, 1].max(0)])
 
 
+def domain_grid(
+    design_mesh: trimesh.Trimesh,
+    ref_models: Sequence[tuple[trimesh.Trimesh, str]],
+    elements_along_longest: int,
+    padding: int = 1,
+) -> Grid:
+    """The grid `build_domain` voxelizes onto (cheap: bounds only, nothing is allocated).
+
+    Grid = union of design and keep_in bounds (keep_out never extends it).
+    """
+    for _, mode in ref_models:
+        if mode not in ("keep_in", "keep_out"):
+            raise ValueError(f"unknown reference-model mode {mode!r}")
+    keep_in = [m for m, mode in ref_models if mode == "keep_in" and len(m.faces)]
+    return Grid.from_bounds(
+        _union_bounds([design_mesh, *keep_in]), elements_along_longest, padding=padding
+    )
+
+
 def build_domain(
     design_mesh: trimesh.Trimesh,
     ref_models: Sequence[tuple[trimesh.Trimesh, str]],
@@ -331,17 +366,12 @@ def build_domain(
 ) -> tuple[Grid, np.ndarray, np.ndarray, list[str]]:
     """World-space meshes -> (grid, active, passive, warnings).
 
-    Grid = union of design and keep_in bounds (keep_out never extends it).
-    active = design ∪ keep_in, minus keep_out; passive = 1 on keep_in, 0 elsewhere.
+    Grid = `domain_grid`. active = design ∪ keep_in, minus keep_out; passive = 1 on keep_in,
+    0 elsewhere.
     """
-    for _, mode in ref_models:
-        if mode not in ("keep_in", "keep_out"):
-            raise ValueError(f"unknown reference-model mode {mode!r}")
+    grid = domain_grid(design_mesh, ref_models, elements_along_longest, padding)
     keep_in = [m for m, mode in ref_models if mode == "keep_in" and len(m.faces)]
     keep_out = [m for m, mode in ref_models if mode == "keep_out" and len(m.faces)]
-    grid = Grid.from_bounds(
-        _union_bounds([design_mesh, *keep_in]), elements_along_longest, padding=padding
-    )
     warnings: list[str] = []
     active, w = voxelize_mesh(design_mesh, grid)
     warnings += [f"design: {s}" for s in w]

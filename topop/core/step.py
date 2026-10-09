@@ -12,6 +12,8 @@ import io
 import json
 import os
 import tempfile
+import zipfile
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +30,12 @@ INSTALL_HINT = (
 )
 META_FACETS = "step_facets"  # mesh.metadata: FacetInfo dicts, area-sorted, id = rank
 META_FACE_TO_FACET = "step_facet_of_face"  # mesh.metadata: facet id of every triangle
+# bump when the tessellation or the face table changes for the same file and parameters
+# (`load_step` defaults, merge tolerance, face properties): older `.brep.npz` caches are then stale
+STEP_CACHE_VERSION = 2
+DEFAULT_ANGULAR_TOLERANCE_DEG = 5.0
+# what np.load / zipfile raise on truncated or corrupted archives
+_NPZ_ERRORS = (OSError, KeyError, ValueError, EOFError, zipfile.BadZipFile, zlib.error)
 
 _HEADER = b"ISO-10303-21"
 _EXTENSIONS = {".step", ".stp"}
@@ -55,6 +63,9 @@ class StepMesh:
     # one dict per B-rep face (list index = brep_face): brep_face, kind plane|cylinder|other, area,
     # normal (outward, plane only), centroid, bbox, axis + radius (cylinder only)
     faces: list[dict] = field(default_factory=list)
+    # `load_step` arguments that produced the tessellation (tolerance None = the default)
+    tolerance: float | None = None
+    angular_tolerance_deg: float = DEFAULT_ANGULAR_TOLERANCE_DEG
 
     def __post_init__(self) -> None:
         facets, face_to_facet = self.facets()
@@ -81,8 +92,18 @@ class StepMesh:
         ]
         return facets, rank[self.brep_faces]
 
+    @staticmethod
+    def cache_key(tolerance: float | None, angular_tolerance_deg: float) -> dict:
+        return {
+            "version": STEP_CACHE_VERSION,
+            "tolerance": None if tolerance is None else float(tolerance),
+            "angular_tolerance_deg": float(angular_tolerance_deg),
+        }
+
     def to_npz_bytes(self) -> bytes:
-        """Exact tessellation + face table (float64, unlike an STL), so reloads keep ids aligned."""
+        """Exact tessellation + face table (float64, unlike an STL), so reloads keep ids aligned.
+
+        Also records `STEP_CACHE_VERSION` and the tessellation parameters (`from_npz_bytes`)."""
         buf = io.BytesIO()
         np.savez_compressed(
             buf,
@@ -90,21 +111,39 @@ class StepMesh:
             triangles=np.asarray(self.mesh.faces, dtype=np.int64),
             brep_faces=self.brep_faces.astype(np.int32),
             faces_json=np.array(json.dumps(self.faces)),
+            cache_json=np.array(
+                json.dumps(self.cache_key(self.tolerance, self.angular_tolerance_deg))
+            ),
         )
         return buf.getvalue()
 
     @classmethod
-    def from_npz_bytes(cls, data: bytes) -> StepMesh:
+    def from_npz_bytes(
+        cls,
+        data: bytes,
+        tolerance: float | None = None,
+        angular_tolerance_deg: float = DEFAULT_ANGULAR_TOLERANCE_DEG,
+    ) -> StepMesh:
+        """Inverse of `to_npz_bytes`. ValueError if the bytes are unreadable (truncated, corrupt)
+        or inconsistent, and ValueError("stale cache ...") if they were written by another
+        `STEP_CACHE_VERSION` or with other `load_step` parameters than the ones given here: the
+        caller re-tessellates in every case."""
         try:
             with np.load(io.BytesIO(data), allow_pickle=False) as z:
+                key = json.loads(str(z["cache_json"])) if "cache_json" in z.files else None
                 mesh = trimesh.Trimesh(z["vertices"], z["triangles"], process=False)
                 brep = np.asarray(z["brep_faces"], dtype=np.int64)
                 faces = json.loads(str(z["faces_json"]))
-        except (OSError, KeyError, ValueError) as exc:
+        except _NPZ_ERRORS as exc:
             raise ValueError(f"unreadable STEP tessellation cache: {exc}") from exc
-        if len(brep) != len(mesh.faces) or (len(brep) and brep.max() >= len(faces)):
+        want = cls.cache_key(tolerance, angular_tolerance_deg)
+        if key != want:
+            raise ValueError(f"stale cache: written for {key}, wanted {want}")
+        if not isinstance(faces, list) or len(brep) != len(mesh.faces):
             raise ValueError("STEP tessellation cache is inconsistent")
-        return cls(mesh, brep, faces)
+        if len(brep) and (brep.min() < 0 or brep.max() >= len(faces)):
+            raise ValueError("STEP tessellation cache is inconsistent")
+        return cls(mesh, brep, faces, tolerance, float(angular_tolerance_deg))
 
 
 def facet_triangles(
@@ -241,7 +280,7 @@ def _merge_vertices(
 def load_step(
     src: str | bytes | os.PathLike,
     tolerance: float | None = None,
-    angular_tolerance_deg: float = 5.0,
+    angular_tolerance_deg: float = DEFAULT_ANGULAR_TOLERANCE_DEG,
 ) -> StepMesh:
     """Read a STEP file (path, or the file's bytes) and tessellate every B-rep face.
 
@@ -314,4 +353,4 @@ def load_step(
     owner = owner[keep]
     if len(mesh.faces) == 0:
         raise ValueError("mesh has no (non-degenerate) faces")
-    return StepMesh(mesh, owner, rows)
+    return StepMesh(mesh, owner, rows, tolerance, float(angular_tolerance_deg))

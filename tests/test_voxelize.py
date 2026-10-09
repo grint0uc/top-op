@@ -284,3 +284,34 @@ def test_domain_stats(cantilever):
 
     passive[16, 6, 6] = -1
     assert domain_stats(grid, active, passive)["n_passive_void"] == 1
+
+
+def _stl(mesh: trimesh.Trimesh) -> bytes:
+    return trimesh.exchange.stl.export_stl(mesh)
+
+
+def test_inside_out_mesh_is_turned_outward_keeping_face_ids():
+    from topop.core.selection import node_xyz, resolve_selection
+
+    inv = trimesh.creation.box((4.0, 2.0, 1.0))
+    inv.invert()  # closed and consistently wound, normals pointing in
+    assert inv.volume < 0
+    m = load_mesh(_stl(inv), "stl")
+    assert m.volume == pytest.approx(8.0) and mesh_info(m)["volume"] == pytest.approx(8.0)
+    assert np.allclose(m.triangles_center, inv.triangles_center)  # same face ids
+    grid, active, _, _ = build_domain(m, [], 20, 1)
+    sel = {"kind": "normal", "mesh_id": "d", "direction": [0, 0, 1], "angle_deg": 10}
+    z = node_xyz(grid, resolve_selection(sel, grid, active, {"d": m}))[:, 2]
+    assert z.size and np.allclose(z, 0.5, atol=grid.h / 2)  # the top face, not the bottom
+
+
+def test_inconsistent_winding_of_a_closed_mesh_is_repaired():
+    box = trimesh.creation.box((3.0, 2.0, 1.0))
+    faces = np.asarray(box.faces).copy()
+    faces[[0, 5, 7]] = faces[[0, 5, 7]][:, ::-1]
+    bad = trimesh.Trimesh(box.vertices, faces, process=False)
+    assert bad.is_watertight and not bad.is_winding_consistent
+    m = load_mesh(_stl(bad), "stl")
+    assert m.is_winding_consistent and m.volume == pytest.approx(6.0)
+    assert np.allclose(m.triangles_center, bad.triangles_center)
+    assert np.allclose(m.face_normals, box.face_normals)  # all outward again

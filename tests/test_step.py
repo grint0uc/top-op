@@ -446,3 +446,60 @@ def test_cli_describe_step(step_path: Path, data_dir: Path, capsys):
     out = capsys.readouterr().out
     assert "bracket.step" in out and "watertight True" in out
     assert "bbox min (0, 0, 0)  max (80, 60, 60)" in out
+
+
+def _tiny_step_mesh(**kw) -> StepMesh:
+    import trimesh
+
+    m = trimesh.creation.box()
+    face = {"brep_face": 0, "kind": "other", "area": 6.0, "normal": [0, 0, 0],
+            "centroid": [0, 0, 0], "bbox": [[0, 0, 0], [1, 1, 1]], "axis": None, "radius": None}  # fmt: skip
+    return StepMesh(m, np.zeros(len(m.faces), np.int64), [face], **kw)
+
+
+def test_truncated_tessellation_cache_is_a_value_error():
+    # works without OpenCascade: the store falls back to tessellating the original again
+    data = _tiny_step_mesh().to_npz_bytes()
+    assert len(StepMesh.from_npz_bytes(data).mesh.faces) == 12
+    for bad in (data[: len(data) // 2], data[:-5], b"PK\x03\x04", b""):
+        with pytest.raises(ValueError, match="unreadable STEP tessellation cache"):
+            StepMesh.from_npz_bytes(bad)
+
+
+def test_tessellation_cache_is_stale_for_other_parameters_or_versions(monkeypatch):
+    import io
+
+    import topop.core.step as step_mod
+
+    data = _tiny_step_mesh().to_npz_bytes()  # default parameters, as the store writes it
+    StepMesh.from_npz_bytes(data)
+    with pytest.raises(ValueError, match="stale cache"):
+        StepMesh.from_npz_bytes(data, tolerance=0.5)
+    with pytest.raises(ValueError, match="stale cache"):
+        StepMesh.from_npz_bytes(data, angular_tolerance_deg=20)
+    fine = _tiny_step_mesh(tolerance=0.5, angular_tolerance_deg=20).to_npz_bytes()
+    assert StepMesh.from_npz_bytes(fine, tolerance=0.5, angular_tolerance_deg=20).tolerance == 0.5
+    monkeypatch.setattr(step_mod, "STEP_CACHE_VERSION", step_mod.STEP_CACHE_VERSION + 1)
+    with pytest.raises(ValueError, match="stale cache"):
+        StepMesh.from_npz_bytes(data)
+    # a cache from before the key existed
+    with np.load(io.BytesIO(data)) as z:
+        old = {k: z[k] for k in z.files if k != "cache_json"}
+    buf = io.BytesIO()
+    np.savez_compressed(buf, **old)
+    with pytest.raises(ValueError, match="stale cache"):
+        StepMesh.from_npz_bytes(buf.getvalue())
+
+
+def test_store_retessellates_a_stale_cache(step_path: Path, data_dir: Path, monkeypatch):
+    import topop.core.step as step_mod
+
+    store = Store(data_dir)
+    info = store.add_mesh(step_path.read_bytes(), "bracket.step")
+    npz = store.mesh_dir / f"{info.id}.brep.npz"
+    before = npz.read_bytes()
+    monkeypatch.setattr(step_mod, "STEP_CACHE_VERSION", step_mod.STEP_CACHE_VERSION + 1)
+    fresh = Store(data_dir)
+    assert fresh.mesh_info(info.id) == info
+    assert npz.read_bytes() != before  # rewritten under the new version
+    assert StepMesh.from_npz_bytes(npz.read_bytes()).mesh.faces.shape == (info.n_faces, 3)

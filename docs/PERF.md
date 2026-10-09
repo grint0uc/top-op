@@ -327,10 +327,15 @@ call waits for its workers. Median of 200 calls under load:
 `LinearSolver.solve` pins OpenBLAS only for the duration of a solve. This is why the gap starts at
 ~10k free elements (60x20x4 has 4 800 and never pays it) and why it comes and goes with load.
 30x20x20, 8 iterations, ~2.4 foreign cores: 0.62-0.76 s/it as shipped, 0.30-0.32 s/it with the
-whole `optimize` call inside `with solver._BLAS:`. On a quiet box the difference is ~10 %. The fix
-belongs in `optimize.py`, which is outside this work package: run the iteration loop inside
-`with _BLAS:`, which is re-entrant. Unpinned GEMMs elsewhere (element energies) are one call per
-32k elements and matter much less.
+whole `optimize` call inside `with solver._BLAS:`. On a quiet box the difference is ~10 %.
+
+Fixed where the BLAS calls are, not with a loop-wide pin (a process-wide setting held for the whole
+run): the OC volume bisection uses `einsum` instead of a `ddot`, and the Assembler's per-iteration
+chunked GEMMs (`element_energies`, `element_energies_and_stress`, `element_stress`,
+`von_mises_gradient`, `element_cross_energies`, and `assemble`) run under `fem._blas_pinned`,
+i.e. `with solver._BLAS:` (re-entrant), ~8 ms -> 0.74 ms per call under load. 30x20x20, 12
+iterations, ~1.5 foreign cores: 0.307 s/it with only the solve pinned, 0.285-0.292 s/it with the
+Assembler methods pinned, the same as with the whole `optimize` call pinned (0.282-0.289).
 
 **(a) Reverse Cuthill-McKee.** Bandwidth in DOFs: axis sweep / RCM on the node graph:
 

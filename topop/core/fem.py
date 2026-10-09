@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import itertools
 
 import numpy as np
@@ -9,6 +10,7 @@ import scipy.sparse as sp
 from scipy.sparse.csgraph import reverse_cuthill_mckee
 
 from topop.core.problem import HEX8_OFFSETS, Problem
+from topop.core.solver import _BLAS
 
 # natural coordinates (+-1) of the 8 nodes, HEX8_OFFSETS order
 _SIGNS = (2 * HEX8_OFFSETS - 1).astype(np.float64)
@@ -111,6 +113,18 @@ def interpolation_1d(n: int) -> tuple[sp.csr_matrix, int]:
     cols = np.concatenate([ev // 2, od // 2, od // 2 + 1])
     vals = np.concatenate([np.ones(ev.size), np.full(2 * od.size, 0.5)])
     return sp.csr_matrix((vals, (rows, cols)), shape=(n + 1, nc + 1)), nc
+
+
+def _blas_pinned(fn):
+    """Run an Assembler method with OpenBLAS pinned (`solver._BLAS`, re-entrant): its chunked
+    (32k x 24) GEMMs wake a multithreaded pool for ~8 ms per call under load, vs ~0.7 ms pinned."""
+
+    @functools.wraps(fn)
+    def pinned(*args, **kwargs):
+        with _BLAS:
+            return fn(*args, **kwargs)
+
+    return pinned
 
 
 class Assembler:
@@ -303,6 +317,7 @@ class Assembler:
     def n_elements(self) -> int:
         return int(self.element_ids.size)
 
+    @_blas_pinned
     def assemble(self, E_e: np.ndarray) -> sp.csr_matrix:
         """K restricted to free DOFs for per-active-element moduli E_e (h scaling included)."""
         E_e = np.asarray(E_e, dtype=self.dtype)
@@ -407,6 +422,7 @@ class Assembler:
         g.sum_duplicates()
         return g
 
+    @_blas_pinned
     def element_energies(self, U_free: np.ndarray) -> np.ndarray:
         """(nel_active,) u_e^T (h KE) u_e summed over load cases."""
         U = self.expand(U_free)
@@ -420,6 +436,7 @@ class Assembler:
                 out[lo:hi] += np.einsum("ij,ij->i", ue @ self.KE_h, ue)
         return out
 
+    @_blas_pinned
     def element_stress(self, U_free: np.ndarray, E_e: np.ndarray | None = None) -> np.ndarray:
         """Voigt stress (xx, yy, zz, xy, yz, zx) at the element centers.
 
@@ -438,6 +455,7 @@ class Assembler:
             out *= np.asarray(E_e, dtype=np.float64)[None, :, None]
         return out[0] if U_free.ndim == 1 else out
 
+    @_blas_pinned
     def element_energies_and_stress(self, U_free: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """`element_energies(U_free)` and the solid stress (n_cases, nel, 6) from one gather
         and one (24 x 30) product per chunk."""
@@ -455,6 +473,7 @@ class Assembler:
                 sigma[c, lo:hi] = t[:, 24:]
         return energies, sigma
 
+    @_blas_pinned
     def von_mises_gradient(self, sigma: np.ndarray, weights: np.ndarray) -> np.ndarray:
         """d/dU_free of sum_e weights[e] * von_mises(sigma[e]) for the solid stress sigma.
 
@@ -478,6 +497,7 @@ class Assembler:
         out = out[self.free]
         return out[:, 0] if single else out
 
+    @_blas_pinned
     def element_cross_energies(self, U_free: np.ndarray, V_free: np.ndarray) -> np.ndarray:
         """(nel_active,) u_e^T (h KE) v_e summed over load cases (columns of U and V)."""
         U, V = self.expand(U_free), self.expand(V_free)
@@ -493,7 +513,7 @@ class Assembler:
         return out
 
     @staticmethod
-    def estimate_bytes(nel_active: int, dtype=np.float64) -> int:
+    def estimate_bytes(nel_active: int, dtype=np.float64, n_cases: int = 1) -> int:
         """Peak bytes of a run for `nel_active` elements of a box-like domain.
 
         Symmetric assembly map (~305 upper-triangle entries per element incl. boundary padding,
@@ -502,6 +522,8 @@ class Assembler:
         Galerkin/pattern temporaries. Calibrated on peak RSS (VmHWM, docs/PERF.md v0.3: within
         3 % at 100k and 250k elements, both dtypes); ~30k-element runs peak up to 25 % above it
         and thin domains (more nodes per element) somewhat above.
+        Every load case beyond the first adds dense float64 columns (F, F_free, U, the expanded
+        U, warm start: ~6 x 3 DOFs per node) and its stress block (6 per element).
         """
         item = np.dtype(dtype).itemsize
         n = int(nel_active)
@@ -511,6 +533,7 @@ class Assembler:
         persistent = entries * (4 + item) + nnz * (8 + item)  # map, its row pointers, K
         persistent += 4 * nnz  # mirror: (nnz - n_free) / 2 int32 pairs
         persistent += 192 * n + 900 * nodes + 0.124 * nnz * 12  # edof, vectors, MG level 1
+        persistent += max(0, int(n_cases) - 1) * (6 * 3 * 8 * nodes + 6 * 8 * n)
         return int(1.15 * persistent + 200_000_000)  # interpreter + chunk temporaries
 
 

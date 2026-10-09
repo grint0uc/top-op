@@ -481,7 +481,7 @@ def optimize(
         raise ValueError(f"unknown optimizer {params.optimizer!r}")
     if params.stress_limit is not None and not params.stress_limit > 0:
         raise ValueError("stress_limit must be positive")
-    need = Assembler.estimate_bytes(problem.n_active, np.dtype(params.dtype))
+    need = Assembler.estimate_bytes(problem.n_active, np.dtype(params.dtype), problem.n_cases)
     if need > params.memory_cap_bytes:
         raise MemoryError(
             f"{problem.n_active} active elements need about {need / 1e9:.2f} GB, above the "

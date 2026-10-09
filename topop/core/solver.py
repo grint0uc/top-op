@@ -77,6 +77,10 @@ LMAX_BOOST = 1.1
 # fallback chain of a broken-down geometric-MG CG, in escalation order (SolveInfo.method)
 GMG_METHODS = ("gmg", "gmg-restart", "gmg-safe", "jacobi-pcg")
 JACOBI_MAXITER_FACTOR = 5  # Jacobi-PCG (last resort) gets this many times `maxiter`
+# a direct solve whose relative residual exceeds this came from a (numerically) singular K:
+# LAPACK/SuperLU happily factor a matrix with a free rigid-body mode and return garbage
+DIRECT_MAX_RESIDUAL = 1e-6
+SINGULAR_MESSAGE = "stiffness matrix is singular or badly conditioned: check supports"
 
 
 @dataclass
@@ -711,6 +715,8 @@ class LinearSolver:
                 U, its, setup = self._amg(K, Fm, X0, rigid_modes, rtol)
         self.last_method = method
         res = self._residual(K, Fm, U)
+        if kind == "direct" and not res <= DIRECT_MAX_RESIDUAL:
+            raise np.linalg.LinAlgError(f"{SINGULAR_MESSAGE} (relative residual {res:.1e})")
         info = SolveInfo(kind, its, res, time.perf_counter() - t0, method, rtol, setup)
         return U.reshape(F.shape), info
 
@@ -733,17 +739,21 @@ class LinearSolver:
             fn = float(np.linalg.norm(f))
             u = np.asarray(U[:, c], dtype=np.float64)
             r = f - (blk.matvec(u, y) if K.dtype == np.float64 else blk.matvec64(u, y))
-            out = max(out, float(np.linalg.norm(r)) / (fn if fn > 0 else 1.0))
+            rel = float(np.linalg.norm(r)) / (fn if fn > 0 else 1.0)
+            out = max(out, rel if np.isfinite(rel) else float("inf"))  # max() drops a NaN
         return out
 
     def _direct(self, K: sp.spmatrix, F: np.ndarray) -> np.ndarray:
         # K is SPD: symmetric mode without pivoting, minimum degree on A^T + A
-        lu = sla.splu(
-            sp.csc_matrix(K, dtype=np.float64),
-            permc_spec="MMD_AT_PLUS_A",
-            diag_pivot_thresh=0.0,
-            options={"SymmetricMode": True},
-        )
+        try:
+            lu = sla.splu(
+                sp.csc_matrix(K, dtype=np.float64),
+                permc_spec="MMD_AT_PLUS_A",
+                diag_pivot_thresh=0.0,
+                options={"SymmetricMode": True},
+            )
+        except RuntimeError as exc:  # "Factor is exactly singular"
+            raise np.linalg.LinAlgError(f"{SINGULAR_MESSAGE} ({exc})") from exc
         return lu.solve(np.asarray(F, dtype=np.float64))
 
     def _pcg(

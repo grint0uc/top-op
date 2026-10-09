@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import trimesh
 
 from topop.core.problem import SymmetryPlane
 from topop.core.selection import node_xyz
@@ -245,3 +246,102 @@ def test_resolve_sel_turns_step_facets_into_brep_faces(examples_dir: Path):
     assert step_facets_to_faces({"kind": "plane"}, {key: mesh}) == {"kind": "plane"}
     assert resolve_sel(sel, domain).size > 0
     assert step_facets_to_faces(sel, {key: load_mesh(examples_dir / "bracket.stl")}) is sel
+
+
+def _box_project(transform: list[float], **kw) -> ProjectIn:
+    return ProjectIn(
+        design_mesh=MeshRef(path="box", transform=transform),
+        grid=GridSpec(elements_along_longest=12),
+        **kw,
+    )
+
+
+def test_facet_ids_are_the_raw_meshs_under_a_non_uniform_scale():
+    # raw 10 x 20 x 30: the two largest facets are the x faces (20 x 30). Scaled x3 along x the
+    # y faces (30 x 30) become the largest, so ranking facets on the world mesh permuted the ids.
+    from topop.core.selection import compute_facets
+
+    box = trimesh.creation.box((10.0, 20.0, 30.0))
+    diag = [3.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0]
+    project = _box_project(diag)
+    meshes = load_project_meshes(project, lambda _: box)
+    assert meshes.raw["box"] is box and meshes.raw[DESIGN] is box
+    domain = build_domain_from_project(project, meshes)
+    listed, _ = compute_facets(box)  # what `/meshes/{id}/facets` and `topop describe` list
+    world_listed, _ = compute_facets(meshes[DESIGN])
+    assert abs(listed[0]["normal"][0]) == 1 and abs(world_listed[0]["normal"][1]) == 1
+    h = domain.grid.h
+    for fid in (0, 1):
+        sign = listed[fid]["normal"][0]
+        for key in ("box", DESIGN):
+            nodes = resolve_sel({"kind": "facets", "mesh_id": key, "facet_ids": [fid]}, domain)
+            assert nodes.size > 0
+            assert np.allclose(node_xyz(domain.grid, nodes)[:, 0], 15.0 * sign, atol=h)
+
+
+def test_load_cases_are_renumbered_to_the_ones_in_use(bracket: str):
+    project = bracket_project(bracket)
+    project.loads[1].case = 15
+    built = build_problem(project, load_project_meshes(project, resolver))
+    assert built.problem.n_cases == 2
+    assert [ld.case for ld in built.problem.loads] == [0, 1]
+    one = bracket_project(bracket)
+    one.loads[0].case = one.loads[1].case = 7
+    assert build_problem(one, load_project_meshes(one, resolver)).problem.n_cases == 1
+
+
+_MEMORY_SCRIPT = """
+import json, sys, time
+from topop.server.build import ProblemInvalid, build_problem, load_project_meshes
+from topop.server.schemas import GridSpec, ProjectIn
+from topop.core.voxelize import load_mesh
+project = ProjectIn.model_validate_json(sys.argv[1])
+project.grid = GridSpec(elements_along_longest=600)
+t = time.perf_counter()
+try:
+    build_problem(project, load_project_meshes(project, load_mesh))
+    msg = None
+except ProblemInvalid as exc:
+    msg = str(exc)
+dt = time.perf_counter() - t
+with open("/proc/self/status") as f:
+    peak = next(int(ln.split()[1]) * 1024 for ln in f if ln.startswith("VmHWM:"))
+print(json.dumps({"msg": msg, "dt": dt, "peak": peak}))
+"""
+
+
+@pytest.mark.skipif(not Path("/proc/self/status").is_file(), reason="needs Linux VmHWM")
+def test_too_fine_grid_is_refused_before_voxelizing(bracket: str):
+    import json
+    import subprocess
+    import sys
+
+    project = bracket_project(bracket)
+    out = subprocess.run(
+        [sys.executable, "-c", _MEMORY_SCRIPT, project.model_dump_json()],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    res = json.loads(out.stdout)
+    assert res["msg"] is not None and "memory cap" in res["msg"] and "6.0 GB" in res["msg"]
+    assert "elements_along_longest" in res["msg"]
+    assert res["dt"] < 2.0
+    assert res["peak"] < 1e9
+
+
+def test_run_over_the_memory_cap_is_refused_before_resolving(bracket: str, monkeypatch):
+    from topop.server import build
+
+    def boom(*args, **kwargs):
+        raise AssertionError("selections resolved")
+
+    project = bracket_project(bracket)
+    project.grid = GridSpec(elements_along_longest=200)  # ~1.2M active elements, ~13 GB
+    meshes = load_project_meshes(project, resolver)
+    domain = build_domain_from_project(project, meshes)  # the voxel preview still works
+    assert domain.stats["est_bytes"] > 6e9
+    monkeypatch.setattr(build, "resolve_project_selections", boom)
+    with pytest.raises(ProblemInvalid, match="memory cap"):
+        build_problem(project, meshes, domain)

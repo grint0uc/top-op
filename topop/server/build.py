@@ -6,6 +6,10 @@ Mesh keys: every mesh is keyed by `mesh_id` (server) or `path` (CLI case files).
 name meshes by that key. Two aliases are always present: `"design"` (the design mesh) and
 `"ref:<RefModel.id>"` (each reference model, world space). When the design mesh and a reference
 model share a key, the plain key means the design mesh (that is what the GUI's face picks refer to).
+
+Facet ids are listed on the raw (untransformed) mesh (`/meshes/{id}/facets`, `topop describe`), so
+`facets` selections are turned into triangle ids on the raw mesh and resolved on the world mesh
+(triangle ids survive the transform; facet ids do not under a non-uniform scale).
 """
 
 from __future__ import annotations
@@ -28,16 +32,34 @@ from topop.core.problem import (
     Support,
     SymmetryPlane,
 )
-from topop.core.selection import resolve_selection
+from topop.core.selection import facet_faces, resolve_selection
 from topop.core.step import facet_triangles
-from topop.core.voxelize import apply_transform, build_domain, domain_stats, transform_matrix
+from topop.core.voxelize import (
+    apply_transform,
+    build_domain,
+    domain_grid,
+    domain_stats,
+    transform_matrix,
+)
 from topop.server.schemas import MaterialSpec, ParamsSpec, ProjectIn
 
 DESIGN = "design"
 SLOW_ACTIVE = 150_000
 OOM_ACTIVE = 300_000
+# peak bytes per grid cell of voxelization + stats + selections (measured 21-25 B on 8-16M cells,
+# closed and open meshes): grids above memory_cap_bytes / this are refused before voxelizing
+VOXEL_BYTES_PER_CELL = 50
 
 MeshResolver = Callable[[str], trimesh.Trimesh]
+
+
+class ProjectMeshes(dict[str, trimesh.Trimesh]):
+    """World-space meshes by key (a plain dict to every caller) + `raw`: the untransformed mesh
+    under the same keys, which facet ids refer to."""
+
+    def __init__(self, *args, raw: dict[str, trimesh.Trimesh] | None = None, **kw):
+        super().__init__(*args, **kw)
+        self.raw: dict[str, trimesh.Trimesh] = dict(raw or {})
 
 
 @dataclass
@@ -48,6 +70,8 @@ class BuiltDomain:
     stats: dict  # `VoxelStats` fields
     warnings: list[str]
     meshes_world: dict[str, trimesh.Trimesh]
+    # untransformed meshes under the keys of `meshes_world` (empty: facets resolve on the world mesh)
+    meshes_raw: dict[str, trimesh.Trimesh] = field(default_factory=dict, kw_only=True)
 
 
 @dataclass
@@ -77,8 +101,9 @@ def _world(raw: trimesh.Trimesh, t16: Sequence[float]) -> trimesh.Trimesh:
     return apply_transform(raw, t16)
 
 
-def load_project_meshes(project: ProjectIn, resolver: MeshResolver) -> dict[str, trimesh.Trimesh]:
-    """World-space meshes of the project keyed by mesh key, plus the `design` / `ref:<id>` aliases.
+def load_project_meshes(project: ProjectIn, resolver: MeshResolver) -> ProjectMeshes:
+    """World-space meshes of the project keyed by mesh key, plus the `design` / `ref:<id>` aliases;
+    `.raw` holds the untransformed mesh under every key.
 
     `resolver(key)` returns the raw (untransformed) mesh. Meshes must be treated as read-only.
     """
@@ -93,17 +118,19 @@ def load_project_meshes(project: ProjectIn, resolver: MeshResolver) -> dict[str,
             raw[key] = resolver(key)
         return raw[key]
 
-    out: dict[str, trimesh.Trimesh] = {}
+    out = ProjectMeshes()
     for ref in project.ref_models:
         key = mesh_key(ref)
         if key is None:
             continue
         world = _world(get(key), ref.transform)
         out[f"ref:{ref.id}"] = world
-        out.setdefault(key, world)
+        out.raw[f"ref:{ref.id}"] = raw[key]
+        if key not in out:
+            out[key], out.raw[key] = world, raw[key]
     world = _world(get(dkey), design.transform)
-    out[dkey] = world
-    out[DESIGN] = world
+    out[dkey] = out[DESIGN] = world
+    out.raw[dkey] = out.raw[DESIGN] = raw[dkey]
     return out
 
 
@@ -131,10 +158,53 @@ def estimate_sec_per_iter(n_active: int) -> float:
     return max(0.05, 2e-4 * n_active)
 
 
-def estimate_bytes(n_active: int, dtype: str = "float64") -> int:
+def estimate_bytes(n_active: int, dtype: str = "float64", n_cases: int = 1) -> int:
     from topop.core.fem import Assembler
 
-    return int(Assembler.estimate_bytes(n_active, np.dtype(dtype)))
+    return int(Assembler.estimate_bytes(n_active, np.dtype(dtype), n_cases))
+
+
+def memory_cap(project: ProjectIn) -> int:
+    return int(run_params(project.params).memory_cap_bytes)
+
+
+def _check_voxel_memory(project: ProjectIn, grid: Grid) -> None:
+    """ProblemInvalid when voxelizing `grid` alone would exceed the memory cap."""
+    cap = memory_cap(project)
+    n_cells = grid.nel
+    need = VOXEL_BYTES_PER_CELL * n_cells
+    if need <= cap:
+        return
+    nx, ny, nz = grid.shape
+    msg = (
+        f"grid {nx} x {ny} x {nz} = {n_cells / 1e6:.0f}M cells needs about "
+        f"{need / 1e9:.1f} GB to voxelize, above the {cap / 1e9:.1f} GB memory cap; "
+        f"lower elements_along_longest ({project.grid.elements_along_longest})"
+    )
+    raise ProblemInvalid([msg])
+
+
+def _check_solve_memory(project: ProjectIn, n_active: int, n_cases: int) -> int:
+    """Estimated run bytes; ProblemInvalid when they exceed the memory cap."""
+    cap = memory_cap(project)
+    need = estimate_bytes(n_active, project.params.dtype, n_cases)
+    if need > cap:
+        lo, hi = 0, n_active  # largest element count that fits; n_active scales with eal^3
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if estimate_bytes(mid, project.params.dtype, n_cases) <= cap:
+                lo = mid
+            else:
+                hi = mid - 1
+        eal = project.grid.elements_along_longest
+        fits = max(4, int(0.95 * eal * (lo / n_active) ** (1 / 3)))  # margin: surface effects
+        msg = (
+            f"{n_active:,} active elements ({n_cases} load case(s)) need about "
+            f"{need / 1e9:.1f} GB, above the {cap / 1e9:.1f} GB memory cap; lower "
+            f"elements_along_longest ({eal}) to about {fits}"
+        )
+        raise ProblemInvalid([msg])
+    return need
 
 
 def size_warnings(n_active: int) -> list[str]:
@@ -160,9 +230,9 @@ def build_domain_from_project(
             warnings.append(f"reference model {ref.name or ref.id!r} has no mesh; ignored")
         else:
             refs.append((mesh, ref.mode))
-    grid, active, passive, w = build_domain(
-        design, refs, project.grid.elements_along_longest, project.grid.padding
-    )
+    eal, padding = project.grid.elements_along_longest, project.grid.padding
+    _check_voxel_memory(project, domain_grid(design, refs, eal, padding))
+    grid, active, passive, w = build_domain(design, refs, eal, padding)
     warnings += w
     if not design.is_watertight and not any("watertight" in s for s in warnings):
         warnings.append("design mesh is not watertight; the voxelization may be approximate")
@@ -172,7 +242,8 @@ def build_domain_from_project(
     stats["est_bytes"] = estimate_bytes(n_active, project.params.dtype)
     stats["est_sec_per_iter"] = estimate_sec_per_iter(n_active)
     stats["warnings"] = list(warnings)
-    return BuiltDomain(grid, active, passive, stats, warnings, meshes_world)
+    raw = getattr(meshes_world, "raw", {})
+    return BuiltDomain(grid, active, passive, stats, warnings, meshes_world, meshes_raw=raw)
 
 
 def step_facets_to_faces(sel: Mapping, meshes: Mapping[str, trimesh.Trimesh]) -> Mapping:
@@ -190,10 +261,31 @@ def step_facets_to_faces(sel: Mapping, meshes: Mapping[str, trimesh.Trimesh]) ->
     return {"kind": "faces", "mesh_id": sel["mesh_id"], "face_ids": tris.tolist()}
 
 
+def facets_to_faces(
+    sel: Mapping, meshes_world: Mapping[str, trimesh.Trimesh], meshes_raw: Mapping
+) -> Mapping:
+    """A `facets` selection -> the `faces` selection of the same triangles, facet ids taken on
+    the RAW mesh (where they were listed). Without a raw mesh for the key: `step_facets_to_faces`
+    (facets of other meshes then resolve on the world mesh). Other selections are unchanged."""
+    if sel.get("kind") != "facets":
+        return sel
+    key = sel.get("mesh_id")
+    raw, world = meshes_raw.get(key), meshes_world.get(key)
+    if raw is None or world is None or len(raw.faces) != len(world.faces):
+        return step_facets_to_faces(sel, meshes_world)
+    ids = sel.get("facet_ids", [])
+    tris = facet_triangles(raw, ids)
+    if tris is None:
+        tris = facet_faces(raw, float(sel.get("angle_deg", 5.0)), ids)
+    return {"kind": "faces", "mesh_id": key, "face_ids": tris}
+
+
 def resolve_sel(sel: Mapping, domain: BuiltDomain) -> np.ndarray:
-    """`core.selection.resolve_selection` on the domain, STEP-aware. The one entry point to use."""
+    """`core.selection.resolve_selection` on the domain; facet ids are those listed for the raw
+    mesh (STEP: B-rep faces). The one entry point to use."""
     meshes = domain.meshes_world
-    return resolve_selection(step_facets_to_faces(sel, meshes), domain.grid, domain.active, meshes)
+    sel = facets_to_faces(sel, meshes, domain.meshes_raw)
+    return resolve_selection(sel, domain.grid, domain.active, meshes)
 
 
 def _label(kind: str, item) -> str:
@@ -258,9 +350,16 @@ def build_problem(
     meshes_world: dict[str, trimesh.Trimesh],
     domain: BuiltDomain | None = None,
 ) -> BuiltProblem:
-    """Resolve every load/support and assemble the `Problem`. ProblemInvalid if not runnable."""
+    """Resolve every load/support and assemble the `Problem`. ProblemInvalid if not runnable.
+
+    Load cases are renumbered to the ones in use (sorted), so cases {0, 15} become {0, 1}.
+    A run that would exceed the memory cap is refused before anything is resolved.
+    """
     if domain is None:
         domain = build_domain_from_project(project, meshes_world)
+    case_index = {c: i for i, c in enumerate(sorted({ld.case for ld in project.loads}))}
+    n_cases = max(1, len(case_index))
+    est = _check_solve_memory(project, int(domain.stats["n_active"]), n_cases)
     load_nodes, support_nodes, sel_warnings, sel_errors = resolve_project_selections(
         project, domain
     )
@@ -270,7 +369,7 @@ def build_problem(
         passive=domain.passive,
         material=material(project.material),
         loads=[
-            Load(nodes=n, force=tuple(ld.force), case=ld.case)
+            Load(nodes=n, force=tuple(ld.force), case=case_index[ld.case])
             for ld, n in zip(project.loads, load_nodes, strict=True)
         ],
         supports=[
@@ -286,9 +385,10 @@ def build_problem(
         grid=domain.grid,
         active=domain.active,
         passive=domain.passive,
-        stats={**domain.stats, "warnings": list(warnings)},
+        stats={**domain.stats, "est_bytes": est, "warnings": list(warnings)},
         warnings=warnings,
         meshes_world=domain.meshes_world,
+        meshes_raw=domain.meshes_raw,
         problem=problem,
         resolved={
             **{sp.id: n for sp, n in zip(project.supports, support_nodes, strict=True)},

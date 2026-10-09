@@ -41,10 +41,13 @@ class DensityFilter:
 
     def apply(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64).reshape(self.shape)
-        return np.where(self.active, self._conv(x * self._mask) / self.Hs, 0.0)
+        out = np.where(self.active, self._conv(x * self._mask) / self.Hs, 0.0)
+        if self.use_fft:  # FFT round-off: ~1e-17 below 0 next to void, above 1 inside solid
+            np.clip(out, 0.0, 1.0, out=out)
+        return out
 
     def apply_adjoint(self, y: np.ndarray) -> np.ndarray:
-        """H^T y = A conv(A y / Hs) (the cone kernel is symmetric)."""
+        """H^T y = A conv(A y / Hs) (the cone kernel is symmetric). Linear: never clipped."""
         y = np.asarray(y, dtype=np.float64).reshape(self.shape)
         return np.where(self.active, self._conv(y * self._mask / self.Hs), 0.0)
 
