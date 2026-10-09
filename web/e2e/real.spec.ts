@@ -410,6 +410,11 @@ test('8. a page reload restores the document; "Fetch from server" brings the mes
 });
 
 test('9. Load project.json (RunExport): document restored, meshes fetched by id, run history shown', async () => {
+  // reset through the app, then outwait the 250 ms debounced localStorage write before clearing,
+  // otherwise a pending write from stage 8 lands between clear() and reload() on a fast machine
+  await page.getByTestId('new-project').click();
+  await expect.poll(() => state(page, (s) => s.project.loads.length)).toBe(0);
+  await page.waitForTimeout(400);
   await page.evaluate(() => localStorage.clear());
   await page.reload();
   expect(await state(page, (s) => s.project.loads.length)).toBe(0);
