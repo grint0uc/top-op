@@ -61,8 +61,8 @@ STRESS_NEAR_ACTIVE = -0.1
 # A step asks for g_new <= STRESS_TARGET * g while g > 0 instead of g_new <= 0: the MMA subproblem
 # stays feasible, so its stress multiplier is a real trade-off and compliance keeps shaping the
 # design (an infeasible subproblem pins the multiplier at c and optimizes the stress alone).
-# The decrease is at least STRESS_MIN_DECREASE (not below g_new = 0): without that floor a strongly
-# infeasible start only approaches g = 0 geometrically.
+# The decrease is at least STRESS_MIN_DECREASE (not below g_new = 0): without that floor the last
+# approach to g = 0 is only geometric (binds below g = 0.4).
 STRESS_TARGET = 0.95
 STRESS_MIN_DECREASE = 0.02
 STRESS_MMA_ASY = (0.2, 1.1, 0.6)  # MMA asyinit, asyincr, asydecr

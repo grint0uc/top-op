@@ -42,12 +42,18 @@ volfrac, rmin = 1.5, stress_limit = 0.7 x the unconstrained peak; shared 4-core 
 | 40 x 40 x 4 | 0.5 | 100 | 44 s | 1.001 (<= 1.10 from it. 40) | 0.4998 |
 | 40 x 40 x 4 | 0.3 | 200 | 118 s | 1.135 (near-infeasible, see caveats) | 0.3000 |
 | 60 x 60 x 4 | 0.4 | 100 | 98 s | 1.000 (<= 1.10 from it. 46) | 0.3999 |
-| 40 x 40 x 4, limit 0.4 x peak | 0.5 | 150 | 64 s | 1.640 (infeasible at this volume) | 0.4999 |
+| 40 x 40 x 4, limit 0.4 x peak | 0.5 | 150 | 64 s | 1.640 (infeasible on this domain) | 0.4999 |
 
-FLOOR_NOTE
+The 0.02 floor: 40 x 40 vf 0.5 first reaches g <= 0.01 at iteration 73 instead of 90 (compliance 47.9;
+before 45.9 at g = +0.008), 60 x 60 vf 0.4 at 61 instead of never (before: g = +0.013, 1.013, compliance
+55.6; now 57.3). The 0.4 x limit cannot be met on this domain: the inner flange of the vertical arm sits
+at ~1.6 x the limit along its whole length (vf 0.7 still ends at 1.44 x). The run ends fully stressed
+there (median solid cell 1.13 x the limit), volume exact, g still falling slowly; g never drops below
+0.4, so the floor never binds and the history is identical to the one without it.
 
-Ablation on l_bracket(40) (measured before the 0.02 floor and the doubling gate), one measure off (max stress / limit, volume, compliance; vf 0.5 at 120 its,
-vf 0.3 at 150; all on: 1.003, 0.500, 45.2 and 1.143, 0.300, 89.0). Volume row c = 1e4: vf 0.3 ends at
+Ablation on l_bracket(40), measured before the 0.02 floor and the doubling gate, one measure off (max
+stress / limit, volume, compliance; vf 0.5 at 120 its, vf 0.3 at 150; all on: 1.003, 0.500, 45.2 and
+1.143, 0.300, 89.0). Volume row c = 1e4: vf 0.3 ends at
 volume **0.329** (1.002). No step target: 1.023, compliance **56.1** and **1.605**, 157. p capped at
 16: 1.024, 46.7 and **1.264**. No move caps or a = 0.5: same end points, but one-iteration stress jumps
 of +0.93 / +0.51 x limit at vf 0.3 (all on: +0.22). Move as MMA box x +- move: 1.064, 55.9 and 1.722.
