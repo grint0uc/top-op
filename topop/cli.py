@@ -152,7 +152,13 @@ def _feature_summary(params) -> str:
         )
         parts.append(f"symmetry {planes}")
     if params.stress_limit is not None:
-        parts.append(f"stress_limit {params.stress_limit:g} (p-norm {params.stress_pnorm:g})")
+        from topop.core.optimize import STRESS_P_START
+
+        # stress_pnorm is the final exponent of the p-continuation
+        p_end = params.stress_pnorm
+        p_start = min(STRESS_P_START, p_end)
+        sched = f"{p_start:g}->{p_end:g}" if p_start < p_end else f"{p_end:g}"
+        parts.append(f"stress_limit {params.stress_limit:g} (p {sched})")
     if params.overhang is not None:
         parts.append(f"overhang {params.overhang}")
     return "; ".join(parts)

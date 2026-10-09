@@ -105,3 +105,25 @@ def test_per_instance_asymptote_settings():
     mma.reset()
     x, its = run_beam(mma, np.full(5, 5.0))
     assert its < 60 and np.allclose(x, BEAM_OPT, rtol=1e-2)
+
+
+def test_reset_reinitializes_the_asymptotes_for_two_updates_whatever_iter():
+    # StressControl and optimize restart MMA by reset() and keep passing the outer iteration
+    def beam_step(mma, k, x):
+        g = np.array([np.sum(BEAM_COEF / x**3) - 1.0])
+        dg = (-3.0 * BEAM_COEF / x**4)[None, :]
+        return mma.update(k, x, 0.0624 * x.sum(), np.full(5, 0.0624), g, dg)
+
+    span = 9.0
+    fresh, restarted = MMA(5, 1, 1.0, 10.0, 0.5), MMA(5, 1, 1.0, 10.0, 0.5)
+    x = np.full(5, 5.0)
+    for k in range(1, 6):
+        x = beam_step(restarted, k, x)
+    restarted.reset()
+    xs = [x]
+    for k in (1, 2, 3):
+        xs.append(beam_step(fresh, k, xs[-1]))
+        assert np.array_equal(beam_step(restarted, 10 + k, xs[-2]), xs[-1])
+        if k <= 2:  # initial asymptotes x -+ asyinit * span
+            assert np.allclose(restarted.low, xs[-2] - MMA.asyinit * span)
+        assert np.array_equal(restarted.low, fresh.low) and np.array_equal(restarted.upp, fresh.upp)

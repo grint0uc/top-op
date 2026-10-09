@@ -4,13 +4,19 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 Transform = Annotated[list[float], Field(min_length=16, max_length=16)]  # column-major (three.js)
 Vec3 = Annotated[list[float], Field(min_length=3, max_length=3)]
 Bool3 = Annotated[list[bool], Field(min_length=3, max_length=3)]
 
 IDENTITY: list[float] = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+
+
+class StrictModel(BaseModel):
+    """Input models reject unknown fields so a typo (or `case` on a support) can't be ignored."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
 class MeshInfo(BaseModel):
@@ -25,36 +31,36 @@ class MeshInfo(BaseModel):
     n_brep_faces: int | None = None  # STEP only
 
 
-class FaceSelection(BaseModel):
+class FaceSelection(StrictModel):
     """Explicit triangle ids (what the GUI produces by clicking/painting)."""
 
     kind: Literal["faces"] = "faces"
     mesh_id: str
-    face_ids: list[int]
+    face_ids: list[Annotated[int, Field(ge=0, lt=2**31)]]
 
 
-class FacetSelection(BaseModel):
+class FacetSelection(StrictModel):
     """Coplanar facet ids from GET /api/meshes/{id}/facets (agent-friendly, stable per angle_deg)."""
 
     kind: Literal["facets"] = "facets"
     mesh_id: str
-    facet_ids: list[int]
-    angle_deg: float = 5.0
+    facet_ids: list[Annotated[int, Field(ge=0, lt=2**31)]]
+    angle_deg: float = Field(default=5.0, ge=0, le=90)
 
 
-class NormalSelection(BaseModel):
+class NormalSelection(StrictModel):
     """All surface faces whose normal is within angle_deg of `direction`, optionally clipped to a world bbox."""
 
     kind: Literal["normal"] = "normal"
     mesh_id: str
     direction: Vec3
-    angle_deg: float = 10.0
+    angle_deg: float = Field(default=10.0, ge=0, le=180)
     # [[xmin,ymin,zmin],[xmax,ymax,zmax]], clips strictly on grid-node coordinates. Grid nodes
     # sit up to h/2 outside the surface, so pad a box derived from the mesh bbox by one voxel h.
     within: list[Vec3] | None = None
 
 
-class PlaneSelection(BaseModel):
+class PlaneSelection(StrictModel):
     """Surface grid nodes within `tol` of the plane (no mesh needed). Agent-friendly: 'fix the plane x=0'."""
 
     kind: Literal["plane"] = "plane"
@@ -63,7 +69,7 @@ class PlaneSelection(BaseModel):
     tol: float = 0.0  # 0 -> band of ±h/2 (the single node layer nearest the plane)
 
 
-class PrimitiveSelection(BaseModel):
+class PrimitiveSelection(StrictModel):
     kind: Literal["box", "sphere", "cylinder"]
     transform: Transform = Field(default_factory=lambda: list(IDENTITY))
     size: Vec3 = Field(default_factory=lambda: [1.0, 1.0, 1.0])
@@ -102,13 +108,13 @@ class MeshFacets(BaseModel):
     n_facets_total: int
 
 
-class MeshRef(BaseModel):
+class MeshRef(StrictModel):
     mesh_id: str | None = None  # server: required
     path: str | None = None  # CLI case files only: load from disk
     transform: Transform = Field(default_factory=lambda: list(IDENTITY))
 
 
-class RefModel(BaseModel):
+class RefModel(StrictModel):
     id: str
     name: str = ""
     mesh_id: str | None = None  # server: required
@@ -118,22 +124,22 @@ class RefModel(BaseModel):
     visible: bool = True
 
 
-class GridSpec(BaseModel):
+class GridSpec(StrictModel):
     elements_along_longest: int = Field(default=60, ge=4, le=600)
     padding: int = Field(default=1, ge=0, le=10)
 
 
-class MaterialSpec(BaseModel):
+class MaterialSpec(StrictModel):
     E: float = Field(default=1.0, gt=0)
     nu: float = Field(default=0.3, ge=0, lt=0.5)
 
 
-class SymmetrySpec(BaseModel):
+class SymmetrySpec(StrictModel):
     axis: Literal["x", "y", "z"]
     position: float | None = None  # world coordinate of the mirror plane; None -> domain center
 
 
-class ParamsSpec(BaseModel):
+class ParamsSpec(StrictModel):
     volfrac: float = Field(default=0.3, gt=0, lt=1)
     penal: float = Field(default=3.0, ge=1, le=6)
     rmin: float = Field(default=2.0, ge=1.0)
@@ -148,26 +154,28 @@ class ParamsSpec(BaseModel):
     optimizer: Literal["oc", "mma"] = "oc"
     symmetry: list[SymmetrySpec] = Field(default_factory=list)
     stress_limit: float | None = Field(default=None, gt=0)  # von Mises limit, units of E
-    stress_pnorm: float = Field(default=64.0, ge=4, le=256)  # final exponent of the p-continuation (starts at 8)
+    stress_pnorm: float = Field(
+        default=64.0, ge=4, le=256
+    )  # final exponent of the p-continuation (starts at 8)
     overhang: Literal["+x", "-x", "+y", "-y", "+z", "-z"] | None = None  # AM build direction
 
 
-class LoadSpec(BaseModel):
+class LoadSpec(StrictModel):
     id: str
     name: str = ""
     selection: Selection
     force: Vec3  # total force
-    case: int = Field(default=0, ge=0)
+    case: int = Field(default=0, ge=0, le=15)  # load cases are renumbered to the ones in use
 
 
-class SupportSpec(BaseModel):
+class SupportSpec(StrictModel):
     id: str
     name: str = ""
     selection: Selection
     fix: Bool3 = Field(default_factory=lambda: [True, True, True])
 
 
-class ProjectIn(BaseModel):
+class ProjectIn(StrictModel):
     name: str = "untitled"
     design_mesh: MeshRef | None = None
     ref_models: list[RefModel] = Field(default_factory=list)
@@ -207,7 +215,7 @@ class ResolvedNodes(BaseModel):
     truncated: bool = False
 
 
-class RunCreate(BaseModel):
+class RunCreate(StrictModel):
     project_id: str
 
 

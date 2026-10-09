@@ -171,6 +171,84 @@ class Problem:
                 issues.append(f"support {i} fixes no DOF")
         if self.free.sum() == 0:
             issues.append("no free design elements (everything is passive)")
+        if self.supports and self.loads and not issues:
+            issues.extend(self._check_rigid_body())
+            issues.extend(self._check_lost_force(blocking=True))
+        return issues
+
+    def warnings(self) -> list[str]:
+        """Non-blocking advice (e.g. part of a load acting on fixed DOFs). Valid problems only."""
+        if not self.supports or not self.loads:
+            return []
+        return self._check_lost_force(blocking=False)
+
+    def fixed_dof_mask(self) -> np.ndarray:
+        """bool (3*n_nodes,): DOFs fixed by any support (full-grid numbering)."""
+        fixed = np.zeros((self.grid.n_nodes, 3), dtype=bool)
+        for sp in self.supports:
+            if sp.nodes.size:
+                fixed[sp.nodes] |= np.asarray(sp.fix, dtype=bool)
+        return fixed.ravel()
+
+    def _check_rigid_body(self) -> list[str]:
+        """Supports must block all 6 rigid-body modes, else K is singular and results are garbage."""
+        fixed = self.fixed_dof_mask().reshape(-1, 3)
+        nodes = np.flatnonzero(fixed.any(axis=1))
+        if nodes.size == 0:
+            return ["supports fix no DOF"]
+        xyz = self.grid.node_coords()[nodes] - self.grid.node_coords()[nodes].mean(axis=0)
+        # rigid modes restricted to the fixed DOFs: 3 translations + 3 rotations (r x e_k)
+        rows = []
+        for node_i, (x, y, z) in enumerate(xyz):
+            for axis in range(3):
+                if not fixed[nodes[node_i], axis]:
+                    continue
+                t = np.zeros(6)
+                t[axis] = 1.0
+                # rotation about x: (0, -z, y); about y: (z, 0, -x); about z: (-y, x, 0)
+                rot = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+                t[3:] = rot[axis]
+                rows.append(t)
+        rank = np.linalg.matrix_rank(
+            np.asarray(rows), tol=1e-9 * max(1.0, float(np.abs(xyz).max()))
+        )
+        if rank < 6:
+            msg = f"supports leave {6 - rank} rigid-body mode(s) free (rank {rank}/6)"
+            return [msg + ": fix more directions or a second region"]
+        return []
+
+    def _check_lost_force(self, blocking: bool) -> list[str]:
+        """Load components on fixed DOFs go straight into the reactions and never load the part.
+
+        blocking=True returns only the fatal cases (no force reaches the part); False only the
+        advisory one (more than 1 % of a case's force is lost to the supports).
+        """
+        fixed = self.fixed_dof_mask().reshape(-1, 3)
+        issues: list[str] = []
+        for case in range(self.n_cases):
+            total = 0.0
+            applied = 0.0
+            for ld in self.loads:
+                if ld.case != case or ld.nodes.size == 0:
+                    continue
+                f = np.asarray(ld.force, dtype=np.float64)
+                total += float(np.abs(f).sum())
+                per_node = f / ld.nodes.size
+                free_frac = (~fixed[ld.nodes]).astype(np.float64)  # (n, 3)
+                applied += float((np.abs(per_node)[None, :] * free_frac).sum())
+            if total == 0.0:
+                if blocking:
+                    issues.append(f"load case {case} has zero total force")
+            elif applied == 0.0:
+                if blocking:
+                    issues.append(
+                        f"load case {case} acts only on fixed DOFs (nothing loads the part)"
+                    )
+            elif applied < 0.99 * total and not blocking:
+                issues.append(
+                    f"load case {case}: {100 * (1 - applied / total):.0f}% of the force acts on "
+                    "fixed DOFs and is lost to the supports"
+                )
         return issues
 
 

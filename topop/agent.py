@@ -278,7 +278,9 @@ class Session:
 
     def _edit(self, project_id: str, fn: Callable[[ProjectIn], Any]) -> tuple[Project, Any]:
         with self._lock:
-            body = ProjectIn.model_validate(self.store.get_project(project_id).model_dump())
+            body = ProjectIn.model_validate(
+                self.store.get_project(project_id).model_dump(exclude=_ENVELOPE)
+            )
             result = fn(body)
             body = ProjectIn.model_validate(body.model_dump())  # re-validate what fn changed
             return self.store.update_project(project_id, body), result
@@ -716,6 +718,8 @@ class Session:
             raw = raw["project"]  # a run.json written by `topop run`
         if not isinstance(raw, dict):
             raise ValueError("a case file must be a JSON object (ProjectIn)")  # noqa: TRY004
+        for key in _ENVELOPE:  # a saved Project document is also accepted as a case
+            raw.pop(key, None)
         for key in ("loads", "supports"):
             for item in raw.get(key) or []:
                 if isinstance(item, dict) and isinstance(item.get("selection"), dict):

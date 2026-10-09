@@ -46,7 +46,7 @@ class MMA:
         self.reset()
 
     def reset(self) -> None:
-        """Forget the history: the next update re-initializes the asymptotes."""
+        """Forget the history: the next two updates re-initialize the asymptotes, as at iter 1, 2."""
         self.xold1: np.ndarray | None = None
         self.xold2: np.ndarray | None = None
         self.low: np.ndarray | None = None
@@ -63,7 +63,8 @@ class MMA:
         fval: np.ndarray,
         dfdx: np.ndarray,
     ) -> np.ndarray:
-        """One MMA step from `x`; `iter` is 1-based (iter <= 2 re-initializes the asymptotes).
+        """One MMA step from `x`; `iter` is 1-based (iter <= 2 re-initializes the asymptotes, as
+        do the first two updates after `reset()` whatever `iter` is).
 
         fval (m,) are the constraint values f_i(x) (<= 0 feasible), dfdx (m, n) their gradients.
         """

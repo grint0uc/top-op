@@ -371,8 +371,9 @@ def create_server(session: Session | None = None) -> MCPServer:
         and stiffer where stress concentrates. Check it afterwards: run reports `stress_max` and
         `constraint` (g <= 0 means satisfied, within 0.01) and result_stress_summary gives the field's
         max and where it is. Stresses are voxel stresses: sharp corners overshoot, so give some margin.
-        stress_pnorm (2..40, default 8): aggregation exponent; larger tracks the true max more
-        closely but optimizes less smoothly.
+        stress_pnorm (4..256, default 64): FINAL exponent of the p-norm continuation, which starts
+        at min(8, stress_pnorm) and doubles up to it as the run settles; while the constraint is
+        active the move limit is capped at 0.1 (0.05 near the limit). Rarely needs changing.
         overhang: additive-manufacturing build direction ("+z" = printed upward): a 45-degree
         overhang filter keeps every material voxel supported from below. The base plate is the
         domain's min face along that axis for "+x/+y/+z" and its max face for "-x/-y/-z" (the part

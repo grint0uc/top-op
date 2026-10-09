@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import time
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -10,8 +11,24 @@ import pytest
 from topop.core import optimize as opt
 from topop.core.benchmarks import cantilever, cantilever_params, l_bracket
 from topop.core.fem import Assembler, von_mises
-from topop.core.optimize import STRESS_Q, SimpModel, StressControl, optimize
-from topop.core.problem import Grid, Load, Material, Problem, Result, RunParams, Support
+from topop.core.optimize import (
+    STRESS_Q,
+    SimpModel,
+    StressControl,
+    Symmetry,
+    optimize,
+    stress_step_target,
+)
+from topop.core.problem import (
+    Grid,
+    Load,
+    Material,
+    Problem,
+    Result,
+    RunParams,
+    Support,
+    SymmetryPlane,
+)
 from topop.core.solver import LinearSolver
 
 
@@ -206,18 +223,49 @@ def p_schedule(params: RunParams, changes) -> list[float]:
 
 
 def test_pnorm_continuation_schedule():
-    every = opt.STRESS_P_EVERY
+    every, settle = opt.STRESS_P_EVERY, opt.STRESS_P_SETTLE
     p = p_schedule(RunParams(stress_limit=1.0), [1.0] * (4 * every + 5))
-    assert p[:every] == [8.0] * every  # default stress_pnorm 8
+    assert p[:every] == [8.0] * every
     assert p[every : 2 * every] == [16.0] * every
     assert p[2 * every : 3 * every] == [32.0] * every
-    assert set(p[3 * every :]) == {64.0}  # max(stress_pnorm, 64)
-    # a settled design (change < 0.02) doubles p right away
-    assert p_schedule(RunParams(stress_limit=1.0), [1.0, 0.01, 0.01, 1.0]) == [8, 16, 32, 32]
-    # the user's exponent is the cap when it is larger, and the start when it is smaller
-    p = p_schedule(RunParams(stress_limit=1.0, stress_pnorm=100), [0.01] * 6)
-    assert p == [8, 16, 32, 64, 100, 100]
-    assert p_schedule(RunParams(stress_limit=1.0, stress_pnorm=4), [0.01] * 6)[:3] == [4, 8, 16]
+    assert set(p[3 * every :]) == {64.0}  # default stress_pnorm: the final exponent
+    # a settled design (change < 0.02) doubles p as soon as the asymptotes have had `settle`
+    # iterations since the last restart
+    p = p_schedule(RunParams(stress_limit=1.0), [0.01] * (3 * settle + 2))
+    assert p == [8] * settle + [16] * settle + [32] * settle + [64, 64]
+    # stress_pnorm is the final exponent, reached exactly; below 8 it is also the start
+    p = p_schedule(RunParams(stress_limit=1.0, stress_pnorm=100), [0.01] * (5 * settle + 3))
+    assert p[::settle] == [8, 16, 32, 64, 100, 100] and p[-1] == 100
+    assert p_schedule(RunParams(stress_limit=1.0, stress_pnorm=12), [0.01] * 12)[-1] == 12
+    assert set(p_schedule(RunParams(stress_limit=1.0, stress_pnorm=4), [0.01] * 12)) == {4}
+
+
+def test_pnorm_never_doubles_while_damped_or_right_after_a_restart():
+    every, settle = opt.STRESS_P_EVERY, opt.STRESS_P_SETTLE
+    ctl = StressControl(RunParams(stress_limit=1.0), 10)
+    assert [ctl.begin(1.0) for _ in range(every)] == [8.0] * every
+    ctl.damp_left = 2  # oscillation damping in progress: neither trigger doubles p
+    assert ctl.begin(1.0) == 8.0 and ctl.begin(0.001) == 8.0
+    ctl.damp_left = 0
+    assert ctl.begin(1.0) == 16.0
+    # a projection change restarts the asymptotes; p waits `settle` iterations after it
+    for _ in range(settle):
+        ctl.begin(1.0)
+    ctl.mma.xold1 = ctl.mma.low = np.zeros(10)  # pretend MMA has a history
+    ctl.restart()
+    assert ctl.n_restarts == 1 and ctl.mma.xold1 is None and ctl.mma.low is None
+    assert [ctl.begin(0.001) for _ in range(settle + 1)] == [16.0] * settle + [32.0]
+
+
+def test_stress_step_target_has_a_relative_and_an_absolute_decrease():
+    assert stress_step_target(-0.3) == 0.0 and stress_step_target(0.0) == 0.0
+    assert stress_step_target(6.0) == pytest.approx(0.95 * 6.0)  # far: 5 % per step
+    assert stress_step_target(0.2) == pytest.approx(0.18)  # near: at least 0.02 per step
+    assert stress_step_target(0.01) == 0.0  # never asks for more than feasibility
+    g = np.linspace(1e-4, 8.0, 500)
+    t = np.array([stress_step_target(v) for v in g])
+    assert np.all((t >= 0) & (t < g) & (t <= 0.95 * g + 1e-15))
+    assert np.all((g - t >= opt.STRESS_MIN_DECREASE - 1e-12) | (t == 0.0))
 
 
 def test_move_limit_schedule_and_oscillation_damping():
@@ -245,6 +293,75 @@ def test_move_limit_schedule_and_oscillation_damping():
     assert len(ctl.notes) == 1 and "oscillation" in ctl.notes[0]
     ctl.track(-flipped)
     assert len(ctl.notes) == 1  # reported once
+
+
+class SpyControl(StressControl):
+    """StressControl that records its instances, each step's input and each step passed to
+    `track`; with `noise` > 0 it perturbs MMA's step (any later change of the step, as the
+    symmetry projection makes, must reach `track`)."""
+
+    made: ClassVar[list[SpyControl]] = []
+    noise = 0.0
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.inputs: list[np.ndarray] = []
+        self.tracked: list[np.ndarray] = []
+        self.rng = np.random.default_rng(0)
+        SpyControl.made.append(self)
+
+    def step(self, xf, r, c0):
+        self.inputs.append(xf.copy())
+        x_new, g = super().step(xf, r, c0)
+        if self.noise:
+            x_new = np.clip(x_new + self.rng.uniform(-self.noise, self.noise, x_new.size), 0, 1)
+        return x_new, g
+
+    def track(self, dx):
+        self.tracked.append(dx.copy())
+        super().track(dx)
+
+
+@pytest.fixture
+def spy(monkeypatch) -> type[SpyControl]:
+    SpyControl.made, SpyControl.noise = [], 0.0
+    monkeypatch.setattr(opt, "StressControl", SpyControl)
+    return SpyControl
+
+
+def test_oscillation_detector_sees_the_applied_symmetric_step(spy):
+    spy.noise = 0.01  # an asymmetric step that the symmetry projection then averages
+    p = cantilever(12, 6, 4)
+    planes = (SymmetryPlane("z"),)
+    params = dataclasses.replace(cantilever_params(), max_iter=4, symmetry=planes, stress_limit=1.0)
+    optimize(p, params)
+    (ctl,) = spy.made
+    sym = Symmetry(p, planes)
+    assert len(ctl.inputs) == len(ctl.tracked) == 4
+    for k in range(3):
+        applied = ctl.inputs[k + 1] - ctl.inputs[k]
+        assert np.array_equal(ctl.tracked[k], applied)
+        assert np.allclose(applied, sym.apply(applied), rtol=0, atol=1e-15)
+
+
+def test_projection_restart_resets_the_stress_path_asymptotes(spy):
+    # heaviside: beta doubles at iteration 41 at the latest (earlier once change < 0.05), which
+    # restarts the MMA asymptotes through StressControl.restart
+    p = l_bracket(16, 2)
+    base = RunParams(volfrac=0.5, rmin=1.5, max_iter=50, heaviside=True, optimizer="mma")
+    s0 = float(optimize(p, base).stress.max())
+    limit = 0.8 * s0
+    res = optimize(p, dataclasses.replace(base, stress_limit=limit))
+    ctl = spy.made[-1]
+    assert ctl.n_restarts >= 1
+    assert ctl.p == ctl.p_max  # the continuation still completed
+    assert all(np.isfinite(h.compliance) and np.isfinite(h.constraint) for h in res.history)
+    assert np.isfinite(res.rho).all() and np.isfinite(res.stress).all()
+    # feasible, or close to fully stressed at the target volume after 50 iterations
+    assert res.history[-1].constraint <= opt.STRESS_FEAS_TOL or (
+        float(res.stress.max()) <= 1.15 * limit and res.history[-1].constraint < 0.15
+    )
+    assert abs(res.history[-1].volume - 0.5) < 5e-3
 
 
 # ---- L-bracket benchmark ----------------------------------------------------------------------
@@ -300,7 +417,7 @@ def test_l_bracket_stress_constraint_moves_material_off_the_corner():
 
 
 # User sets only volfrac, rmin and stress_limit = 0.7 x the unconstrained peak; move (0.2),
-# stress_pnorm (8) and max_iter (100) keep their defaults except where noted. vf 0.3 is
+# stress_pnorm (64) and max_iter (100) keep their defaults except where noted. vf 0.3 is
 # near-infeasible at this limit (docs/STRESS.md): the unconstrained design's inner flange already
 # carries 1.3 x the limit along the whole vertical arm, and the constrained optimum at exactly
 # 30 % volume is fully stressed at about 1.12 x; it gets 200 iterations and a 1.15 bound.
