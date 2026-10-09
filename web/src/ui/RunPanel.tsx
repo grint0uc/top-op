@@ -159,8 +159,8 @@ export function RunPanel() {
         <Field label="Stress limit" hint="Von Mises limit in the units of E; empty = no stress constraint">
           <OptNumField value={params.stress_limit ?? null} placeholder="off" testId="p-stress-limit" onChange={(v) => setParams({ stress_limit: v })} />
         </Field>
-        <Field label="Stress p-norm" hint="Aggregation exponent of the stress constraint (2..40); higher = closer to the true maximum, harder to converge">
-          <NumField value={params.stress_pnorm} min={2} max={40} step={1} testId="p-stress-pnorm" onChange={(v) => setParams({ stress_pnorm: v })} />
+        <Field label="Stress p-norm (final)" hint="Final exponent of the automatic p-continuation (starts at 8, doubles as the run settles; 4..256). The move limit is capped at 0.1/0.05 while the constraint is active">
+          <NumField value={params.stress_pnorm} min={4} max={256} step={1} testId="p-stress-pnorm" onChange={(v) => setParams({ stress_pnorm: v })} />
         </Field>
         <Field label="Overhang build dir" hint="Additive manufacturing: no overhangs steeper than 45 degrees when building along this direction">
           <select
