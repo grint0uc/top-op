@@ -337,7 +337,7 @@ CI: `.github/workflows/ci.yml` (every push and PR) runs lint + web typecheck, th
 
 Deferred or open:
 - Solver: the CG breakdown on warm-started adjoint solves is fixed (Lanczos bound for the Chebyshev smoother, see `docs/PERF.md`); +5 % per iteration at 100k.
-- Stress constraint: stable on the L-bracket only with `stress_pnorm=16` and `move=0.05`; p=8 or move >= 0.1 oscillates 12-18 % over the limit. The GUI defaults do not change automatically.
+- Stress constraint: stable at default parameters (automatic p-continuation to 64, move caps, per-step constraint target; `docs/STRESS.md`). A limit that is near-infeasible at the requested volume ends fully stressed above it (L-bracket vf 0.3: 1.13x) instead of trading volume.
 - Facets: surfaces tessellated with section steps > 3x the angle tolerance (e.g. a 16-section sphere) can split into narrow per-meridian "cylinders".
 - Overhang: no support-structure generation; the base plate is the first active layer along the build axis.
 - Memory estimate for `dtype="float32"` is within 30 % in isolation but the measured peak varied up to 2x between runs on the CI box; the guard uses the estimate, so prefer float64 when near the cap.

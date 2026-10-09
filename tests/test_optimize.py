@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -8,6 +10,8 @@ import pytest
 from topop.core.benchmarks import cantilever, cantilever_params
 from topop.core.optimize import oc_update, optimize
 from topop.core.problem import Load, RunParams
+
+HISTORY_REF = Path(__file__).resolve().parent / "data" / "cantilever_20x8x4_history.json"
 
 
 def small_params(**kw) -> RunParams:
@@ -39,6 +43,19 @@ def test_small_cantilever_converges_sensibly(small_run):
     assert [info.it for info, _ in calls] == list(range(1, 31))
     assert all(info.t_iter > 0 for info, _ in calls)
     assert np.array_equal(calls[-1][1], res.rho)
+
+
+@pytest.mark.parametrize("optimizer", ["oc", "mma"])
+def test_compliance_only_path_is_unchanged_by_the_stress_conditioning(optimizer):
+    # reference histories generated before the stress-path conditioning (docs/STRESS.md): runs
+    # without a stress limit must reproduce them to round-off
+    ref = json.loads(HISTORY_REF.read_text())[optimizer]
+    res = optimize(cantilever(20, 8, 4), small_params(optimizer=optimizer))
+    assert len(res.history) == len(ref["compliance"]) == 30
+    for key in ("compliance", "volume", "change", "stress_max"):
+        got = np.array([getattr(h, key) for h in res.history])
+        assert np.allclose(got, ref[key], rtol=1e-12, atol=0.0), key
+    assert all(h.constraint is None for h in res.history)
 
 
 def test_rho_is_zero_outside_active_and_bounded():

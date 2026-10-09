@@ -28,7 +28,7 @@ from topop.core.problem import (
     RunParams,
     SymmetryPlane,
 )
-from topop.core.solver import LinearSolver
+from topop.core.solver import _BLAS, LinearSolver
 
 log = logging.getLogger(__name__)
 
@@ -40,11 +40,30 @@ ADAPTIVE_TOL: float | None = 1e-4
 # vanishes in void cells (whose solid-material stress is meaningless) and equals the solid
 # stress in solid cells. Used for Result.stress, IterationInfo.stress_max and the constraint.
 STRESS_Q = 0.5
-STRESS_NORM_ALPHA = 0.5  # adaptive p-norm normalization c_k (Le et al. 2010, eq. 15)
 SYMMETRY_WARN_FRACTION = 0.05
 RETRY_RESIDUAL = 1e-3  # re-solve from zero when a warm-started solve ends above this residual
 MMA_FEAS_TOL = 1e-3  # MMA converges only once every constraint g_i <= this
 STRESS_FEAS_TOL = 0.01
+
+# Automatic conditioning of the stress-constrained path (docs/STRESS.md). Used only when
+# params.stress_limit is set: the compliance-only OC and MMA paths never read these.
+STRESS_NORM_ALPHA = 0.3  # adaptive normalization c_k blend (Le et al. 2010, eq. 15)
+STRESS_P_START = 8.0  # p-norm continuation: start at min(stress_pnorm, 8) and double ...
+STRESS_P_MAX = 64.0  # ... up to max(stress_pnorm, 64) ...
+STRESS_P_EVERY = 15  # ... every 15 iterations, or as soon as change < STRESS_P_CHANGE
+STRESS_P_CHANGE = 0.02
+STRESS_MOVE = (0.1, 0.05)  # move caps: warm-up and g <= STRESS_NEAR_ACTIVE / g above it
+STRESS_WARMUP = 10
+STRESS_NEAR_ACTIVE = -0.1
+# A step asks for g_new <= STRESS_TARGET * g while g > 0 instead of g_new <= 0: the MMA subproblem
+# stays feasible, so its stress multiplier is a real trade-off and compliance keeps shaping the
+# design (an infeasible subproblem pins the multiplier at c and optimizes the stress alone).
+STRESS_TARGET = 0.95
+STRESS_MMA_ASY = (0.2, 1.1, 0.6)  # MMA asyinit, asyincr, asydecr
+STRESS_MMA_C = (1e6, 1e4)  # MMA artificial-variable costs: volume row (hard), stress row
+OSC_FLIP_FRACTION = 0.4  # dx flips sign on more than this share of the moving variables ...
+OSC_DAMP_ITERS = 5  # ... -> the move limit is halved for this many iterations
+OSC_MIN_STEP = 1e-3  # "moving": |dx| above this in both iterations
 
 
 def _linear_volume(v0: float, dv: np.ndarray, x0: np.ndarray, x: np.ndarray) -> float:
@@ -335,6 +354,89 @@ def problem_rows(
     return r.compliance / c0, r.dc / c0, np.array(g), np.stack(dg)
 
 
+class StressControl:
+    """Automatic conditioning of the stress-constrained MMA path (docs/STRESS.md).
+
+    Per iteration `begin(change)` returns the p-norm exponent for the evaluation and `step` makes
+    the MMA update: adaptive normalization, a relative step target on the stress row, a hard
+    volume row, move caps and oscillation damping.
+    """
+
+    def __init__(self, params: RunParams, n_free: int):
+        self.params = params
+        self.p = float(min(params.stress_pnorm, STRESS_P_START))
+        self.p_max = float(max(params.stress_pnorm, STRESS_P_MAX))
+        self.p_since = 0
+        self.it = 0
+        self.mma_it = 0
+        self.ck: float | None = None
+        self.g: float | None = None  # stress row of the last step
+        self.dx_prev: np.ndarray | None = None
+        self.damp_left = 0
+        self.notes: list[str] = []
+        mma = self.mma = MMA(n_free, 2, 0.0, 1.0, params.move, c=np.array(STRESS_MMA_C))
+        mma.asyinit, mma.asyincr, mma.asydecr = STRESS_MMA_ASY
+
+    @property
+    def settled(self) -> bool:
+        return self.p >= self.p_max
+
+    def begin(self, change: float) -> float:
+        """Start an iteration; returns the p-norm exponent (continuation)."""
+        self.it += 1
+        if (
+            self.it > 1
+            and self.p < self.p_max
+            and (self.p_since >= STRESS_P_EVERY or change < STRESS_P_CHANGE)
+        ):
+            self.p, self.p_since = min(2.0 * self.p, self.p_max), 0
+            self.ck = None  # a new aggregate: fresh normalization and asymptotes
+            self.mma_it = 0
+        self.p_since += 1
+        return self.p
+
+    def restart(self) -> None:
+        """Re-initialize the MMA asymptotes (the projection changed)."""
+        self.mma_it = 0
+
+    def move(self) -> float:
+        near = self.it > STRESS_WARMUP and self.g is not None and self.g > STRESS_NEAR_ACTIVE
+        m = min(self.params.move, STRESS_MOVE[1] if near else STRESS_MOVE[0])
+        return 0.5 * m if self.damp_left > 0 else m
+
+    def track(self, dx: np.ndarray) -> None:
+        """Halve the move for OSC_DAMP_ITERS iterations when most moving variables reverse."""
+        prev, self.dx_prev = self.dx_prev, dx
+        if prev is None:
+            return
+        moving = (np.abs(dx) > OSC_MIN_STEP) & (np.abs(prev) > OSC_MIN_STEP)
+        if not moving.any():
+            return
+        if np.mean(np.sign(dx[moving]) != np.sign(prev[moving])) > OSC_FLIP_FRACTION:
+            self.damp_left = OSC_DAMP_ITERS
+            if not self.notes:
+                self.notes.append(
+                    f"stress: oscillation damped (move halved) from iteration {self.it}"
+                )
+
+    def step(self, xf: np.ndarray, r: Responses, c0: float) -> tuple[np.ndarray, np.ndarray]:
+        """MMA update of the free variables at responses r; returns (x_new, [g_vol, g_stress])."""
+        ratio = r.stress_max / r.stress_pnorm if r.stress_pnorm > 0 else 1.0
+        a = STRESS_NORM_ALPHA
+        self.ck = ratio if self.ck is None else a * ratio + (1 - a) * self.ck
+        f0, df0, g, dg = problem_rows(r, self.params, c0, self.ck)
+        self.g = float(g[1])
+        fval = g.copy()
+        fval[1] -= STRESS_TARGET * max(self.g, 0.0)
+        self.mma.move = self.move()
+        if self.damp_left > 0:
+            self.damp_left -= 1
+        self.mma_it += 1
+        x_new = self.mma.update(self.mma_it, xf, f0, df0, fval, dg)
+        self.track(x_new - xf)
+        return x_new, g
+
+
 def optimize(
     problem: Problem,
     params: RunParams,
@@ -369,9 +471,12 @@ def optimize(
     if warn:
         log.warning(warn)
     stress_on = params.stress_limit is not None
-    mma = None
-    if params.optimizer == "mma" or stress_on:
-        mma = MMA(model.n_free, 2 if stress_on else 1, 0.0, 1.0, params.move)
+    mma, ctl = None, None
+    if stress_on:
+        ctl = StressControl(params, model.n_free)
+        mma = ctl.mma
+    elif params.optimizer == "mma":
+        mma = MMA(model.n_free, 1, 0.0, 1.0, params.move)
 
     x = np.zeros(shape)
     x[free] = params.volfrac
@@ -389,88 +494,98 @@ def optimize(
     status, message = "max_iter", ""
     beta_since, change = 0, 1.0
     c0 = None  # MMA objective scale: first compliance
-    ck = None  # adaptive stress normalization
     mma_it = 0
-    for it in range(1, params.max_iter + 1):
-        if cancel is not None and cancel():
-            status, message = "cancelled", f"cancelled before iteration {it}"
-            break
-        t0 = time.perf_counter()
-        if (
-            params.heaviside
-            and model.beta < BETA_MAX
-            and ((beta_since >= 20 and change < 0.05) or beta_since >= 40)
-        ):
-            model.beta, beta_since = 2 * model.beta, 0
-            xp = model.physical(x)
-            mma_it = 0  # the projection changed: restart the MMA asymptotes
-        beta_since += 1
-        p = params.penal
-        if params.continuation:
-            p = 1.0 + (params.penal - 1.0) * min(1.0, (it - 1) / CONTINUATION_ITERS)
-
-        r = model.evaluate(xp, p, change, pnorm=params.stress_pnorm if stress_on else None)
-        c = r.compliance
-        if not np.isfinite(c):
-            status, message = "error", f"non-finite compliance at iteration {it}"
-            break
-        if sym is not None:
-            r.dc, r.dv = sym.apply(r.dc), sym.apply(r.dv)
-            r.dpn = sym.apply(r.dpn) if r.dpn is not None else None
-        if stress_on:
-            ratio = r.stress_max / r.stress_pnorm if r.stress_pnorm > 0 else 1.0
-            ck = ratio if ck is None else STRESS_NORM_ALPHA * ratio + (1 - STRESS_NORM_ALPHA) * ck
-
-        xf = x[free]
-        g_stress, feasible = None, True
-        if mma is None:  # OC: compliance and the volume row only (unscaled: OC is scale-free)
-            if model.linear_volume:
-                # mean(H x) over free cells is linear in x: exact, no filtering per bisection
-                volume = partial(_linear_volume, float(xp[free].mean()), r.dv, xf)
-            else:
-                volume = partial(model.projected_volume, x)
-            # OC oscillates on a sharp projection unless the step shrinks as beta grows
-            move = params.move / np.sqrt(model.beta) if params.heaviside else params.move
-            x_new = oc_update(xf, r.dc, r.dv, params.volfrac, move, volume=volume)
-        else:
-            if c0 is None:
-                c0 = abs(c) if c != 0 else 1.0
-            f0, df0, g, dg = problem_rows(r, params, c0, ck)
-            g_stress = float(g[1]) if stress_on else None
-            mma_it += 1
-            x_new = mma.update(mma_it, xf, f0, df0, g, dg)
-            feasible = g[0] <= MMA_FEAS_TOL and (g_stress is None or g_stress <= STRESS_FEAS_TOL)
-        if sym is not None:
-            x_new = sym.apply(x_new)
-        change = float(np.abs(x_new - xf).max())
-        x[free] = x_new
-        xp = model.physical(x)
-        info = IterationInfo(
-            it,
-            c,
-            float(xp[free].mean()),
-            change,
-            time.perf_counter() - t0,
-            stress_max=r.stress_max,
-            constraint=g_stress,
-        )
-        history.append(info)
-
-        if callback is not None:
-            ret = callback(info, xp)
-            if ret is not None and not ret:
-                status, message = "cancelled", f"cancelled after iteration {it}"
+    # pin OpenBLAS to one thread for the whole loop, not only inside the solves: the volume
+    # bisection's dot products otherwise wake its thread pool ~30 times per iteration
+    with _BLAS:
+        for it in range(1, params.max_iter + 1):
+            if cancel is not None and cancel():
+                status, message = "cancelled", f"cancelled before iteration {it}"
                 break
-        settled = (not params.continuation or p >= params.penal) and (
-            not params.heaviside or model.beta >= BETA_MAX
-        )
-        if change < params.tol and settled and feasible:
-            status, message = "converged", f"converged after {it} iterations"
-            break
-    else:
-        if params.max_iter > 0:
-            message = f"stopped at max_iter={params.max_iter}"
+            t0 = time.perf_counter()
+            if (
+                params.heaviside
+                and model.beta < BETA_MAX
+                and ((beta_since >= 20 and change < 0.05) or beta_since >= 40)
+            ):
+                model.beta, beta_since = 2 * model.beta, 0
+                xp = model.physical(x)
+                mma_it = 0  # the projection changed: restart the MMA asymptotes
+                if ctl is not None:
+                    ctl.restart()
+            beta_since += 1
+            p = params.penal
+            if params.continuation:
+                p = 1.0 + (params.penal - 1.0) * min(1.0, (it - 1) / CONTINUATION_ITERS)
 
+            r = model.evaluate(xp, p, change, pnorm=ctl.begin(change) if ctl is not None else None)
+            c = r.compliance
+            if not np.isfinite(c):
+                status, message = "error", f"non-finite compliance at iteration {it}"
+                break
+            if sym is not None:
+                r.dc, r.dv = sym.apply(r.dc), sym.apply(r.dv)
+                r.dpn = sym.apply(r.dpn) if r.dpn is not None else None
+
+            xf = x[free]
+            g_stress, feasible = None, True
+            if mma is None:  # OC: compliance and the volume row only (unscaled: OC is scale-free)
+                if model.linear_volume:
+                    # mean(H x) over free cells is linear in x: exact, no filtering per bisection
+                    volume = partial(_linear_volume, float(xp[free].mean()), r.dv, xf)
+                else:
+                    volume = partial(model.projected_volume, x)
+                # OC oscillates on a sharp projection unless the step shrinks as beta grows
+                move = params.move / np.sqrt(model.beta) if params.heaviside else params.move
+                x_new = oc_update(xf, r.dc, r.dv, params.volfrac, move, volume=volume)
+            else:
+                if c0 is None:
+                    c0 = abs(c) if c != 0 else 1.0
+                if ctl is not None:
+                    x_new, g = ctl.step(xf, r, c0)
+                    g_stress = float(g[1])
+                else:
+                    f0, df0, g, dg = problem_rows(r, params, c0, None)
+                    mma_it += 1
+                    x_new = mma.update(mma_it, xf, f0, df0, g, dg)
+                feasible = g[0] <= MMA_FEAS_TOL and (
+                    g_stress is None or g_stress <= STRESS_FEAS_TOL
+                )
+            if sym is not None:
+                x_new = sym.apply(x_new)
+            change = float(np.abs(x_new - xf).max())
+            x[free] = x_new
+            xp = model.physical(x)
+            info = IterationInfo(
+                it,
+                c,
+                float(xp[free].mean()),
+                change,
+                time.perf_counter() - t0,
+                stress_max=r.stress_max,
+                constraint=g_stress,
+            )
+            history.append(info)
+
+            if callback is not None:
+                ret = callback(info, xp)
+                if ret is not None and not ret:
+                    status, message = "cancelled", f"cancelled after iteration {it}"
+                    break
+            settled = (
+                (not params.continuation or p >= params.penal)
+                and (not params.heaviside or model.beta >= BETA_MAX)
+                and (ctl is None or ctl.settled)
+            )
+            if change < params.tol and settled and feasible:
+                status, message = "converged", f"converged after {it} iterations"
+                break
+        else:
+            if params.max_iter > 0:
+                message = f"stopped at max_iter={params.max_iter}"
+
+    if ctl is not None and ctl.notes:
+        message = "; ".join([message, *ctl.notes]) if message else "; ".join(ctl.notes)
     if warn:
         message = f"{warn}; {message}" if message else warn
     # the returned design moved since the last solve: its stress needs one more solve

@@ -91,3 +91,17 @@ def test_mma_runs_with_projection_and_passives():
     assert abs(res.rho[p.free].mean() - 0.3) < 5e-3
     c = np.array([h.compliance for h in res.history])
     assert np.all(np.isfinite(c)) and c[-1] < 0.3 * c[0]
+
+
+def test_per_instance_asymptote_settings():
+    # the stress path tightens the asymptotes on its own instance (docs/STRESS.md)
+    mma = MMA(5, 1, 1.0, 10.0, 0.5)
+    mma.asyinit, mma.asyincr, mma.asydecr = 0.2, 1.1, 0.6
+    x = np.full(5, 5.0)
+    g = np.array([np.sum(BEAM_COEF / x**3) - 1.0])
+    mma.update(1, x, 0.0624 * x.sum(), np.full(5, 0.0624), g, (-3 * BEAM_COEF / x**4)[None])
+    assert np.allclose(mma.low, x - 0.2 * 9.0) and np.allclose(mma.upp, x + 0.2 * 9.0)
+    assert (MMA.asyinit, MMA.asyincr, MMA.asydecr) == (0.5, 1.2, 0.7)
+    mma.reset()
+    x, its = run_beam(mma, np.full(5, 5.0))
+    assert its < 60 and np.allclose(x, BEAM_OPT, rtol=1e-2)

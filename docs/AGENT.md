@@ -70,7 +70,7 @@ holes of equal radius apart. `facet_faces(mesh_id, facet_id)` returns the triang
 |---|---|
 | `optimizer` | `oc` (default: volume constraint only, fastest) or `mma` (any constraints, slower per iteration) |
 | `symmetry` | mirror planes, `[{"axis":"y","position":null}]`; `position` is a world coordinate, `null` = centre of the design's bbox, snapped to the nearest voxel boundary or centre. Design variables are tied across the plane, so the result is exactly mirror-symmetric. Loads, supports and domain should be symmetric too (else `run` warns). `[]` removes |
-| `stress_limit` | von Mises limit in the units of E (MCP: `0` removes). A p-norm aggregated constraint; forces `mma` (`voxel_stats` says so when `optimizer` is `oc`). `stress_pnorm` (2..40, default 8): larger tracks the true max better but is harder to optimize |
+| `stress_limit` | von Mises limit in the units of E (MCP: `0` removes). A p-norm aggregated constraint; forces `mma` (`voxel_stats` says so when `optimizer` is `oc`). `stress_pnorm` (default 8) is only the START of an automatic p-continuation (doubling up to 64 as the run settles); the move limit is capped at 0.1/0.05 while the constraint is active. See docs/STRESS.md |
 | `overhang` | additive-manufacturing build direction, `+x` .. `-z` (MCP: `"none"` removes): 45 degree Langelaar filter, every voxel must be supported from below. The base plate is the domain's **min** face along the axis for `+`, **max** face for `-`; no support structures are generated |
 
 Reading the outcome: `run` returns `stress_max` (max von Mises of the last evaluated design) and `constraint` (`g`, null without a

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
+import time
 
 import numpy as np
 import pytest
 
+from topop.core import optimize as opt
 from topop.core.benchmarks import cantilever, cantilever_params, l_bracket
 from topop.core.fem import Assembler, von_mises
-from topop.core.optimize import STRESS_Q, SimpModel, optimize
-from topop.core.problem import Grid, Load, Material, Problem, RunParams, Support
+from topop.core.optimize import STRESS_Q, SimpModel, StressControl, optimize
+from topop.core.problem import Grid, Load, Material, Problem, Result, RunParams, Support
 from topop.core.solver import LinearSolver
 
 
@@ -182,13 +185,76 @@ def test_stress_limit_lowers_the_peak_stress():
     base = RunParams(volfrac=0.4, rmin=1.5, max_iter=60, optimizer="mma")
     free_run = optimize(p, base)
     s0 = free_run.history[-1].stress_max
-    res = optimize(p, dataclasses.replace(base, optimizer="oc", stress_limit=0.85 * s0))
+    # default max_iter: the volume stays on target throughout, so the stress comes down at a
+    # bounded rate per step (docs/STRESS.md) instead of being bought with extra volume early on
+    res = optimize(
+        p, dataclasses.replace(base, optimizer="oc", stress_limit=0.85 * s0, max_iter=100)
+    )
     assert all(h.constraint is not None for h in res.history)  # MMA forced
     assert res.history[-1].stress_max < 0.97 * s0
     assert res.history[-1].constraint < 0.1
+    assert all(abs(h.volume - 0.4) < 5e-3 for h in res.history[10:])
+    assert abs(res.history[-1].volume - 0.4) < 1e-3
+
+
+# ---- automatic conditioning of the stress path (docs/STRESS.md) -------------------------------
+
+
+def p_schedule(params: RunParams, changes) -> list[float]:
+    ctl = StressControl(params, 10)
+    return [ctl.begin(ch) for ch in changes]
+
+
+def test_pnorm_continuation_schedule():
+    every = opt.STRESS_P_EVERY
+    p = p_schedule(RunParams(stress_limit=1.0), [1.0] * (4 * every + 5))
+    assert p[:every] == [8.0] * every  # default stress_pnorm 8
+    assert p[every : 2 * every] == [16.0] * every
+    assert p[2 * every : 3 * every] == [32.0] * every
+    assert set(p[3 * every :]) == {64.0}  # max(stress_pnorm, 64)
+    # a settled design (change < 0.02) doubles p right away
+    assert p_schedule(RunParams(stress_limit=1.0), [1.0, 0.01, 0.01, 1.0]) == [8, 16, 32, 32]
+    # the user's exponent is the cap when it is larger, and the start when it is smaller
+    p = p_schedule(RunParams(stress_limit=1.0, stress_pnorm=100), [0.01] * 6)
+    assert p == [8, 16, 32, 64, 100, 100]
+    assert p_schedule(RunParams(stress_limit=1.0, stress_pnorm=4), [0.01] * 6)[:3] == [4, 8, 16]
+
+
+def test_move_limit_schedule_and_oscillation_damping():
+    ctl = StressControl(RunParams(stress_limit=1.0), 200)  # default move 0.2
+    ctl.begin(1.0)
+    ctl.g = 3.0
+    assert ctl.move() == pytest.approx(opt.STRESS_MOVE[0])  # warm-up
+    ctl.it = opt.STRESS_WARMUP + 1
+    assert ctl.move() == pytest.approx(opt.STRESS_MOVE[1])  # constraint near-active
+    ctl.g = -0.5
+    assert ctl.move() == pytest.approx(opt.STRESS_MOVE[0])  # far from active
+    assert StressControl(RunParams(stress_limit=1.0, move=0.02), 5).move() == 0.02
+    # alternating steps on most moving variables halve the move for OSC_DAMP_ITERS iterations
+    rng = np.random.default_rng(0)
+    dx = rng.choice([-0.05, 0.05], 200)
+    dx[:20] = 0.0  # not moving: ignored
+    ctl.track(dx)
+    ctl.track(dx)  # same direction: no oscillation
+    assert ctl.damp_left == 0 and not ctl.notes
+    flipped = dx.copy()
+    flipped[:120] *= -1  # 100 of the 180 moving variables flip
+    ctl.track(flipped)
+    assert ctl.damp_left == opt.OSC_DAMP_ITERS
+    assert ctl.move() == pytest.approx(0.5 * opt.STRESS_MOVE[0])
+    assert len(ctl.notes) == 1 and "oscillation" in ctl.notes[0]
+    ctl.track(-flipped)
+    assert len(ctl.notes) == 1  # reported once
 
 
 # ---- L-bracket benchmark ----------------------------------------------------------------------
+
+
+@functools.cache
+def free_l_bracket(n: int, volfrac: float) -> Result:
+    """Compliance-only MMA run: the reference peak stress (at the re-entrant corner)."""
+    params = RunParams(volfrac=volfrac, rmin=1.5, max_iter=100, optimizer="mma")
+    return optimize(l_bracket(n, 4), params)
 
 
 def corner_density(p: Problem, rho: np.ndarray, arm: int, w: int = 4) -> float:
@@ -212,12 +278,12 @@ def test_l_bracket_benchmark_geometry():
 @pytest.mark.slow
 def test_l_bracket_stress_constraint_moves_material_off_the_corner():
     # compliance + volume 0.5 + stress <= 0.7 x the unconstrained peak (at the re-entrant
-    # corner). p = 16 and move 0.05: with p = 8 or move >= 0.1 MMA oscillates and ends 12-18 %
-    # above the limit (the peak at the corner is a near-singularity on this 40 x 40 x 4 mesh).
+    # corner), with the explicit p = 16 and move 0.05 that were needed before the automatic
+    # conditioning (docs/STRESS.md)
     p = l_bracket(40, 4)
     arm = 16
     base = RunParams(volfrac=0.5, rmin=1.5, max_iter=100, optimizer="mma")
-    free_run = optimize(p, base)
+    free_run = free_l_bracket(40, 0.5)
     s0 = float(free_run.stress.max())
     peak = np.unravel_index(np.argmax(free_run.stress), p.grid.shape)
     assert abs(peak[0] + 0.5 - arm) <= 1 and abs(peak[1] + 0.5 - arm) <= 1  # at the corner
@@ -231,3 +297,37 @@ def test_l_bracket_stress_constraint_moves_material_off_the_corner():
     assert abs(res.history[-1].volume - 0.5) < 1e-3
     assert corner_density(p, res.rho, arm) < corner_density(p, free_run.rho, arm)
     assert corner_density(p, res.rho, arm, w=6) < corner_density(p, free_run.rho, arm, w=6) - 0.01
+
+
+# User sets only volfrac, rmin and stress_limit = 0.7 x the unconstrained peak; move (0.2),
+# stress_pnorm (8) and max_iter (100) keep their defaults except where noted. vf 0.3 is
+# near-infeasible at this limit (docs/STRESS.md): the unconstrained design's inner flange already
+# carries 1.3 x the limit along the whole vertical arm, and the constrained optimum at exactly
+# 30 % volume is fully stressed at about 1.12 x; it gets 200 iterations and a 1.15 bound.
+L_BRACKET_CASES = [
+    pytest.param(40, 0.5, 100, 1.10, id="40-vf0.5"),
+    pytest.param(40, 0.3, 200, 1.15, id="40-vf0.3"),
+    pytest.param(60, 0.4, 100, 1.10, id="60-vf0.4"),
+]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(("n", "volfrac", "max_iter", "bound"), L_BRACKET_CASES)
+def test_l_bracket_stress_limit_at_default_parameters(n, volfrac, max_iter, bound):
+    limit = 0.7 * float(free_l_bracket(n, volfrac).stress.max())
+    params = RunParams(volfrac=volfrac, rmin=1.5, max_iter=max_iter, stress_limit=limit)
+    t0 = time.perf_counter()
+    res = optimize(l_bracket(n, 4), params)
+    wall = time.perf_counter() - t0
+    s1 = float(res.stress.max())
+    print(
+        f"l_bracket({n}) vf={volfrac}: {len(res.history)} its, {wall:.0f} s, "
+        f"max stress {s1 / limit:.3f} x limit, volume {res.history[-1].volume:.4f}"
+    )
+    assert s1 <= bound * limit, f"max stress {s1 / limit:.3f} x limit"
+    assert abs(res.history[-1].volume - volfrac) < 1e-3
+    # stable: no two consecutive compliance changes above 10 % in the last 20 iterations
+    c = np.array([h.compliance for h in res.history[-21:]])
+    big = np.abs(np.diff(c)) / c[:-1] > 0.10
+    assert not np.any(big[1:] & big[:-1])
+    assert all(h.constraint is not None for h in res.history)
