@@ -49,7 +49,7 @@ STRESS_FEAS_TOL = 0.01
 # params.stress_limit is set: the compliance-only OC and MMA paths never read these.
 STRESS_NORM_ALPHA = 0.3  # adaptive normalization c_k blend (Le et al. 2010, eq. 15)
 STRESS_P_START = 8.0  # p-norm continuation: start at min(stress_pnorm, 8) and double ...
-STRESS_P_MAX = 64.0  # ... up to max(stress_pnorm, 64) ...
+STRESS_P_MAX = 64.0  # default RunParams.stress_pnorm; the continuation ends at stress_pnorm
 STRESS_P_EVERY = 15  # ... every 15 iterations, or as soon as change < STRESS_P_CHANGE
 STRESS_P_CHANGE = 0.02
 STRESS_MOVE = (0.1, 0.05)  # move caps: warm-up and g <= STRESS_NEAR_ACTIVE / g above it
@@ -364,8 +364,8 @@ class StressControl:
 
     def __init__(self, params: RunParams, n_free: int):
         self.params = params
-        self.p = float(min(params.stress_pnorm, STRESS_P_START))
-        self.p_max = float(max(params.stress_pnorm, STRESS_P_MAX))
+        self.p_max = float(params.stress_pnorm)
+        self.p = float(min(self.p_max, STRESS_P_START))
         self.p_since = 0
         self.it = 0
         self.mma_it = 0

@@ -24,7 +24,7 @@ export const DEFAULT_PARAMS: ParamsSpec = {
   optimizer: 'oc',
   symmetry: [],
   stress_limit: null,
-  stress_pnorm: 8,
+  stress_pnorm: 64,
   overhang: null,
 };
 

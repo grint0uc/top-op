@@ -22,7 +22,7 @@ Full design: `docs/PLAN.md`. Read it before touching anything non-trivial.
 - Density frames over WebSocket (binary): `u32 it, u32 nx, u32 ny, u32 nz, u8[nx*ny*nz]` little-endian, C-order, value = round(rho*255). Inactive elements = 0.
 - Selections (`schemas.Selection`): `faces` (GUI clicks), `facets` (coplanar groups from `/facets`), `normal` (direction + angle), `plane` (grid nodes near a plane), `box|sphere|cylinder`. All resolve server-side to full-grid node ids in `core/selection.py`. Agents (Claude) use the non-`faces` kinds.
 - Agent interface: `topop run case.json` (case = `ProjectIn` JSON with `path` instead of `mesh_id`), `topop describe mesh.stl` (facet table), `topop mcp` (MCP server over the same API). Everything the GUI can do must be reachable through these.
-- v0.2 params (`RunParams`/`ParamsSpec`): `optimizer` oc|mma, `symmetry` planes (densities mirrored each iteration), `stress_limit`+`stress_pnorm` (p-norm von Mises constraint, forces mma), `overhang` build direction (Langelaar AM filter, 45°). `Result.stress` / `IterationInfo.stress_max` carry von Mises. Facets carry `kind` plane|cylinder|other (+axis/radius) and `brep_face` for STEP input.
+- v0.2 params (`RunParams`/`ParamsSpec`): `optimizer` oc|mma, `symmetry` planes (densities mirrored each iteration), `stress_limit`+`stress_pnorm` (p-norm von Mises constraint, forces mma; p continues 8 → `stress_pnorm`, default 64; see docs/STRESS.md), `overhang` build direction (Langelaar AM filter, 45°). `Result.stress` / `IterationInfo.stress_max` carry von Mises. Facets carry `kind` plane|cylinder|other (+axis/radius) and `brep_face` for STEP input.
 - Units: none enforced. Whatever the mesh is in. Compliance reported in those units.
 
 ## Commands

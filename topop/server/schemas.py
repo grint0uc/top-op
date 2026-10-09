@@ -148,7 +148,7 @@ class ParamsSpec(BaseModel):
     optimizer: Literal["oc", "mma"] = "oc"
     symmetry: list[SymmetrySpec] = Field(default_factory=list)
     stress_limit: float | None = Field(default=None, gt=0)  # von Mises limit, units of E
-    stress_pnorm: float = Field(default=8.0, ge=2, le=40)
+    stress_pnorm: float = Field(default=64.0, ge=4, le=256)  # final exponent of the p-continuation (starts at 8)
     overhang: Literal["+x", "-x", "+y", "-y", "+z", "-z"] | None = None  # AM build direction
 
 

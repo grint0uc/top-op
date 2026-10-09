@@ -669,7 +669,7 @@ export interface components {
             stress_limit?: number | null;
             /**
              * Stress Pnorm
-             * @default 8
+             * @default 64
              */
             stress_pnorm: number;
             /** Overhang */

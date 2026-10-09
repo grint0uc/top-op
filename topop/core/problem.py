@@ -208,7 +208,8 @@ class RunParams:
     symmetry: tuple[SymmetryPlane, ...] = ()
     # von Mises stress constraint (same units as E); None -> compliance-only. Forces optimizer=mma.
     stress_limit: float | None = None
-    stress_pnorm: float = 8.0  # p-norm aggregation exponent
+    # final p-norm exponent: the constraint starts at min(8, stress_pnorm) and doubles up to this value
+    stress_pnorm: float = 64.0
     # Additive-manufacturing overhang filter (Langelaar 2017, 45 deg): build direction, or None.
     overhang: Direction | None = None
 
