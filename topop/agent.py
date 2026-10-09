@@ -25,6 +25,7 @@ from topop.core.optimize import optimize
 from topop.core.problem import IterationInfo
 from topop.core.selection import compute_facets, node_xyz, resolved_preview
 from topop.core.step import META_FACE_TO_FACET
+from topop.core.struts import StrutResult
 from topop.core.voxelize import transform_matrix
 from topop.server.build import (
     DESIGN,
@@ -37,6 +38,12 @@ from topop.server.build import (
 )
 from topop.server.jobs import iteration_record
 from topop.server.routes_runs import DESIGN_RGB, PREVIEW_SMOOTH, RESULT_RGB
+from topop.server.routes_struts import (
+    StrutRequest,
+    strut_json,
+    struts_for_project,
+    struts_for_run,
+)
 from topop.server.schemas import (
     FacetInfo,
     GridSpec,
@@ -756,6 +763,29 @@ class Session:
             out["stress_limit"] = float(limit)
             out["max_over_limit"] = out["max"] / limit
         return out
+
+    # ---- struts -------------------------------------------------------------------------------
+
+    def generate_struts(self, run_id: str, **params: Any) -> dict:
+        """Explicit strut (truss) structure of a finished run (`core.struts`), verified by an FE
+        solve; `params` are `StrutRequest` fields. Stored next to the run as
+        runs/{id}.struts.stl / .json / .png. Returns the summary plus `files`."""
+        result, paths = struts_for_run(self.store, run_id, StrutRequest(**params))
+        data = strut_json(result)
+        data.pop("nodes")
+        data.pop("bars")
+        return {"run_id": run_id, **data, "files": {k: str(v) for k, v in paths.items()}}
+
+    def struts_from_density(
+        self, project_id: str, rho: np.ndarray, grid: Any, **params: Any
+    ) -> tuple[StrutResult, trimesh.Trimesh | None]:
+        """(struts, world design mesh) of a density field on the project's grid (`topop struts`
+        on a run directory). ProjectInvalid if the project is not runnable."""
+        project, domain = self._domain(project_id)
+        try:
+            return struts_for_project(project, domain, rho, grid, StrutRequest(**params))
+        except ProblemInvalid as exc:
+            raise ProjectInvalid(exc.issues) from exc
 
     def export(self, run_id: str) -> RunExport:
         rec = self.store.get_run(run_id)

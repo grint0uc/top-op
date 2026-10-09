@@ -18,7 +18,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from topop import __version__
-from topop.server import routes_meshes, routes_projects, routes_runs
+from topop.server import routes_meshes, routes_projects, routes_runs, routes_struts
 from topop.server.jobs import RunManager
 from topop.server.schemas import Selection, WsMessage
 from topop.server.store import Store
@@ -169,6 +169,7 @@ class Health(BaseModel):
 app.include_router(routes_meshes.router)
 app.include_router(routes_projects.router)
 app.include_router(routes_runs.router)
+app.include_router(routes_struts.router)
 
 
 @app.get("/api/health", response_model=Health, tags=["meta"])

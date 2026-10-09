@@ -702,6 +702,50 @@ def create_server(session: Session | None = None) -> MCPServer:
         return session.stress_summary(run_id)
 
     @tool()
+    def generate_struts(
+        run_id: str,
+        mode: Literal["layout", "skeleton"] = "layout",
+        sigma_allow: float = 20.0,
+        target_volume: float | None = None,
+        node_spacing: float | None = None,
+        min_radius: float | None = None,
+        max_bar_length: float | None = None,
+        sample: Literal["solid", "active"] = "solid",
+        path: str | None = None,
+        overwrite: bool = False,
+    ) -> dict:
+        """Turn a finished run into an explicit strut (truss) structure: round bars with spherical
+        joints, unioned with the keep-in bodies, clipped to the design, then voxelized and FE-solved.
+        mode "layout" (default): minimum-volume truss over a ground structure of nodes at the
+        loads, supports, keep-in boundaries and sampled from the SIMP solid (sample "active": the
+        whole domain), every node pair within max_bar_length (default 0.4 x domain diagonal),
+        node_spacing default 4 voxels (coarsened automatically while min-radius bars would exceed
+        the volume). mode "skeleton": the medial axis of the SIMP solid, for results that already
+        look like beams. Radii are scaled to target_volume (default: the SIMP material volume;
+        <= 0 keeps the sigma_allow sizing), never below min_radius (default max(1, 0.8 h)).
+        Returns n_bars, radii, volume vs simp_volume, compliance per load case vs simp_compliance
+        (compliance_ratio < 1 = stiffer than SIMP), stress_max, watertight, n_bodies, warnings, and
+        `files` (struts.stl / .json / .png in the data dir; GET /api/runs/{id}/struts.stl serves
+        the same STL). path: optional ABSOLUTE .stl to also write the mesh to (overwrite=true to
+        replace)."""
+        out = _output_path(path, ".stl", overwrite) if path else None
+        data = session.generate_struts(
+            run_id,
+            mode=mode,
+            sigma_allow=sigma_allow,
+            target_volume=target_volume,
+            node_spacing=node_spacing,
+            min_radius=min_radius,
+            max_bar_length=max_bar_length,
+            sample=sample,
+        )
+        if out is not None:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(Path(data["files"]["stl"]).read_bytes())
+            data["path"] = str(out)
+        return data
+
+    @tool()
     def export_case(project_id: str, path: str, overwrite: bool = False) -> dict:
         """Save the project as a case file (JSON) that `topop run` and load_case read. Mesh files
         are referenced by path relative to the case file when their source file is known.

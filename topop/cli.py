@@ -378,6 +378,92 @@ def _stress_line(session, info, last) -> str:
     return f"{line}\nconstraint  stress <= {limit:g}: {verdict} (g = {g}, max/limit {peak / limit:.2f})"
 
 
+# ---- struts -------------------------------------------------------------------------------------
+
+STRUT_FILES = ("struts.stl", "struts.png", "struts.json")
+
+
+def _run_files(target: str) -> tuple[Path, Path]:
+    """RUN_DIR or RUN_DIR/run.json -> (run.json, density.npz)."""
+    p = Path(target).expanduser()
+    run_json = p / "run.json" if p.is_dir() else p
+    npz = run_json.parent / "density.npz"
+    for f in (run_json, npz):
+        if not f.is_file():
+            raise FileNotFoundError(f"{f} not found (expected the output directory of `topop run`)")
+    return run_json, npz
+
+
+def _struts(args: argparse.Namespace) -> int:
+
+    from topop.agent import ProjectInvalid, Session, pretty_json
+    from topop.core.export import from_npz_bytes, to_stl_bytes
+    from topop.server.routes_struts import strut_json, struts_png
+    from topop.server.store import NotFoundError
+
+    t0 = time.perf_counter()
+    params = {
+        "mode": args.mode,
+        "sigma_allow": args.sigma,
+        "node_spacing": args.spacing,
+        "target_volume": args.volume,
+        "min_radius": args.min_radius,
+        "max_bar_length": args.max_length,
+        "sample": args.sample,
+    }
+    try:
+        run_json, npz = _run_files(args.run)
+        rho, grid, _, _ = from_npz_bytes(npz.read_bytes())
+        session = Session()
+        project = session.load_case(run_json)
+    except (ValueError, OSError, NotFoundError) as exc:
+        _err("struts", _explain(exc))
+        return EXIT_INVALID
+    try:
+        result, design = session.struts_from_density(project.id, rho, grid, **params)
+    except ProjectInvalid as exc:
+        _report_invalid(exc)
+        return EXIT_INVALID
+    except ValidationError as exc:
+        _err("struts", f"invalid options: {_explain(exc)}")
+        return EXIT_INVALID
+    except ValueError as exc:
+        _err("struts", f"failed: {exc}")
+        return 1
+    out = Path(args.out).expanduser() if args.out else run_json.parent
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "struts.stl").write_bytes(to_stl_bytes(result.mesh))
+        (out / "struts.png").write_bytes(struts_png(result, design))
+        (out / "struts.json").write_text(pretty_json(strut_json(result)) + "\n")
+    except OSError as exc:
+        _err("struts", f"could not write to {out}: {exc}")
+        return 1
+    s = result.summary()
+    for w in result.warnings:
+        _err("struts", f"warning: {w}")
+    print(
+        f"struts      mode {s['mode']}: {s['n_bars']} bars, {s['n_nodes']} nodes, radius "
+        f"{s['radius_min']:.4g}..{s['radius_max']:.4g}"
+    )
+    print(
+        f"volume      {s['volume']:.6g} (target {s['target_volume']:.6g}, voxels "
+        f"{s['voxel_volume']:.6g}, SIMP {s['simp_volume']:.6g})"
+    )
+    comp = ", ".join(f"{c:.6e}" for c in s["compliance"])
+    simp = ", ".join(f"{c:.6e}" for c in s["simp_compliance"])
+    ratio = s["compliance_ratio"]
+    print(f"compliance  {comp} (SIMP {simp}; ratio {'n/a' if ratio is None else f'{ratio:.3f}'})")
+    print(f"stress      max {s['stress_max']:.4e} von Mises")
+    print(
+        f"mesh        watertight {s['watertight']}, {s['n_bodies']} body(ies), "
+        f"{s['triangles']} triangles"
+    )
+    print(f"wall time   {time.perf_counter() - t0:.1f} s")
+    print(f"files       {out}/ : {', '.join(STRUT_FILES)}")
+    return 0
+
+
 # ---- mcp ----------------------------------------------------------------------------------------
 
 
@@ -462,6 +548,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_describe.add_argument("--png", metavar="OUT.png", default=None, help="also render a preview")
     p_describe.add_argument("--view", default="iso", help="iso, +x, -x, +y, -y, +z or -z")
     p_describe.set_defaults(func=_describe)
+
+    p_struts = sub.add_parser(
+        "struts",
+        help="turn a `topop run` result into an explicit strut (truss) structure",
+        description="Read RUN_DIR/run.json and density.npz (what `topop run --out RUN_DIR` "
+        "writes), rebuild the problem, generate struts (layout: minimum-volume truss LP over a "
+        "ground structure; skeleton: medial axis of the SIMP solid), verify them by FE and write "
+        "struts.stl, struts.png and struts.json. Exit codes: 0 done, 1 failed, 2 invalid input.",
+    )
+    p_struts.add_argument("run", metavar="RUN_DIR_OR_RUN_JSON")
+    p_struts.add_argument("--out", metavar="DIR", default=None, help="default: the run directory")
+    p_struts.add_argument("--mode", choices=("layout", "skeleton"), default="layout")
+    p_struts.add_argument(
+        "--sigma", type=float, default=20.0, help="LP stress limit, units of E (default 20)"
+    )
+    p_struts.add_argument(
+        "--spacing", type=float, default=None, help="layout node spacing (default 4 voxels)"
+    )
+    p_struts.add_argument(
+        "--volume",
+        type=float,
+        default=None,
+        help="strut volume (default: the SIMP material volume; <= 0: sigma sizing)",
+    )
+    p_struts.add_argument(
+        "--min-radius", type=float, default=None, help="default max(1, 0.8 voxel)"
+    )
+    p_struts.add_argument(
+        "--max-length", type=float, default=None, help="longest bar (default 0.4 x diagonal)"
+    )
+    p_struts.add_argument(
+        "--sample",
+        choices=("solid", "active"),
+        default="solid",
+        help="layout nodes from the SIMP solid or the whole design domain",
+    )
+    p_struts.set_defaults(func=_struts)
 
     p_mcp = sub.add_parser("mcp", help="MCP server (stdio) over the same API")
     p_mcp.set_defaults(func=_mcp)

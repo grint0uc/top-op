@@ -347,6 +347,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/runs/{id}/struts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Turn a finished run into an explicit strut (truss) structure, verified by FE */
+        post: operations["create_struts_api_runs__id__struts_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/runs/{id}/struts.stl": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Download the strut structure of a run (POST /api/runs/{id}/struts first) */
+        get: operations["struts_stl_api_runs__id__struts_stl_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/health": {
         parameters: {
             query?: never;
@@ -843,6 +877,120 @@ export interface components {
              * @default null
              */
             message: string | null;
+        };
+        /**
+         * StrutRequest
+         * @description Strut generation parameters (`core.struts.StrutParams`); lengths in mesh units.
+         */
+        StrutRequest: {
+            /**
+             * Mode
+             * @description layout: ground-structure truss LP; skeleton: medial axis of the SIMP solid
+             * @default layout
+             * @enum {string}
+             */
+            mode: "layout" | "skeleton";
+            /**
+             * Sigma Allow
+             * @description LP stress limit (units of E)
+             * @default 20
+             */
+            sigma_allow: number;
+            /**
+             * Node Spacing
+             * @description sampled-node spacing; null: 4 h
+             */
+            node_spacing?: number | null;
+            /**
+             * Max Bar Length
+             * @description longest candidate bar; null: 0.4 x domain diagonal
+             */
+            max_bar_length?: number | null;
+            /**
+             * Target Volume
+             * @description strut volume; null: the SIMP material volume; <= 0: sigma_allow sizing
+             */
+            target_volume?: number | null;
+            /**
+             * Min Radius
+             * @description null: max(1, 0.8 h)
+             */
+            min_radius?: number | null;
+            /**
+             * Sample
+             * @description layout nodes from the SIMP solid (rho >= 0.3) or the whole domain
+             * @default solid
+             * @enum {string}
+             */
+            sample: "solid" | "active";
+        };
+        /** StrutSummary */
+        StrutSummary: {
+            /** Run Id */
+            run_id: string;
+            /** Mode */
+            mode: string;
+            /** N Nodes */
+            n_nodes: number;
+            /** N Bars */
+            n_bars: number;
+            /** Radius Min */
+            radius_min: number;
+            /** Radius Max */
+            radius_max: number;
+            /**
+             * Volume
+             * @description strut volume outside the keep-ins (mesh)
+             */
+            volume: number;
+            /** Target Volume */
+            target_volume: number;
+            /**
+             * Voxel Volume
+             * @description strut voxels in the free cells x h^3
+             */
+            voxel_volume: number;
+            /**
+             * Simp Volume
+             * @description sum of the SIMP densities over the free cells x h^3
+             */
+            simp_volume: number;
+            /**
+             * Lp Volume
+             * @description optimal LP volume at sigma_allow (layout)
+             */
+            lp_volume?: number | null;
+            /**
+             * Compliance
+             * @description per load case, voxelized struts
+             */
+            compliance: number[];
+            /**
+             * Simp Compliance
+             * @description per load case, the SIMP density
+             */
+            simp_compliance: number[];
+            /** Compliance Ratio */
+            compliance_ratio?: number | null;
+            /**
+             * Stress Max
+             * @description max von Mises over the strut voxels
+             */
+            stress_max?: number | null;
+            /** Watertight */
+            watertight: boolean;
+            /** N Bodies */
+            n_bodies: number;
+            /** Triangles */
+            triangles: number;
+            /** Warnings */
+            warnings: string[];
+            /** Timings */
+            timings: {
+                [key: string]: number;
+            };
+            /** Stl Url */
+            stl_url: string;
         };
         /** SupportSpec */
         SupportSpec: {
@@ -1866,6 +2014,99 @@ export interface operations {
                 };
                 content: {
                     "image/png": string;
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_struts_api_runs__id__struts_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StrutRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StrutSummary"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Content */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    struts_stl_api_runs__id__struts_stl_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Strut mesh made by POST /api/runs/{id}/struts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "model/stl": string;
                 };
             };
             /** @description Not Found */
