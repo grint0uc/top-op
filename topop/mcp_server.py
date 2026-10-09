@@ -19,6 +19,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import ValidationError
 
 from topop.agent import (
+    OUTPUT_FILES,
     ProjectInvalid,
     Session,
     explain_validation_error,
@@ -53,7 +54,10 @@ Always check that a load/support resolved to a sensible node count before runnin
 """
 
 SELECTION_HELP = """\
-SELECTION: a JSON object; "kind" picks the shape. Coordinates are in the mesh's own units.
+SELECTION: a JSON object; "kind" picks the shape. Coordinates are in the mesh's own units, in WORLD
+space: the mesh as the project places it (design_transform applied). describe_mesh(mesh_id,
+project_id=...) lists the facets in that frame; without project_id its normals/centroids/bboxes are the
+raw file's, which only agree while the design_transform is the identity. Facet ids agree in both frames.
  facets   {"kind":"facets","facet_ids":[0,3]}   facet ids from describe_mesh: coplanar groups and cylinders
           (same angle_deg, default 5); for STEP meshes the ids are exact B-rep faces. A hole = the facet
           with kind "cylinder" and the radius you want; facet_faces(mesh_id, facet_id) lists its triangles
@@ -90,6 +94,32 @@ def _round(obj: Any, sig: int = 6) -> Any:
 
 def _dump(model: Any) -> dict:
     return model.model_dump(mode="json")
+
+
+def _absolute(path: str) -> Path:
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        raise ValueError(
+            f"path must be absolute: {path!r} would be resolved against the MCP server's working "
+            f"directory ({Path.cwd()}), not yours"
+        )
+    return p
+
+
+def _output_path(path: str, suffix: str, overwrite: bool) -> Path:
+    """An absolute `path` ending in `suffix` that is new, or an existing regular file of that type
+    when `overwrite` is set. Anything else is refused (ValueError)."""
+    p = _absolute(path)
+    if p.suffix.lower() != suffix:
+        raise ValueError(f"{p}: the file name must end in {suffix}")
+    if p.is_symlink():
+        raise ValueError(f"{p} is a symbolic link; refusing to write through it")
+    if p.exists():
+        if not p.is_file():
+            raise ValueError(f"{p} exists and is not a regular file")
+        if not overwrite:
+            raise ValueError(f"{p} already exists; pass overwrite=true to replace it")
+    return p
 
 
 def _brief(p: Project) -> dict:
@@ -228,7 +258,9 @@ def create_server(session: Session | None = None) -> MCPServer:
         return _round(_dump(session.load_mesh(path)))
 
     @tool()
-    def describe_mesh(mesh_id: str, angle_deg: float = 5.0, top: int = 30) -> dict:
+    def describe_mesh(
+        mesh_id: str, angle_deg: float = 5.0, top: int = 30, project_id: str | None = None
+    ) -> dict:
         """Mesh info plus the facet table that lets you name faces without seeing them. Each row has
         id, n_faces, area, kind, unit normal, centroid and bbox [[min],[max]]. kind is "plane" (a group
         of coplanar triangles, neighbours within angle_deg of each other; has a normal), "cylinder"
@@ -238,8 +270,14 @@ def create_server(session: Session | None = None) -> MCPServer:
         meshes list their exact B-rep faces instead (angle_deg is ignored, each row also has
         `brep_face`, the face index in the file, and ids never renumber). `top` rows are returned
         (0 = all). Select a facet with {"kind":"facets","facet_ids":[id],"angle_deg":<same>}. Combine
-        with preview_mesh to check what you picked."""
-        data = session.describe_mesh(mesh_id, angle_deg, top)
+        with preview_mesh to check what you picked.
+        FRAME: selections (`direction`, `within`, plane `point`, primitives) are WORLD coordinates,
+        the mesh as the project places it (design_transform / reference-model transform applied).
+        Without project_id the geometry here is the raw file's ("frame": "mesh"); pass project_id
+        to get it in world coordinates ("frame": "world"; mesh_id may then also be "design" or
+        "ref:<id>"). Use the world table whenever the project has a design_transform. Facet ids are
+        the same in both frames."""
+        data = session.describe_mesh(mesh_id, angle_deg, top, project_id)
         optional = ("axis", "radius", "brep_face")
         data["facets"] = [
             {k: v for k, v in f.items() if k not in optional or v is not None}
@@ -604,7 +642,12 @@ def create_server(session: Session | None = None) -> MCPServer:
 
     @tool()
     def export_stl(
-        run_id: str, path: str, threshold: float = 0.5, smooth: int = 0, trim: bool = False
+        run_id: str,
+        path: str,
+        threshold: float = 0.5,
+        smooth: int = 0,
+        trim: bool = False,
+        overwrite: bool = False,
     ) -> dict:
         """Write the result as a binary STL (marching-cubes iso-surface of the density at
         threshold; smooth = Laplacian smoothing iterations, 0-10, more shrinks thin members).
@@ -612,10 +655,12 @@ def create_server(session: Session | None = None) -> MCPServer:
         space): the part never pokes outside the CAD surface and keeps its exact faces (flat
         mounting faces, hole walls) wherever material reaches them, instead of the stair-stepped
         voxel skin. It needs a watertight design mesh; if that or the boolean fails, the untrimmed
-        STL is written and the reason is returned under "warnings". Parent directories are created.
-        Returns path, byte size and triangle count."""
+        STL is written and the reason is returned under "warnings".
+        path: ABSOLUTE (this server's working directory is not yours), ending in .stl; parent
+        directories are created. An existing file is only replaced with overwrite=true (and only
+        a regular .stl file). Returns path, byte size and triangle count."""
+        out = _output_path(path, ".stl", overwrite)
         data, warnings = session.export_stl(run_id, threshold, smooth, trim)
-        out = Path(path).expanduser().resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(data)
         result = {"path": str(out), "bytes": len(data), "triangles": (len(data) - 84) // 50}
@@ -623,15 +668,27 @@ def create_server(session: Session | None = None) -> MCPServer:
 
     @tool()
     def export_files(
-        run_id: str, directory: str, threshold: float = 0.5, smooth: int = 0, trim: bool = False
+        run_id: str,
+        directory: str,
+        threshold: float = 0.5,
+        smooth: int = 0,
+        trim: bool = False,
+        overwrite: bool = False,
     ) -> dict:
         """Write everything into a directory: result.stl, result.png (iso), result.vti (ParaView
         density + passive mask + von Mises "stress" cell data), density.npz (numpy arrays, with a
         "stress" key) and run.json (project + run record; `topop run run.json` re-runs it
         headlessly). trim=true clips result.stl (and the png) to the design surface, see
-        export_stl. Returns the written paths and, under "errors", any file that could not be made
-        and, under "warnings", why a trim was skipped."""
-        return session.write_outputs(run_id, directory, threshold, smooth, trim)
+        export_stl. directory: ABSOLUTE (this server's working directory is not yours), created
+        if missing; if any of those five files already exists nothing is written unless
+        overwrite=true. Returns the written paths and, under "errors", any file that could not be
+        made and, under "warnings", why a trim was skipped."""
+        out = _absolute(directory)
+        if out.exists() and not out.is_dir():
+            raise ValueError(f"{out} exists and is not a directory")
+        for name in OUTPUT_FILES:
+            _output_path(str(out / name), Path(name).suffix, overwrite)
+        return session.write_outputs(run_id, out, threshold, smooth, trim)
 
     @tool()
     def result_stress_summary(run_id: str) -> dict:
@@ -645,10 +702,13 @@ def create_server(session: Session | None = None) -> MCPServer:
         return session.stress_summary(run_id)
 
     @tool()
-    def export_case(project_id: str, path: str) -> dict:
+    def export_case(project_id: str, path: str, overwrite: bool = False) -> dict:
         """Save the project as a case file (JSON) that `topop run` and load_case read. Mesh files
-        are referenced by path relative to the case file when their source file is known."""
-        return {"path": session.save_case(project_id, path)}
+        are referenced by path relative to the case file when their source file is known.
+        path: ABSOLUTE (this server's working directory is not yours), ending in .json; an
+        existing file is only replaced with overwrite=true (and only a regular .json file)."""
+        out = _output_path(path, ".json", overwrite)
+        return {"path": session.save_case(project_id, out)}
 
     @tool()
     def load_case(path: str) -> dict:

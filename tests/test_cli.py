@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 import threading
@@ -14,7 +15,7 @@ import pytest
 import trimesh
 
 from topop.agent import Session, expand_selection, parse_selection, pretty_json
-from topop.cli import main
+from topop.cli import _allow_host, main
 from topop.core.voxelize import transform_matrix
 from topop.server.schemas import ProjectIn, RunExport
 
@@ -98,22 +99,41 @@ def test_run_cantilever_writes_everything(examples_dir, capsys, tmp_path):
 
 def test_run_json_is_rerunnable(examples_dir, tmp_path):
     first, second = tmp_path / "first", tmp_path / "second"
-    base = ["run", examples_dir / "cantilever.json", "--quiet"]
+    base = ["run", examples_dir / "cantilever.json", "--quiet", "--threshold", 0.05]
     assert cli(*base, "--out", first, "--max-iter", 2, "--resolution", 12) == 0
-    assert cli("run", first / "run.json", "--out", second, "--max-iter", 3, "--quiet") == 0
+    again = ["run", first / "run.json", "--out", second, "--max-iter", 3, "--quiet"]
+    assert cli(*again, "--threshold", 0.05) == 0
     again = RunExport.model_validate_json((second / "run.json").read_text())
     assert len(again.run.history) == 3 and again.project.grid.elements_along_longest == 12
 
 
-def test_run_with_threshold_above_every_density_still_writes_the_rest(
-    examples_dir, capsys, tmp_path
-):
+def test_run_without_result_stl_writes_the_rest_and_exits_1(examples_dir, capsys, tmp_path):
     out = tmp_path / "out"
     args = ["run", examples_dir / "cantilever.json", "--out", out, "--max-iter", 2, "--quiet"]
-    assert cli(*args, "--resolution", 12, "--threshold", 0.99) == 0
-    assert "result.stl not written: no material above threshold 0.99" in capsys.readouterr().err
+    assert cli(*args, "--resolution", 12, "--threshold", 0.99) == 1
+    err = capsys.readouterr().err
+    assert "result.stl not written: no material above threshold 0.99" in err
+    assert "failed: result.stl was not written" in err
     assert not (out / "result.stl").exists() and (out / "run.json").exists()
     assert (out / "density.npz").exists()
+
+
+@pytest.mark.parametrize(
+    "flags, needle",
+    [
+        (["--threshold", 0], "must be in (0, 1]"),
+        (["--threshold", 1.5], "must be in (0, 1]"),
+        (["--threshold", "nan"], "must be in (0, 1]"),
+        (["--threshold", "half"], "not a number"),
+        (["--smooth", -1], "must be >= 0"),
+        (["--smooth", 1.5], "not an integer"),
+    ],
+)
+def test_run_rejects_bad_threshold_and_smooth(examples_dir, capsys, tmp_path, flags, needle):
+    out = tmp_path / "out"
+    assert cli("run", examples_dir / "cantilever.json", "--out", out, *flags) == 2
+    assert needle in capsys.readouterr().err
+    assert not out.exists()  # refused before anything ran
 
 
 def test_run_without_supports_exits_2(examples_dir, capsys, tmp_path):
@@ -396,7 +416,8 @@ def test_run_reports_why_a_trim_was_skipped(examples_dir, capsys, tmp_path, monk
 def test_run_stress_limit_forces_mma_and_reports_the_verdict(examples_dir, capsys, tmp_path):
     out = tmp_path / "out"
     args = ["run", examples_dir / "cantilever.json", "--out", out, "--resolution", 16]
-    assert cli(*args, "--max-iter", 3, "--optimizer", "oc", "--stress-limit", 5) == 0
+    flags = ["--max-iter", 3, "--optimizer", "oc", "--stress-limit", 5, "--threshold", 0.05]
+    assert cli(*args, *flags) == 0
     text = capsys.readouterr().out
     assert "forced to mma" in text and "optimizer mma" in text
     head = next(ln for ln in text.splitlines() if ln.split()[:2] == ["it", "compliance"])
@@ -436,9 +457,21 @@ def test_run_rejects_a_negative_stress_limit(examples_dir, capsys, tmp_path):
 def test_symmetry_flag_takes_a_position_and_repeats(examples_dir, tmp_path):
     out = tmp_path / "out"
     args = ["run", examples_dir / "cantilever.json", "--out", out, "--resolution", 12, "--quiet"]
-    assert cli(*args, "--max-iter", 2, "--symmetry", "y", "--symmetry", "z=10.5") == 0
+    flags = ["--max-iter", 2, "--symmetry", "y", "--symmetry", "z=10.5", "--threshold", 0.05]
+    assert cli(*args, *flags) == 0
     export = RunExport.model_validate_json((out / "run.json").read_text())
     assert [(s.axis, s.position) for s in export.project.params.symmetry] == [
         ("y", None),
         ("z", 10.5),
     ]
+
+
+def test_serve_host_is_added_to_the_allowed_hosts(monkeypatch, capsys):
+    monkeypatch.delenv("TOPOP_ALLOWED_HOSTS", raising=False)
+    _allow_host("127.0.0.1")
+    assert "TOPOP_ALLOWED_HOSTS" not in os.environ  # localhost is always allowed
+    _allow_host("192.168.1.5")
+    _allow_host("fe80::1")
+    assert os.environ["TOPOP_ALLOWED_HOSTS"] == "192.168.1.5,[fe80::1]"
+    _allow_host("0.0.0.0")  # every interface: the names clients use cannot be guessed
+    assert "TOPOP_ALLOWED_HOSTS" in capsys.readouterr().err

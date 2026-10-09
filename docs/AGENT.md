@@ -11,12 +11,16 @@ claude mcp add top-op -- uv run --directory /path/to/top-op topop mcp
 ```
 
 Equivalent `.mcp.json` entry: `{"mcpServers": {"top-op": {"command": "uv", "args": ["run", "--directory", "/path/to/top-op", "topop", "mcp"]}}}`.
-Optional `"env": {"TOPOP_DATA_DIR": "/some/dir"}` keeps projects somewhere else.
+Optional `"env": {"TOPOP_DATA_DIR": "/some/dir"}` keeps projects somewhere else. A running `topop serve` on the
+same data dir picks up projects and finished runs made here (and the other way round) without a restart.
 
 ## The loop: describe, select, run, look
 
 1. `load_mesh(path)` gives a `mesh_id`; `describe_mesh(mesh_id)` prints the bbox and a facet table
    (id, area, kind, normal or axis+radius, centroid, bbox of every face group, largest first). `preview_mesh` is the picture.
+   That table is in the mesh file's own coordinates (`"frame": "mesh"`). Once the project gives the mesh a
+   `design_transform`, use `describe_mesh(mesh_id, project_id=...)` (`"frame": "world"`; `mesh_id` may also be
+   `"design"` or `"ref:<id>"`): the same facet ids with normals, centroids, bboxes, axes and radii in world space.
 2. `create_project(name, design_mesh_id, elements_along_longest=30..40)`, then `add_support` and `add_load`
    with selections (below). Each call returns how many grid nodes the selection resolved to: 0 means it missed.
 3. `voxel_stats(project_id)`: grid size, `n_active`, memory/time estimate, warnings, node counts per load/support.
@@ -24,10 +28,14 @@ Optional `"env": {"TOPOP_DATA_DIR": "/some/dir"}` keeps projects somewhere else.
    should sit at `volfrac`, `change` should drop below `tol` (0.01).
 5. `result_preview(run_id)` (orange = result, grey = original). Try `view` `iso`, `+x`, `+y`, `+z`. Adjust
    (`set_params`, `set_grid`, `add_ref_model`, move a load), `run` again, then `export_stl(run_id, path)`.
+   Export paths (`export_stl`, `export_files`, `export_case`) must be **absolute** (the MCP server's working
+   directory is not yours) and end in `.stl` / `.json`; an existing file is only replaced with `overwrite=true`.
 
 CLI equivalent: `topop describe part.stl --png part.png`, write a case file, `topop run case.json --out out/`
 (writes `result.stl`, `result.png`, `result.vti`, `density.npz`, `run.json`; `run.json` re-runs with `topop run`).
-Exit codes: 0 done, 1 failed, 2 invalid case or project (issues printed), 3 out of memory. Overrides for the
+Exit codes: 0 done, 1 failed (also when `result.stl` could not be written, e.g. no density above `--threshold`;
+the other files are still written), 2 invalid case, project or flags (`--threshold` must be in (0, 1], `--smooth`
+>= 0; issues printed), 3 out of memory, 130 interrupted. Overrides for the
 design rules below: `--symmetry y` (or `y=12.5`, repeatable), `--overhang +z` (write `--overhang=-z` for negative
 directions), `--stress-limit 200`, `--optimizer mma`; `--trim` clips `result.stl` to the CAD surface. The per-iteration
 table gains `stress_max` (and `constraint` with a limit); the summary names the final max stress and, with a limit,
@@ -35,7 +43,12 @@ whether the constraint ended satisfied.
 `export_case` / `load_case` convert between a project and a case file (`examples/*.json`: a `ProjectIn` whose
 meshes are `path`s relative to the file; selections may use `"mesh_id": "design"`).
 
-## Selections (loads, supports; coordinates in the mesh's own units)
+## Selections (loads, supports; coordinates in the mesh's own units, world space)
+
+Every coordinate and direction (`direction`, `within`, plane `point`/`normal`, primitives) is in **world space**:
+the mesh as the project places it, `design_transform` (or a reference model's `transform`) applied. Facet ids
+are those of `describe_mesh` and do not depend on the transform; read normals and positions for a transformed
+design from `describe_mesh(mesh_id, project_id=...)`.
 
 | kind | JSON |
 |---|---|
@@ -102,6 +115,12 @@ and the primitives work on the tessellation as for any mesh. Without the extra, 
 - `overhang`: the base plate is the first grid layer that holds active cells along the build axis; cells of a keep-in
   body floating above a gap are unsupported by construction and will be removed.
 - Always check the node counts before running; "resolves to zero nodes" blocks the run. Supports must stop all rigid motion.
+- A `normal` or `within` taken from the raw `describe_mesh` table misses once the design has a rotation or scale in
+  `design_transform`: describe it with `project_id` (world frame) instead.
+- `topop serve` answers only requests addressed to localhost (`TOPOP_ALLOWED_HOSTS=name1,name2` adds hosts) and refuses
+  state-changing requests from pages of other sites (403); uploads above `TOPOP_MAX_UPLOAD_MB` (200) get 413, and
+  `POST /api/runs` gets 429 while `TOPOP_MAX_QUEUED` (4) runs wait. A stream client that falls behind gets every
+  progress message but only the newest density frame, and is disconnected after 30 s without reading.
 - Size: keep `n_active` <= about 150k on a 16 GB machine (`est_bytes` and `est_sec_per_iter` in `voxel_stats`, about 30 KB per element).
   Debug at 30-40 elements along the longest side, refine to 60-100 at the end. Above the memory cap `run` fails fast (exit 3).
 - Features thinner than about 2 voxels vanish; `rmin` (voxels, default 2) also limits the smallest member. Non-watertight

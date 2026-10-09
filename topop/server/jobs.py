@@ -1,13 +1,15 @@
 """Background optimization runs: one thread per run, serialised by a semaphore, fanned out to
-WebSocket subscribers through asyncio queues (`loop.call_soon_threadsafe`)."""
+WebSocket subscribers through bounded mailboxes (`Mailbox`)."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import struct
 import threading
 import time
+from collections import deque
 
 import numpy as np
 from fastapi import Request
@@ -20,7 +22,10 @@ from topop.server.store import TERMINAL, RunRecord, Store, now_iso, store_of
 
 log = logging.getLogger(__name__)
 
-CLOSE = None  # queue sentinel: no more messages for this subscriber
+CLOSE = None  # mailbox sentinel: no more messages for this subscriber
+GONE = object()  # mailbox marker: the subscriber was dropped (stalled) or disconnected
+STALL_SECONDS = 30.0  # a subscriber that takes nothing for this long while messages wait is dropped
+DEFAULT_MAX_QUEUED = 4
 RESULT_STATUS = {
     "converged": "done",
     "max_iter": "done",
@@ -55,11 +60,93 @@ def _status_msg(kind: str, info: RunInfo, message: str | None = None) -> dict:
     return StatusMsg(type=kind, message=message, run=info).model_dump(mode="json")
 
 
+def max_queued() -> int:
+    """TOPOP_MAX_QUEUED (default 4): runs allowed to wait behind the running one."""
+    try:
+        return max(0, int(os.environ.get("TOPOP_MAX_QUEUED") or DEFAULT_MAX_QUEUED))
+    except ValueError:
+        return DEFAULT_MAX_QUEUED
+
+
+class Mailbox:
+    """One stream subscriber: every JSON message in order, but at most one density frame (a new
+    frame replaces one not sent yet). Filled from any thread, drained on the subscriber's loop."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self.loop = loop
+        self._lock = threading.Lock()
+        self._items: deque = deque()
+        self._has_frame = False
+        self._waiting_since: float | None = None  # since when something waits and nothing is taken
+        self._gone = False
+        self._wake = asyncio.Event()  # set/cleared/awaited on `loop` only
+
+    def put(self, msg: dict | bytes | None) -> bool:
+        """Queue a JSON message, a density frame or CLOSE. False once the subscriber is gone."""
+        with self._lock:
+            if self._gone:
+                return False
+            if self._waiting_since is None:
+                self._waiting_since = time.monotonic()
+            if isinstance(msg, bytes):
+                if self._has_frame:  # keep only the newest frame, after the progress it belongs to
+                    for i in range(len(self._items) - 1, -1, -1):
+                        if isinstance(self._items[i], bytes):
+                            del self._items[i]
+                            break
+                self._has_frame = True
+            self._items.append(msg)
+        return self._notify()
+
+    def stalled(self, limit: float) -> bool:
+        with self._lock:
+            since = self._waiting_since
+        return since is not None and time.monotonic() - since > limit
+
+    def drop(self) -> None:
+        """Discard what is queued; `get` returns GONE from now on."""
+        with self._lock:
+            self._gone = True
+            self._items.clear()
+            self._has_frame = False
+            self._waiting_since = None
+        self._notify()
+
+    def pending(self) -> list:
+        with self._lock:
+            return list(self._items)
+
+    def _notify(self) -> bool:
+        try:
+            self.loop.call_soon_threadsafe(self._wake.set)
+        except RuntimeError:  # the subscriber's event loop is closed
+            with self._lock:
+                self._gone = True
+                self._items.clear()
+            return False
+        return True
+
+    async def get(self) -> dict | bytes | None | object:
+        while True:
+            with self._lock:
+                if self._gone:
+                    return GONE
+                if self._items:
+                    msg = self._items.popleft()
+                    if isinstance(msg, bytes):
+                        self._has_frame = False
+                    self._waiting_since = time.monotonic() if self._items else None
+                    return msg
+                self._wake.clear()
+            await self._wake.wait()
+
+
 class RunManager:
     def __init__(self, store: Store):
         self.store = store
         self.semaphore = threading.Semaphore(1)  # one run at a time per process
-        self._threads: dict[str, threading.Thread] = {}
+        self._threads: dict[str, tuple[threading.Thread, RunRecord]] = {}
+        self._threads_lock = threading.Lock()
 
     # ---- lifecycle ------------------------------------------------------------------------------
 
@@ -68,8 +155,15 @@ class RunManager:
         thread = threading.Thread(
             target=self._worker, args=(rec, built, params), name=f"topop-run-{run_id}", daemon=True
         )
-        self._threads[run_id] = thread
+        with self._threads_lock:
+            self._threads[run_id] = (thread, rec)
         thread.start()
+
+    def queued(self) -> int:
+        """Runs of this manager still waiting for the semaphore."""
+        with self._threads_lock:
+            recs = [rec for _, rec in self._threads.values()]
+        return sum(1 for rec in recs if rec.info.status == "queued")
 
     def cancel(self, run_id: str) -> RunInfo:
         rec = self.store.get_run(run_id)
@@ -81,11 +175,12 @@ class RunManager:
         return rec.snapshot()
 
     def shutdown(self, timeout: float = 10.0) -> None:
-        for rec in self.store.list_runs():
-            if not rec.finished:
-                rec.cancel.set()
+        with self._threads_lock:
+            live = list(self._threads.values())
+        for _, rec in live:
+            rec.cancel.set()
         deadline = time.monotonic() + timeout
-        for thread in list(self._threads.values()):
+        for thread, _ in live:
             thread.join(max(0.0, deadline - time.monotonic()))
 
     def _worker(self, rec: RunRecord, built: BuiltProblem, params: ParamsSpec) -> None:
@@ -105,9 +200,16 @@ class RunManager:
         except Exception as exc:
             log.exception("run %s failed", rec.info.id)
             self._finish(rec, "error", str(exc) or type(exc).__name__)
+        except BaseException as exc:  # SystemExit, KeyboardInterrupt, ...: never leave it running
+            log.exception("run %s aborted", rec.info.id)
+            why = f": {exc}" if str(exc) else ""
+            self._finish(rec, "error", f"run aborted ({type(exc).__name__}{why})")
+            if isinstance(exc, KeyboardInterrupt | SystemExit):
+                raise
         finally:
             self.semaphore.release()
-            self._threads.pop(rec.info.id, None)
+            with self._threads_lock:
+                self._threads.pop(rec.info.id, None)
 
     def _optimize(self, rec: RunRecord, built: BuiltProblem, params: ParamsSpec) -> None:
         every = max(1, int(params.density_every))
@@ -164,42 +266,51 @@ class RunManager:
                     active = rec.built.active if rec.built is not None else None
                     final_frame = density_frame(last_it, rho, active)
                     rec.latest_frame, rec.latest_frame_it = final_frame, last_it
-        self.store.persist_run(rec)  # before `done` goes out, so exports exist on disk
-        with rec.lock:
-            if final_frame is not None:
-                self._push_locked(rec, final_frame)
-            self._push_locked(rec, _status_msg(status, rec.info.model_copy(deep=True), message))
-            self._push_locked(rec, CLOSE)
-            rec.subscribers.clear()
+        try:
+            # before `done` goes out, so exports exist on disk; a failure is noted in the message
+            self.store.finish_run(rec)
+        finally:  # whatever happened, subscribers get the final status and are closed
+            with rec.lock:
+                if final_frame is not None:
+                    self._push_locked(rec, final_frame)
+                info = rec.info.model_copy(deep=True)
+                self._push_locked(rec, _status_msg(status, info, rec.message))
+                self._push_locked(rec, CLOSE)
+                rec.subscribers.clear()
 
     # ---- WebSocket fan-out ----------------------------------------------------------------------
 
     @staticmethod
     def _push_locked(rec: RunRecord, msg: dict | bytes | None) -> None:
         alive = []
-        for loop, queue in rec.subscribers:
-            try:
-                loop.call_soon_threadsafe(queue.put_nowait, msg)
-            except RuntimeError:  # the subscriber's event loop is closed
+        for box in rec.subscribers:
+            if not box.put(msg):  # disconnected, dropped, or its loop is closed
                 continue
-            alive.append((loop, queue))
+            if msg is not CLOSE and box.stalled(STALL_SECONDS):
+                log.warning(
+                    "run %s: dropping a stream subscriber that read nothing for %.0f s",
+                    rec.info.id,
+                    STALL_SECONDS,
+                )
+                box.drop()
+                continue
+            alive.append(box)
         rec.subscribers[:] = alive
 
-    def subscribe(
-        self, rec: RunRecord, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue
-    ) -> tuple[RunInfo, bytes | None, dict | None]:
+    def subscribe(self, rec: RunRecord, box: Mailbox) -> tuple[RunInfo, bytes | None, dict | None]:
         """(run info so far, latest density frame, final status message if already finished).
 
-        Atomic with respect to the worker: every message after the snapshot reaches `queue`.
+        Atomic with respect to the worker: every message after the snapshot reaches `box`. A
+        finished run's frame is rebuilt from runs/{id}.npz, so call this off the event loop.
         """
         with rec.lock:
             info = rec.info.model_copy(deep=True)
             frame = rec.latest_frame
             if rec.info.status not in TERMINAL:
-                rec.subscribers.append((loop, queue))
+                rec.subscribers.append(box)
                 return info, frame, None
-        message = rec.message if rec.message is not None else info.error
-        if frame is None:  # finished before a restart: rebuild the last frame from runs/{id}.npz
+            message = rec.message if rec.message is not None else info.error
+        if frame is None:  # released after persisting, or finished before a restart
             res = self.store.run_result(rec)
             if res is not None:
                 rho, _, active, _ = res
@@ -207,9 +318,9 @@ class RunManager:
         return info, frame, _status_msg(info.status, info, message)
 
     @staticmethod
-    def unsubscribe(rec: RunRecord, queue: asyncio.Queue) -> None:
+    def unsubscribe(rec: RunRecord, box: Mailbox) -> None:
         with rec.lock:
-            rec.subscribers[:] = [s for s in rec.subscribers if s[1] is not queue]
+            rec.subscribers[:] = [b for b in rec.subscribers if b is not box]
 
 
 def runs_of(app) -> RunManager:

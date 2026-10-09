@@ -29,9 +29,10 @@ NOT_FOUND = {404: {"model": ErrorResponse}}
 StoreDep = Annotated[Store, Depends(get_store)]
 
 
-def _project(store: Store, project_id: str) -> Project:
+async def _project(store: Store, project_id: str) -> Project:
+    """The project, re-read if another process (`topop mcp`) saved it; 404 if unknown."""
     try:
-        return store.get_project(project_id)
+        return await asyncio.to_thread(store.get_project, project_id)
     except NotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -53,12 +54,12 @@ async def create_project(body: ProjectIn, store: StoreDep) -> Project:
 
 @router.get("/projects", response_model=list[Project], summary="List projects")
 async def list_projects(store: StoreDep) -> list[Project]:
-    return store.list_projects()
+    return await asyncio.to_thread(store.list_projects)
 
 
 @router.get("/projects/{id}", response_model=Project, responses=NOT_FOUND, summary="Get a project")
 async def get_project(id: str, store: StoreDep) -> Project:
-    return _project(store, id)
+    return await _project(store, id)
 
 
 @router.put(
@@ -78,7 +79,7 @@ async def update_project(id: str, body: Project, store: StoreDep) -> Project:
     summary="Voxelize the project and report grid statistics",
 )
 async def voxelize_project(id: str, store: StoreDep) -> VoxelStats:
-    project = _project(store, id)
+    project = await _project(store, id)
     domain = await project_domain(store, project)
     # loads/supports that resolve to nothing at this resolution are worth a warning here
     _, _, warnings, errors = await asyncio.to_thread(resolve_project_selections, project, domain)
@@ -95,7 +96,7 @@ async def voxelize_project(id: str, store: StoreDep) -> VoxelStats:
     summary="Resolve a selection to full-grid nodes (preview capped at 5000 points)",
 )
 async def resolve_selection(id: str, body: Selection, store: StoreDep) -> ResolvedNodes:
-    project = _project(store, id)
+    project = await _project(store, id)
     domain = await project_domain(store, project)
 
     def work() -> ResolvedNodes:

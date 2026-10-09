@@ -435,3 +435,116 @@ def test_topop_mcp_serves_over_stdio(examples_dir):
             assert json.loads(res.content[0].text)["n_faces"] == 1326
 
     anyio.run(main)
+
+
+def test_exports_need_absolute_new_paths_of_the_right_type(examples_dir, tmp_path):
+    async def scenario(agent: Agent):
+        pid = await setup_cantilever(agent, examples_dir, elements_along_longest=12)
+        rid = (await agent("run", project_id=pid, max_iter=2))["run_id"]
+        msg = await agent.fails("export_stl", run_id=rid, path="out.stl", threshold=0.05)
+        assert "must be absolute" in msg and "working directory" in msg
+        assert "must be absolute" in await agent.fails("export_case", project_id=pid, path="c.json")
+        assert "must be absolute" in await agent.fails("export_files", run_id=rid, directory="o")
+
+        victim = tmp_path / "victim.txt"
+        victim.write_text("important notes\n")
+        for overwrite in (False, True):
+            msg = await agent.fails(
+                "export_stl", run_id=rid, path=str(victim), threshold=0.05, overwrite=overwrite
+            )
+            assert ".stl" in msg
+            msg = await agent.fails(
+                "export_case", project_id=pid, path=str(victim), overwrite=overwrite
+            )
+            assert ".json" in msg
+        assert victim.read_text() == "important notes\n"
+
+        stl = tmp_path / "part.stl"
+        await agent("export_stl", run_id=rid, path=str(stl), threshold=0.05)
+        assert "already exists" in await agent.fails(
+            "export_stl", run_id=rid, path=str(stl), threshold=0.05
+        )
+        again = await agent("export_stl", run_id=rid, path=str(stl), threshold=0.05, overwrite=True)
+        assert again["bytes"] == stl.stat().st_size
+        link = tmp_path / "link.stl"
+        link.symlink_to(victim)
+        msg = await agent.fails("export_stl", run_id=rid, path=str(link), overwrite=True)
+        assert "symbolic link" in msg and victim.read_text() == "important notes\n"
+
+        out = tmp_path / "all"
+        await agent("export_files", run_id=rid, directory=str(out), threshold=0.05)
+        assert "already exists" in await agent.fails(
+            "export_files", run_id=rid, directory=str(out), threshold=0.05
+        )
+        done = await agent(
+            "export_files", run_id=rid, directory=str(out), threshold=0.05, overwrite=True
+        )
+        assert done["errors"] == {} and len(done["files"]) == 5
+        assert "not a directory" in await agent.fails(
+            "export_files", run_id=rid, directory=str(stl)
+        )
+
+        case = tmp_path / "case.json"
+        await agent("export_case", project_id=pid, path=str(case))
+        assert "already exists" in await agent.fails("export_case", project_id=pid, path=str(case))
+        assert (await agent("export_case", project_id=pid, path=str(case), overwrite=True))["path"]
+
+    drive(scenario)
+
+
+def test_describe_mesh_in_the_project_frame(examples_dir):
+    async def scenario(agent: Agent):
+        mesh = await agent("load_mesh", path=str(examples_dir / "cantilever.stl"))
+        # rotate 90 deg about z, scale 2, move by (100, 0, 0); column-major
+        t = [0, 2, 0, 0, -2, 0, 0, 0, 0, 0, 2, 0, 100, 0, 0, 1]
+        made = await agent("create_project", name="placed", design_mesh_id=mesh["id"],
+                           elements_along_longest=16, design_transform=t)  # fmt: skip
+        pid = made["project_id"]
+        raw = await agent("describe_mesh", mesh_id=mesh["id"])
+        world = await agent("describe_mesh", mesh_id=mesh["id"], project_id=pid)
+        assert raw["frame"] == "mesh" and world["frame"] == "world"
+        assert np.allclose(raw["mesh"]["bbox"], [[0, 0, 0], [60, 20, 20]])
+        assert np.allclose(world["mesh"]["bbox"], [[60, 0, 0], [100, 120, 40]])
+        assert world["mesh"]["volume"] == pytest.approx(8 * 24000)
+        assert [f["id"] for f in world["facets"]] == [f["id"] for f in raw["facets"]]
+        for r, w in zip(raw["facets"], world["facets"], strict=True):
+            (nx, ny, nz), (cx, cy, cz) = r["normal"], r["centroid"]
+            assert np.allclose(w["normal"], [-ny, nx, nz], atol=1e-6)
+            assert np.allclose(w["centroid"], [100 - 2 * cy, 2 * cx, 2 * cz])
+            assert w["area"] == pytest.approx(4 * r["area"])
+            lo, hi = np.asarray(w["bbox"])
+            assert np.allclose((lo + hi) / 2, w["centroid"])
+        # the frame selections are resolved in: facet 0's nodes lie on the face described
+        top = world["facets"][0]
+        sel = {"kind": "facets", "facet_ids": [top["id"]]}
+        nodes = await agent("resolve_selection", project_id=pid, selection=sel)
+        axis = int(np.argmax(np.abs(top["normal"])))
+        assert nodes["count"] > 0
+        assert (
+            np.abs(np.asarray(nodes["bbox"])[:, axis] - top["centroid"][axis]).max() <= nodes["h"]
+        )
+        same = await agent("describe_mesh", mesh_id="design", project_id=pid)
+        assert same["facets"] == world["facets"]
+        assert "not part of project" in await agent.fails(
+            "describe_mesh", mesh_id="0" * 16, project_id=pid
+        )
+
+    drive(scenario)
+
+
+def test_describe_step_mesh_in_the_project_frame(examples_dir):
+    pytest.importorskip("OCP", reason="STEP support not installed (uv sync --extra step)")
+
+    async def scenario(agent: Agent):
+        mesh = await agent("load_mesh", path=str(examples_dir / "bracket.step"))
+        t = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 50, 1]  # up by 50
+        pid = (await agent("create_project", name="s", design_mesh_id=mesh["id"],
+                           elements_along_longest=12, design_transform=t))["project_id"]  # fmt: skip
+        raw = await agent("describe_mesh", mesh_id=mesh["id"], top=0)
+        world = await agent("describe_mesh", mesh_id=mesh["id"], top=0, project_id=pid)
+        for r, w in zip(raw["facets"], world["facets"], strict=True):
+            assert (w["id"], w["brep_face"], w["kind"]) == (r["id"], r["brep_face"], r["kind"])
+            assert np.allclose(w["centroid"], np.add(r["centroid"], [0, 0, 50]))
+            assert w.get("radius") == r.get("radius") and w["normal"] == r["normal"]
+
+    drive(scenario)

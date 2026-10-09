@@ -344,3 +344,25 @@ Deferred or open:
 - Stress is the relaxed voxel stress `rho^0.5 * sigma_vm(solid)`; sharp corners and the clamped face overshoot. No stress-based remeshing or smoothing.
 - `trim=true` needs a closed, consistently oriented design mesh; otherwise it warns and returns the untrimmed surface. Trimming a ~200k-triangle surface takes under 5 s (`tests/test_export.py`).
 - Several stress limits (per region or per load case) and local (non-aggregated) constraints are not supported.
+
+## Status (v0.3 review round)
+
+Two read-only reviews (core; server/CLI/MCP) found what the green suite did not cover, all fixed with
+regression tests (414 tests, incl. slow):
+- Under-constrained supports and loads that only hit fixed DOFs are now rejected by `Problem.validate()`
+  (rigid-body rank, lost-force); partial loss is a warning. A singular stiffness that slips through raises
+  instead of returning garbage.
+- Facet ids resolve on the raw mesh (non-uniform design scale no longer permutes faces); load cases are
+  renumbered; the memory cap is checked from the bounding box before voxelizing and before validating.
+- Inside-out meshes are repaired on load; NPZ/STEP caches are versioned and fail cleanly.
+- Input models reject unknown fields and NaN; face ids, angles and the load-case index are bounded.
+- Server: bounded WebSocket queues (latest density frame only), store refresh across processes, upload
+  size cap, host/origin checks, queued-run limit, finished runs released from memory, atomic writes with
+  fsync, BaseException-safe workers; MCP exports require absolute paths and never overwrite silently;
+  CLI exit codes are meaningful; `describe_mesh(project_id)` reports world-space geometry.
+- Stress constraint: step-target floor, continuation gated on damping, `stress_pnorm` = final exponent.
+- Perf: BLAS pinned inside the assembler instead of process-wide.
+
+Still open: `estimate_bytes` counts active elements only (full-grid filter arrays of a sparse part in a
+large box are not counted); malformed STEP could crash OCC in-process (tessellate in a subprocess if it
+ever matters); the v0.1 tag exists only locally.

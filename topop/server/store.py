@@ -8,7 +8,9 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
+import zipfile
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -39,6 +41,8 @@ log = logging.getLogger(__name__)
 MESH_CACHE = 20
 FACET_CACHE = 20
 DOMAIN_CACHE = 8
+RESULT_CACHE = 2  # finished runs whose density (from runs/{id}.npz) stays loaded
+STALE_TMP_S = 600.0  # `_write_atomic` leftovers older than this are removed when a Store starts
 TERMINAL = ("done", "error", "cancelled")
 _MESH_ID = re.compile(r"[0-9a-f]{16}")
 _SAFE_ID = re.compile(r"[0-9A-Za-z_-]{1,64}")
@@ -58,12 +62,40 @@ def default_data_dir() -> Path:
 
 def _write_atomic(path: Path, data: bytes) -> None:
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
-    tmp.write_bytes(data)
-    tmp.replace(path)
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _remove_stale_tmp(directory: Path, older_than: float = STALE_TMP_S) -> None:
+    """Delete `_write_atomic` temp files a crashed process left behind. Recent ones may belong to
+    another process writing into the same data dir right now, so they are kept."""
+    cutoff = time.time() - older_than
+    for tmp in directory.glob(".*.tmp"):
+        try:
+            if tmp.is_file() and tmp.stat().st_mtime < cutoff:
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+RunResult = tuple[np.ndarray, Grid, np.ndarray, np.ndarray]
 
 
 @dataclass
 class RunRecord:
+    """A run of this process (live or finished) or one read back from runs/{id}.json.
+
+    `built`, `rho`, `stress` and `latest_frame` are only held while the run is live, and after it
+    finished only if persisting failed; otherwise results are read back from runs/{id}.npz.
+    """
+
     info: RunInfo
     project: Project  # snapshot taken when the run was created
     built: BuiltProblem | None = None
@@ -74,10 +106,7 @@ class RunRecord:
     message: str | None = None  # final status message (StatusMsg.message)
     cancel: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
-    subscribers: list = field(default_factory=list)  # (asyncio loop, asyncio.Queue)
-    # result loaded back from runs/{id}.npz after a restart: (rho, grid, active, passive)
-    _from_disk: tuple[np.ndarray, Grid, np.ndarray, np.ndarray] | None = None
-    _stress_from_disk: np.ndarray | None = None
+    subscribers: list = field(default_factory=list)  # jobs.Mailbox per WebSocket
 
     @property
     def finished(self) -> bool:
@@ -96,14 +125,20 @@ class Store:
         self.run_dir = self.root / "runs"
         for d in (self.mesh_dir, self.project_dir, self.run_dir):
             d.mkdir(parents=True, exist_ok=True)
+            _remove_stale_tmp(d)
         self._lock = threading.RLock()
         self._meshes: OrderedDict[str, trimesh.Trimesh] = OrderedDict()
         self._mesh_locks: dict[str, threading.Lock] = {}
         self._facets: OrderedDict[tuple[str, float], tuple[list[dict], int]] = OrderedDict()
-        self._projects: dict[str, Project] | None = None
+        # other processes (`topop mcp`, `topop run`) write into the same directories: projects are
+        # re-read when their file changed, unknown ids and list calls look at the disk
+        self._projects: dict[str, Project] = {}
+        self._project_stamps: dict[str, tuple[int, ...]] = {}  # id -> `_stamp` of the file read
         self._domains: OrderedDict[str, tuple[str, BuiltDomain]] = OrderedDict()
         self._domain_locks: dict[str, threading.Lock] = {}
-        self._runs: dict[str, RunRecord] | None = None
+        self._runs: dict[str, RunRecord] = {}
+        self._unreadable: dict[Path, tuple[int, ...]] = {}  # bad files, skipped until they change
+        self._results: OrderedDict[str, tuple] = OrderedDict()  # run id -> from_npz_bytes(...)
 
     # ---- meshes ---------------------------------------------------------------------------------
 
@@ -112,7 +147,8 @@ class Store:
 
         STEP files (by extension or header) are tessellated once; the original bytes, an STL and
         `{id}.brep.npz` (exact tessellation + B-rep face table) are kept so `get_mesh` never
-        tessellates again.
+        tessellates again. The same bytes uploaded again under another extension keep the file
+        type they were first stored as.
         """
         step = is_step(filename) or is_step(data)
         ext = "step" if step else Path(filename).suffix.lower().lstrip(".")
@@ -121,16 +157,19 @@ class Store:
                 f"cannot tell the file type of {filename!r}; use .stl/.obj/.3mf/.ply/.step"
             )
         mesh_id = hashlib.sha256(data).hexdigest()[:16]
+        stored = self._stored_type(mesh_id)
+        file_type = stored or ext
         with self._lock:
             mesh = self._meshes.get(mesh_id)
-        if mesh is None and step:
-            mesh = self._store_step(mesh_id, data)
-        elif mesh is None:
-            mesh = load_mesh(data, ext)  # ValueError on bad input, before anything is written
-            path = self.mesh_dir / f"{mesh_id}.{ext}"
-            if not path.exists():
-                _write_atomic(path, data)
-        meta = {"name": filename, "file_type": ext}
+        if file_type == "step":
+            if mesh is None or stored is None:
+                mesh = self._store_step(mesh_id, data)
+        else:
+            if mesh is None:
+                mesh = load_mesh(data, file_type)  # ValueError on bad input, before any write
+            if stored is None:
+                _write_atomic(self.mesh_dir / f"{mesh_id}.{file_type}", data)
+        meta = {"name": filename, "file_type": file_type}
         _write_atomic(self.mesh_dir / f"{mesh_id}.json", json.dumps(meta).encode())
         with self._lock:
             mesh = self._meshes.setdefault(mesh_id, mesh)
@@ -138,6 +177,15 @@ class Store:
             while len(self._meshes) > MESH_CACHE:
                 self._meshes.popitem(last=False)
         return self._info(mesh_id, filename, mesh)
+
+    def _stored_type(self, mesh_id: str) -> str | None:
+        """File type of an earlier upload of these bytes whose source file is still on disk."""
+        try:
+            file_type = self._mesh_meta(mesh_id)["file_type"]
+        except (NotFoundError, KeyError, TypeError):
+            return None
+        source = "brep.npz" if file_type == "step" else file_type
+        return file_type if (self.mesh_dir / f"{mesh_id}.{source}").is_file() else None
 
     def _store_step(self, mesh_id: str, data: bytes) -> trimesh.Trimesh:
         cached = self._read_step_cache(mesh_id)
@@ -252,38 +300,74 @@ class Store:
 
     # ---- projects -------------------------------------------------------------------------------
 
-    def _project_map(self) -> dict[str, Project]:
+    @staticmethod
+    def _stamp(path: Path) -> tuple[int, ...] | None:
+        """Identity of a file version: `_write_atomic` renames a new inode into place, so the inode
+        changes even when two saves land in the same mtime tick with the same size."""
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return st.st_ino, st.st_mtime_ns, st.st_size
+
+    def _parse(self, path: Path, model: type, stamp: tuple[int, ...]):
+        """`model` from a JSON file, or None (logged once per file version) if unreadable."""
+        if self._unreadable.get(path) == stamp:
+            return None
+        try:
+            return model.model_validate_json(path.read_bytes())
+        except (OSError, ValueError) as exc:
+            log.warning("skipping unreadable %s: %s", path, exc)
+            with self._lock:
+                self._unreadable[path] = stamp
+            return None
+
+    def _read_project(self, project_id: str) -> Project | None:
+        """projects/{id}.json, parsed again only when the file changed (another process saved)."""
+        path = self.project_dir / f"{project_id}.json"
+        stamp = self._stamp(path)
+        if stamp is None:
+            return None
         with self._lock:
-            if self._projects is None:
-                projects: dict[str, Project] = {}
-                for path in sorted(self.project_dir.glob("*.json")):
-                    try:
-                        p = Project.model_validate_json(path.read_bytes())
-                    except (OSError, ValueError) as exc:
-                        log.warning("skipping unreadable project %s: %s", path, exc)
-                        continue
-                    projects[p.id] = p
-                self._projects = dict(sorted(projects.items(), key=lambda kv: kv[1].created_at))
-            return self._projects
+            if self._project_stamps.get(project_id) == stamp:
+                return self._projects.get(project_id)
+        p = self._parse(path, Project, stamp)
+        if p is None or p.id != project_id:
+            return None
+        with self._lock:
+            self._projects[project_id] = p
+            self._project_stamps[project_id] = stamp
+        return p
 
     def _save_project(self, p: Project) -> None:
-        _write_atomic(self.project_dir / f"{p.id}.json", p.model_dump_json(indent=1).encode())
+        path = self.project_dir / f"{p.id}.json"
+        _write_atomic(path, p.model_dump_json(indent=1).encode())
+        stamp = self._stamp(path)
+        with self._lock:
+            self._projects[p.id] = p
+            if stamp is not None:
+                self._project_stamps[p.id] = stamp
 
     def create_project(self, body: ProjectIn) -> Project:
         now = now_iso()
         p = Project(**body.model_dump(), id=uuid.uuid4().hex[:12], created_at=now, updated_at=now)
-        with self._lock:
-            self._save_project(p)
-            self._project_map()[p.id] = p
+        self._save_project(p)
         return p
 
     def list_projects(self) -> list[Project]:
+        """Every project on disk (rescanned: other processes add projects too), oldest first."""
+        for path in self.project_dir.glob("*.json"):
+            if _SAFE_ID.fullmatch(path.stem):
+                self._read_project(path.stem)
         with self._lock:
-            return list(self._project_map().values())
+            projects = list(self._projects.values())
+        return sorted(projects, key=lambda p: p.created_at)
 
     def get_project(self, project_id: str) -> Project:
-        with self._lock:
-            p = self._project_map().get(project_id)
+        p = self._read_project(project_id) if _SAFE_ID.fullmatch(project_id) else None
+        if p is None:
+            with self._lock:  # saved by this process but the file is gone or unreadable
+                p = self._projects.get(project_id)
         if p is None:
             raise NotFoundError(f"project {project_id} not found")
         return p
@@ -294,7 +378,6 @@ class Store:
             fields = body.model_dump(exclude={"id", "created_at", "updated_at"})
             p = Project(**fields, id=old.id, created_at=old.created_at, updated_at=now_iso())
             self._save_project(p)
-            self._project_map()[p.id] = p
         return p
 
     def get_domain(self, project: Project) -> BuiltDomain:
@@ -321,19 +404,17 @@ class Store:
 
     # ---- runs -----------------------------------------------------------------------------------
 
-    def _run_map(self) -> dict[str, RunRecord]:
+    def _read_run(self, run_id: str) -> RunRecord | None:
+        """A finished run from runs/{id}.json (written by this or another process), registered."""
+        path = self.run_dir / f"{run_id}.json"
+        stamp = self._stamp(path)
+        if stamp is None:
+            return None
+        exp = self._parse(path, RunExport, stamp)
+        if exp is None or exp.run.id != run_id:
+            return None
         with self._lock:
-            if self._runs is None:
-                runs: dict[str, RunRecord] = {}
-                for path in self.run_dir.glob("*.json"):
-                    try:
-                        exp = RunExport.model_validate_json(path.read_bytes())
-                    except (OSError, ValueError) as exc:
-                        log.warning("skipping unreadable run %s: %s", path, exc)
-                        continue
-                    runs[exp.run.id] = RunRecord(info=exp.run, project=exp.project)
-                self._runs = dict(sorted(runs.items(), key=lambda kv: kv[1].info.created_at))
-            return self._runs
+            return self._runs.setdefault(run_id, RunRecord(info=exp.run, project=exp.project))
 
     def new_run(self, project: Project, built: BuiltProblem, stats) -> RunRecord:
         info = RunInfo(
@@ -345,65 +426,108 @@ class Store:
         )
         rec = RunRecord(info=info, project=project.model_copy(deep=True), built=built)
         with self._lock:
-            self._run_map()[info.id] = rec
+            self._runs[info.id] = rec
         return rec
 
     def get_run(self, run_id: str) -> RunRecord:
         with self._lock:
-            rec = self._run_map().get(run_id)
+            rec = self._runs.get(run_id)
+        if rec is None and _SAFE_ID.fullmatch(run_id):
+            rec = self._read_run(run_id)
         if rec is None:
             raise NotFoundError(f"run {run_id} not found")
         return rec
 
     def list_runs(self) -> list[RunRecord]:
+        """Runs of this process plus every finished run on disk (rescanned), oldest first."""
+        for path in self.run_dir.glob("*.json"):
+            with self._lock:
+                known = path.stem in self._runs
+            if not known and _SAFE_ID.fullmatch(path.stem):
+                self._read_run(path.stem)
         with self._lock:
-            return list(self._run_map().values())
+            runs = list(self._runs.values())
+        return sorted(runs, key=lambda r: r.info.created_at)
 
     def persist_run(self, rec: RunRecord) -> None:
-        """runs/{id}.npz (density) + runs/{id}.json (RunExport) so exports survive a restart."""
+        """runs/{id}.npz (density) + runs/{id}.json (RunExport): exports survive a restart and
+        other processes on the data dir see the run. Raises if a file could not be written."""
         if not _SAFE_ID.fullmatch(rec.info.id):
             return
+        with rec.lock:
+            rho, built, stress = rec.rho, rec.built, rec.stress
+        if rho is not None and built is not None:
+            _write_atomic(
+                self.run_dir / f"{rec.info.id}.npz",
+                to_npz_bytes(rho, built.grid, built.active, built.passive, stress),
+            )
+        exp = RunExport(project=rec.project, run=rec.snapshot())
+        _write_atomic(self.run_dir / f"{rec.info.id}.json", exp.model_dump_json().encode())
+
+    def finish_run(self, rec: RunRecord) -> str | None:
+        """Persist a finished run, then release its arrays (exports read runs/{id}.npz back).
+
+        If persisting fails the result stays in memory, "result not persisted: <reason>" is
+        appended to the run's message, and that note is returned.
+        """
         try:
-            if rec.rho is not None and rec.built is not None:
-                b = rec.built
-                _write_atomic(
-                    self.run_dir / f"{rec.info.id}.npz",
-                    to_npz_bytes(rec.rho, b.grid, b.active, b.passive, rec.stress),
-                )
-            exp = RunExport(project=rec.project, run=rec.snapshot())
-            _write_atomic(self.run_dir / f"{rec.info.id}.json", exp.model_dump_json().encode())
-        except OSError as exc:
-            log.warning("could not persist run %s: %s", rec.info.id, exc)
+            self.persist_run(rec)
+        except Exception as exc:  # noqa: BLE001 - disk full, MemoryError while compressing, ...
+            note = f"result not persisted: {str(exc) or type(exc).__name__}"
+            log.warning("run %s: %s", rec.info.id, note)
+            with rec.lock:
+                msg = rec.info.message
+                rec.info.message = rec.message = f"{msg}; {note}" if msg else note
+            return note
+        with rec.lock:
+            rec.built = rec.rho = rec.stress = rec.latest_frame = None
+        return None
 
-    def run_result(self, rec: RunRecord) -> tuple[np.ndarray, Grid, np.ndarray, np.ndarray] | None:
-        """(rho, grid, active, passive) of a finished run, from memory or runs/{id}.npz."""
-        if rec.rho is not None and rec.built is not None:
-            return rec.rho, rec.built.grid, rec.built.active, rec.built.passive
-        return self._load_npz(rec)
+    def _load_npz(self, run_id: str) -> tuple | None:
+        """(rho, grid, active, passive, stress | None) from runs/{id}.npz; the last few cached."""
+        with self._lock:
+            hit = self._results.get(run_id)
+            if hit is not None:
+                self._results.move_to_end(run_id)
+                return hit
+        path = self.run_dir / f"{run_id}.npz"
+        if not _SAFE_ID.fullmatch(run_id) or not path.is_file():
+            return None
+        try:
+            res = from_npz_bytes(path.read_bytes(), with_stress=True)
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
+            log.warning("unreadable run result %s: %s", path, exc)
+            return None
+        with self._lock:
+            self._results[run_id] = res
+            while len(self._results) > RESULT_CACHE:
+                self._results.popitem(last=False)
+        return res
 
-    def _load_npz(self, rec: RunRecord) -> tuple[np.ndarray, Grid, np.ndarray, np.ndarray] | None:
-        if rec._from_disk is None:
-            path = self.run_dir / f"{rec.info.id}.npz"
-            if not _SAFE_ID.fullmatch(rec.info.id) or not path.is_file():
-                return None
-            rho, grid, active, passive, stress = from_npz_bytes(path.read_bytes(), with_stress=True)
-            rec._stress_from_disk = stress
-            rec._from_disk = (rho, grid, active, passive)
-        return rec._from_disk
+    def run_result(self, rec: RunRecord) -> RunResult | None:
+        """(rho, grid, active, passive) of a finished run, from memory or runs/{id}.npz.
+        Reads the disk: call it off the event loop."""
+        with rec.lock:
+            rho, built = rec.rho, rec.built
+        if rho is not None and built is not None:
+            return rho, built.grid, built.active, built.passive
+        res = self._load_npz(rec.info.id)
+        return None if res is None else res[:4]
 
     def run_stress(self, rec: RunRecord) -> np.ndarray | None:
         """Von Mises field (nx,ny,nz) of a finished run from memory or runs/{id}.npz, else None."""
-        if rec.stress is not None:
-            return rec.stress
-        if rec.rho is None or rec.built is None:  # not in memory: a run loaded from disk
-            self._load_npz(rec)
-            return rec._stress_from_disk
-        return None
+        with rec.lock:
+            rho, built, stress = rec.rho, rec.built, rec.stress
+        if rho is not None and built is not None:
+            return stress
+        res = self._load_npz(rec.info.id)
+        return None if res is None else res[4]
 
     def design_world(self, rec: RunRecord) -> trimesh.Trimesh | None:
         """The run's design mesh in world space (for the ghosted result preview)."""
-        if rec.built is not None:
-            return rec.built.meshes_world.get("design")
+        built = rec.built
+        if built is not None:
+            return built.meshes_world.get("design")
         try:
             meshes = load_project_meshes(
                 rec.project.model_copy(update={"ref_models": []}), self.get_mesh

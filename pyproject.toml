@@ -23,6 +23,7 @@ dependencies = [
     "websockets",
     "matplotlib",
     "mcp",
+    "lxml",  # trimesh needs it to read 3MF uploads
 ]
 
 [project.optional-dependencies]

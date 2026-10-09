@@ -23,10 +23,14 @@ from pydantic import TypeAdapter, ValidationError
 from topop.core.export import density_to_mesh, render_png, to_npz_bytes, to_stl_bytes, to_vti_bytes
 from topop.core.optimize import optimize
 from topop.core.problem import IterationInfo
-from topop.core.selection import node_xyz, resolved_preview
+from topop.core.selection import compute_facets, node_xyz, resolved_preview
+from topop.core.step import META_FACE_TO_FACET
+from topop.core.voxelize import transform_matrix
 from topop.server.build import (
+    DESIGN,
     ProblemInvalid,
     build_problem,
+    load_project_meshes,
     params_warnings,
     resolve_project_selections,
     resolve_sel,
@@ -59,6 +63,8 @@ RESULT_STATUS = {
     "error": "error",
 }
 ProgressFn = Callable[[IterationRecord], None]
+# what write_outputs writes (`topop run --out`, MCP export_files)
+OUTPUT_FILES = ("result.stl", "result.png", "result.vti", "density.npz", "run.json")
 _SELECTION = TypeAdapter(Selection)
 _ENVELOPE = {"id", "created_at", "updated_at"}
 _ARRAY_LEAF = re.compile(r"\[\n\s*([^\[\]{}]*?)\n\s*\]")  # array of scalars
@@ -179,6 +185,51 @@ def _rewrite_selection_meshes(body: ProjectIn, remap: Mapping[str, str]) -> None
             item.selection.mesh_id = remap[mid]
 
 
+def _unit(v: np.ndarray) -> list[float]:
+    n = float(np.linalg.norm(v))
+    return (v / n).tolist() if n > 0 else [0.0, 0.0, 0.0]
+
+
+def _place_facets(
+    facets: Sequence[dict], labels: np.ndarray, world: trimesh.Trimesh, m: np.ndarray
+) -> list[dict]:
+    """Facet rows of the raw mesh with their geometry in world space (`m`: the 4x4 placement).
+
+    Ids, n_faces and kind stay (facet ids are always those of the raw mesh); area and bbox come
+    from the facet's world triangles (exact); centroid, normal and axis are mapped; a radius is
+    scaled by the transform across the axis (exact for rotations and uniform scale).
+    """
+    lin = m[:3, :3]
+    normal_map = np.linalg.inv(lin).T
+    order = np.argsort(labels, kind="stable")
+    sorted_labels = labels[order]
+    out = []
+    for f in facets:
+        lo, hi = np.searchsorted(sorted_labels, [f["id"], f["id"] + 1])
+        tris = order[lo:hi]
+        row = dict(f)
+        if tris.size:
+            xyz = world.vertices[world.faces[tris]].reshape(-1, 3)
+            row["area"] = float(world.area_faces[tris].sum())
+            row["bbox"] = [xyz.min(0).tolist(), xyz.max(0).tolist()]
+        row["centroid"] = (lin @ np.asarray(f["centroid"], dtype=float) + m[:3, 3]).tolist()
+        if any(f["normal"]):
+            row["normal"] = _unit(normal_map @ np.asarray(f["normal"], dtype=float))
+        if f.get("axis") is not None:
+            axis = np.asarray(f["axis"], dtype=float)
+            row["axis"] = _unit(lin @ axis)
+            if f.get("radius") is not None:  # mean stretch of two directions across the axis
+                u = np.cross(axis, [1.0, 0.0, 0.0] if abs(axis[0]) < 0.9 else [0.0, 1.0, 0.0])
+                u /= np.linalg.norm(u)
+                v = np.cross(axis, u)
+                stretch = (np.linalg.norm(lin @ u) + np.linalg.norm(lin @ v)) / 2
+                row["radius"] = float(f["radius"] * stretch)
+        elif f.get("radius") is not None:  # sphere
+            row["radius"] = float(f["radius"] * abs(np.linalg.det(lin)) ** (1 / 3))
+        out.append(row)
+    return out
+
+
 # ---- session ----------------------------------------------------------------------------------
 
 
@@ -210,20 +261,66 @@ class Session:
     def mesh_info(self, mesh_id: str) -> MeshInfo:
         return self.store.mesh_info(mesh_id)  # NotFoundError
 
-    def describe_mesh(self, mesh_id: str, angle_deg: float = 5.0, top: int = 30) -> dict:
-        """MeshInfo + the `top` largest coplanar facets (all if top <= 0): what names faces.
+    def describe_mesh(
+        self, mesh_id: str, angle_deg: float = 5.0, top: int = 30, project_id: str | None = None
+    ) -> dict:
+        """MeshInfo + the `top` largest facets (all if top <= 0): what names faces.
 
-        STEP meshes list their B-rep faces instead (exact; `angle_deg` is ignored).
+        STEP meshes list their B-rep faces instead (exact; `angle_deg` is ignored). Coordinates
+        are the mesh file's own (`frame` "mesh"). With `project_id` they are WORLD coordinates
+        (`frame` "world"), the frame every selection is resolved in: the mesh as that project
+        places it (`mesh_id` = its design mesh or "design", a reference model's mesh or
+        "ref:<id>"), so normals, centroids, bboxes, axes and radii are what `direction`, `within`
+        and the primitives must use. Facet ids are the same in both frames.
         """
-        info = self.mesh_info(mesh_id)
-        facets, total = self.store.mesh_facets(mesh_id, float(angle_deg))
-        shown = facets[:top] if top > 0 else facets
+        angle = float(angle_deg)
+        if project_id is None:
+            info = self.mesh_info(mesh_id)
+            facets, total = self.store.mesh_facets(mesh_id, angle)
+            frame: dict[str, Any] = {"frame": "mesh"}
+            shown = facets[:top] if top > 0 else facets
+        else:
+            project = self.store.get_project(project_id)
+            key, ref = self._placement(project, mesh_id)
+            raw_id = ref.mesh_id
+            info = self.mesh_info(raw_id)
+            facets, total = self.store.mesh_facets(raw_id, angle)
+            shown = facets[:top] if top > 0 else facets
+            m = transform_matrix(ref.transform)
+            frame = {"frame": "world", "project_id": project.id, "placed_as": key}
+            if not np.allclose(m, np.eye(4)):
+                world = load_project_meshes(project, self.store.get_mesh)[key]
+                raw = self.store.get_mesh(raw_id)
+                labels = raw.metadata.get(META_FACE_TO_FACET)
+                if labels is None:
+                    labels = compute_facets(raw, angle)[1]
+                shown = _place_facets(shown, np.asarray(labels), world, m)
+                volume = None if info.volume is None else abs(float(world.volume))
+                info = info.model_copy(update={"bbox": world.bounds.tolist(), "volume": volume})
         return {
             "mesh": info.model_dump(),
-            "angle_deg": float(angle_deg),
+            **frame,
+            "angle_deg": angle,
             "n_facets_total": total,
             "facets": [FacetInfo(**f).model_dump() for f in shown],
         }
+
+    @staticmethod
+    def _placement(project: Project, mesh_id: str) -> tuple[str, Any]:
+        """(world mesh key, MeshRef/RefModel) for a mesh of the project: its design mesh id or
+        "design", "ref:<id>", or the mesh id of a reference model."""
+        design, refs = project.design_mesh, project.ref_models
+        if design is not None and design.mesh_id and mesh_id in (DESIGN, design.mesh_id):
+            return DESIGN, design
+        for ref in refs:
+            if ref.mesh_id and mesh_id in (f"ref:{ref.id}", ref.mesh_id):
+                return f"ref:{ref.id}", ref
+        names = [DESIGN] if design is not None else []
+        names += [f"ref:{r.id}" for r in refs]
+        raise ValueError(
+            f"mesh {mesh_id!r} is not part of project {project.id} "
+            f"(use its mesh id or one of {names or 'nothing: the project has no mesh'})"
+        )
 
     def facet_faces(self, mesh_id: str, facet_id: int, angle_deg: float = 5.0) -> list[int]:
         """Triangle ids of one facet of `describe_mesh` (ValueError if the facet does not exist)."""
@@ -504,6 +601,9 @@ class Session:
             except Exception as exc:
                 self._finish(rec, "error", str(exc) or type(exc).__name__, outcome="error")
                 raise
+            except BaseException as exc:  # a second Ctrl-C: never leave the run "running"
+                self._finish(rec, "error", f"run aborted ({type(exc).__name__})", outcome="error")
+                raise
             rho = result.rho if result.history else None
             self._finish(
                 rec,
@@ -540,8 +640,10 @@ class Session:
                 rec.info.error = message or "run failed"
             if rho is not None:
                 rec.rho, rec.stress = rho, stress
-        self._outcomes[rec.info.id] = _Outcome(outcome, message or "", wall)
-        self.store.persist_run(rec)
+        # persist, then release the arrays (exports read runs/{id}.npz back); a failure keeps
+        # them in memory and is appended to the message
+        self.store.finish_run(rec)
+        self._outcomes[rec.info.id] = _Outcome(outcome, rec.message or "", wall)
 
     def cancel(self, run_id: str) -> RunInfo:
         """Stop a run after its current iteration (callable from another thread)."""
@@ -570,8 +672,10 @@ class Session:
         self, run_id: str
     ) -> tuple[RunRecord, tuple[np.ndarray, Any, np.ndarray, np.ndarray]]:
         rec = self.store.get_run(run_id)
-        if rec.info.status not in ("done", "cancelled"):
-            raise ValueError(f"run {run_id} is {rec.info.status}; no result to export")
+        with rec.lock:  # the status and the in-memory result are set together
+            status = rec.info.status
+        if status not in ("done", "cancelled"):
+            raise ValueError(f"run {run_id} is {status}; no result to export")
         res = self.store.run_result(rec)
         if res is None:
             raise ValueError(f"run {run_id} has no density result")
@@ -681,7 +785,7 @@ class Session:
             warnings.extend(w for w in ws if w not in warnings)
             return data
 
-        makers = {
+        makers = {  # keys: OUTPUT_FILES
             "result.stl": lambda: with_warnings(
                 lambda: self.export_stl(run_id, threshold, smooth, trim)
             ),
@@ -747,6 +851,7 @@ class Session:
 
 
 __all__ = [
+    "OUTPUT_FILES",
     "NotFoundError",
     "ProjectInvalid",
     "Session",

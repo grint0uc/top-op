@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -15,9 +16,31 @@ EXIT_MEMORY = 3
 EXIT_INTERRUPTED = 130
 
 
+LOOPBACK = ("localhost", "127.0.0.1", "::1", "[::1]")
+WILDCARD = ("0.0.0.0", "::", "[::]", "")
+
+
+def _allow_host(host: str) -> None:
+    """Let the app answer requests addressed to `--host` (it only answers localhost by default)."""
+    if host in LOOPBACK:
+        return
+    if host in WILDCARD:
+        print(
+            f"note: listening on every interface, but only requests addressed to localhost are "
+            f"answered; list the names clients use in TOPOP_ALLOWED_HOSTS (now "
+            f"{os.environ.get('TOPOP_ALLOWED_HOSTS') or 'unset'})",
+            file=sys.stderr,
+        )
+        return
+    name = f"[{host}]" if ":" in host else host
+    extra = os.environ.get("TOPOP_ALLOWED_HOSTS", "")
+    os.environ["TOPOP_ALLOWED_HOSTS"] = f"{extra},{name}" if extra else name
+
+
 def _serve(args: argparse.Namespace) -> int:
     import uvicorn
 
+    _allow_host(args.host)  # before the app module reads the allowed hosts
     if args.dev:
         print(
             "dev mode: run `cd web && npm run dev` (Vite proxies /api to this server)",
@@ -260,6 +283,26 @@ def _symmetry_arg(text: str) -> dict:
     return {"axis": axis, "position": position}
 
 
+def _threshold_arg(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if not 0 < value <= 1:  # also rejects nan
+        raise argparse.ArgumentTypeError(f"{text}: must be in (0, 1]")
+    return value
+
+
+def _smooth_arg(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text}: must be >= 0")
+    return value
+
+
 def _report_invalid(exc: BaseException) -> None:
     from topop.agent import ProjectInvalid
 
@@ -283,6 +326,9 @@ def _finish_run(session, info, args: argparse.Namespace, wall: float) -> int:
     except OSError as exc:
         _err("run", f"could not write to {out}: {exc}")
         return 1
+    except MemoryError as exc:
+        _err("run", f"out of memory while writing the results: {exc}")
+        return EXIT_MEMORY
     written = result["files"]
     for name, why in result["errors"].items():
         _err("run", f"{name} not written: {why}")
@@ -300,6 +346,9 @@ def _finish_run(session, info, args: argparse.Namespace, wall: float) -> int:
     print(f"wall time   {wall:.1f} s total, {outcome.get('wall_s', 0.0):.1f} s optimizing")
     print(f"files       {out}/ : {', '.join(written)}")
     print(f"rerun       topop run {Path(out) / 'run.json'}")
+    if "result.stl" not in written:  # the one output a script cannot do without
+        _err("run", "failed: result.stl was not written")
+        return 1
     return EXIT_INTERRUPTED if status == "cancelled" else 0
 
 
@@ -353,7 +402,8 @@ def build_parser() -> argparse.ArgumentParser:
         "run",
         help="run a case file headless",
         description="Run a case (ProjectIn JSON with mesh `path`s) and write result files. "
-        "Exit codes: 0 done, 1 failed, 2 invalid case/project, 3 out of memory, 130 interrupted.",
+        "Exit codes: 0 done, 1 failed (also: result.stl could not be written), 2 invalid "
+        "case/project/arguments, 3 out of memory, 130 interrupted.",
     )
     p_run.add_argument("case", metavar="CASE.json")
     p_run.add_argument("--out", metavar="DIR", default=None, help="default: ./<case>-out")
@@ -361,8 +411,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--resolution", type=int, default=None, help="override grid.elements_along_longest"
     )
-    p_run.add_argument("--threshold", type=float, default=0.5, help="STL iso level (default 0.5)")
-    p_run.add_argument("--smooth", type=int, default=0, help="STL Laplacian smoothing iterations")
+    p_run.add_argument(
+        "--threshold",
+        type=_threshold_arg,
+        default=0.5,
+        help="STL iso level in (0, 1] (default 0.5)",
+    )
+    p_run.add_argument(
+        "--smooth", type=_smooth_arg, default=0, help="STL Laplacian smoothing iterations (>= 0)"
+    )
     p_run.add_argument("--quiet", action="store_true", help="no per-iteration lines")
     p_run.add_argument(
         "--trim",

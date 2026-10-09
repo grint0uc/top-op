@@ -18,7 +18,7 @@ from topop.core.export import (
 )
 from topop.core.problem import Grid
 from topop.server.build import ProblemInvalid, build_problem
-from topop.server.jobs import CLOSE, RunManager, get_runs, runs_of
+from topop.server.jobs import CLOSE, GONE, Mailbox, RunManager, get_runs, max_queued, runs_of
 from topop.server.schemas import (
     ErrorResponse,
     RunCreate,
@@ -45,12 +45,12 @@ TRIM_HEADER_DOC = {
 
 StoreDep = Annotated[Store, Depends(get_store)]
 RunsDep = Annotated[RunManager, Depends(get_runs)]
-_GONE = object()  # queue marker: the client disconnected
 
 
-def _run(store: Store, run_id: str) -> RunRecord:
+async def _run(store: Store, run_id: str) -> RunRecord:
+    """The run record (may read runs/{id}.json written by another process); 404 if unknown."""
     try:
-        return store.get_run(run_id)
+        return await asyncio.to_thread(store.get_run, run_id)
     except NotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -59,8 +59,9 @@ async def _result(
     store: Store, run_id: str
 ) -> tuple[RunRecord, tuple[np.ndarray, Grid, np.ndarray, np.ndarray]]:
     """(record, (rho, grid, active, passive)); 409 unless the run finished with a result."""
-    rec = _run(store, run_id)
-    status = rec.info.status
+    rec = await _run(store, run_id)
+    with rec.lock:  # `_finish` sets the status and the in-memory result together
+        status = rec.info.status
     if status not in ("done", "cancelled"):
         raise HTTPException(409, f"run {run_id} is {status}; no result to export")
     res = await asyncio.to_thread(store.run_result, rec)
@@ -99,8 +100,9 @@ def _warning_headers(warnings: list[str]) -> dict[str, str]:
     summary="Start a run for a project",
 )
 async def create_run(body: RunCreate, store: StoreDep, runs: RunsDep) -> RunInfo:
+    _check_queue(runs)
     try:
-        project = store.get_project(body.project_id)
+        project = await asyncio.to_thread(store.get_project, body.project_id)
     except NotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -116,26 +118,41 @@ async def create_run(body: RunCreate, store: StoreDep, runs: RunsDep) -> RunInfo
         raise HTTPException(422, str(exc)) from exc
     except ValueError as exc:  # no design mesh, degenerate geometry
         raise HTTPException(409, str(exc)) from exc
+    _check_queue(runs)  # again: other requests may have queued runs while this one was built
     rec = store.new_run(project, built, VoxelStats(**built.stats))
     runs.start(rec.info.id, built, project.params)
     return rec.snapshot()
 
 
+def _check_queue(runs: RunManager) -> None:
+    """429 when TOPOP_MAX_QUEUED runs already wait (each holds its assembled problem in memory)."""
+    limit, waiting = max_queued(), runs.queued()
+    if waiting >= limit:
+        raise HTTPException(
+            429,
+            f"{waiting} runs are already queued (TOPOP_MAX_QUEUED={limit}); "
+            "wait for one to finish or cancel one",
+        )
+
+
 @router.websocket("/runs/{id}/stream")
 async def run_stream(websocket: WebSocket, id: str) -> None:
     """Text frames: ProgressMsg / StatusMsg JSON. Binary frames: [u32 it][u32 nx][u32 ny][u32 nz]
-    [u8 rho*255 ...] (CLAUDE.md). Not part of OpenAPI; message types are in components.schemas."""
+    [u8 rho*255 ...] (CLAUDE.md). Not part of OpenAPI; message types are in components.schemas.
+
+    A client that falls behind gets every JSON message but only the newest density frame; one that
+    reads nothing for `jobs.STALL_SECONDS` while messages wait is disconnected."""
     await websocket.accept()
     store, runs = store_of(websocket.app), runs_of(websocket.app)
     try:
-        rec = store.get_run(id)
+        rec = await asyncio.to_thread(store.get_run, id)
     except NotFoundError as exc:
         await websocket.send_json(StatusMsg(type="error", message=str(exc)).model_dump(mode="json"))
         await websocket.close(code=1008)
         return
-    queue: asyncio.Queue = asyncio.Queue()
-    info, frame, final = runs.subscribe(rec, asyncio.get_running_loop(), queue)
-    watcher = asyncio.create_task(_watch_disconnect(websocket, queue))
+    box = Mailbox(asyncio.get_running_loop())
+    info, frame, final = await asyncio.to_thread(runs.subscribe, rec, box)
+    watcher = asyncio.create_task(_watch_disconnect(websocket, box))
     try:
         await websocket.send_json(StatusMsg(type="started", run=info).model_dump(mode="json"))
         if frame is not None:
@@ -143,8 +160,8 @@ async def run_stream(websocket: WebSocket, id: str) -> None:
         if final is not None:
             await websocket.send_json(final)
         else:
-            while (msg := await queue.get()) is not CLOSE:
-                if msg is _GONE:
+            while (msg := await box.get()) is not CLOSE:
+                if msg is GONE:  # disconnected, or dropped for not reading
                     return
                 if isinstance(msg, bytes):
                     await websocket.send_bytes(msg)
@@ -155,15 +172,15 @@ async def run_stream(websocket: WebSocket, id: str) -> None:
         pass  # client went away
     finally:
         watcher.cancel()
-        runs.unsubscribe(rec, queue)
+        runs.unsubscribe(rec, box)
 
 
-async def _watch_disconnect(websocket: WebSocket, queue: asyncio.Queue) -> None:
+async def _watch_disconnect(websocket: WebSocket, box: Mailbox) -> None:
     """Drain client frames (ignored) so a disconnect is noticed while the run is quiet."""
     with contextlib.suppress(Exception):
         while (await websocket.receive())["type"] != "websocket.disconnect":
             pass
-    queue.put_nowait(_GONE)
+    box.drop()
 
 
 @router.post(
@@ -265,18 +282,18 @@ async def result_stress(id: str, store: StoreDep) -> Response:
     summary="Project + run record (reloadable, re-runnable headlessly)",
 )
 async def run_project(id: str, store: StoreDep) -> RunExport:
-    rec = _run(store, id)
+    rec = await _run(store, id)
     return RunExport(project=rec.project, run=rec.snapshot())
 
 
 @router.get("/runs", response_model=list[RunInfo], summary="List runs")
 async def list_runs(store: StoreDep) -> list[RunInfo]:
-    return [rec.snapshot() for rec in store.list_runs()]
+    return [rec.snapshot() for rec in await asyncio.to_thread(store.list_runs)]
 
 
 @router.get("/runs/{id}", response_model=RunInfo, responses=NOT_FOUND, summary="Run status")
 async def get_run(id: str, store: StoreDep) -> RunInfo:
-    return _run(store, id).snapshot()
+    return (await _run(store, id)).snapshot()
 
 
 @router.get(

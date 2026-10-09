@@ -2,20 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import os
 import struct
+import threading
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import trimesh
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
+from topop.agent import Session
+from topop.core.export import from_npz_bytes
 from topop.core.voxelize import load_mesh
-from topop.server.app import app
-from topop.server.schemas import Project, RunExport, RunInfo, VoxelStats
+from topop.server import jobs
+from topop.server.app import OriginMiddleware, allowed_hosts, app
+from topop.server.jobs import GONE, Mailbox, RunManager, density_frame
+from topop.server.schemas import ParamsSpec, Project, ProjectIn, RunExport, RunInfo, VoxelStats
+from topop.server.store import RunRecord, Store, _write_atomic
 
 PNG = b"\x89PNG\r\n\x1a\n"
 TERMINAL = ("done", "error", "cancelled")
@@ -588,3 +599,255 @@ def test_stress_endpoint_409_until_the_run_has_a_result(api: TestClient, cantile
         sem.release()
     assert api.get(f"/api/runs/{rid}/stress").status_code == 409  # cancelled, no result
     assert api.get("/api/runs/nope/stress").status_code == 404
+
+
+# ---- hardening: limits, guards, memory, processes sharing a data dir ----------------------------
+
+
+def test_stalled_subscriber_holds_one_frame_and_is_dropped(monkeypatch):
+    loop = asyncio.new_event_loop()
+    try:
+        info = RunInfo(id="r", project_id="p", status="running", created_at="t")
+        project = Project.model_validate({"id": "p", "created_at": "t", "updated_at": "t"})
+        rec = RunRecord(info=info, project=project)
+        box = Mailbox(loop)
+        rec.subscribers.append(box)
+        for it in range(1, 51):  # a client that never reads
+            RunManager._push_locked(rec, {"type": "progress", "it": it})
+            RunManager._push_locked(rec, density_frame(it, np.full((8, 8, 8), it / 50)))
+        held = box.pending()
+        frames = [m for m in held if isinstance(m, bytes)]
+        assert len(frames) == 1 and struct.unpack("<I", frames[0][:4]) == (50,)  # the newest
+        assert [m["it"] for m in held if isinstance(m, dict)] == list(range(1, 51))  # every JSON
+        assert held[-1] is frames[0]  # after the progress message it belongs to
+        assert loop.run_until_complete(box.get()) == {"type": "progress", "it": 1}
+
+        monkeypatch.setattr(jobs, "STALL_SECONDS", 0.0)  # stands for 30 s without reading
+        time.sleep(0.01)
+        RunManager._push_locked(rec, {"type": "progress", "it": 51})
+        assert rec.subscribers == [] and box.pending() == []  # dropped, memory freed
+        assert loop.run_until_complete(box.get()) is GONE
+        assert not box.put({"type": "progress", "it": 52})
+    finally:
+        loop.close()
+
+
+def test_upload_above_the_size_cap_is_413(api: TestClient, monkeypatch):
+    monkeypatch.setenv("TOPOP_MAX_UPLOAD_MB", "1")
+    res = api.post("/api/meshes", files={"file": ("big.stl", b"x" * (2**20 + 1))})
+    assert res.status_code == 413 and "TOPOP_MAX_UPLOAD_MB" in res.json()["detail"]
+
+    def chunked():  # no Content-Length: refused while it streams in
+        yield b'--b\r\nContent-Disposition: form-data; name="file"; filename="big.stl"\r\n\r\n'
+        for _ in range(20):
+            yield b"x" * 2**17
+        yield b"\r\n--b--\r\n"
+
+    headers = {"content-type": "multipart/form-data; boundary=b"}
+    res = api.post("/api/meshes", content=chunked(), headers=headers)
+    assert res.status_code == 413 and "TOPOP_MAX_UPLOAD_MB" in res.json()["detail"]
+    box = trimesh.creation.box().export(file_type="stl")
+    assert api.post("/api/meshes", files={"file": ("box.stl", box)}).status_code == 200
+
+
+def test_cross_site_requests_and_foreign_hosts_are_refused(api: TestClient):
+    evil = api.post("/api/projects", json={"name": "x"}, headers={"Origin": "https://evil.example"})
+    assert evil.status_code == 403 and "evil.example" in evil.json()["detail"]
+    assert api.put("/api/projects/x", json={}, headers={"Origin": "null"}).status_code == 403
+    for origin in ("http://localhost:5173", "http://127.0.0.1:8000", "http://[::1]:8000"):
+        res = api.post("/api/projects", json={"name": "ok"}, headers={"Origin": origin})
+        assert res.status_code == 200, origin
+    assert api.post("/api/projects", json={"name": "no origin (curl, MCP)"}).status_code == 200
+    assert api.get("/api/projects", headers={"Origin": "https://evil.example"}).status_code == 200
+    evil_ws = {"Origin": "https://evil.example"}  # WebSockets are not covered by CORS: checked
+    with (
+        pytest.raises(WebSocketDisconnect),
+        api.websocket_connect("/api/runs/x/stream", headers=evil_ws),
+    ):
+        pass
+    # DNS rebinding: only requests addressed to this machine are answered
+    for host, code in (("evil.example", 400), ("localhost:8000", 200), ("[::1]:8000", 200)):
+        other = TestClient(app, base_url=f"http://{host}", client=("127.0.0.1", 50000))
+        assert other.get("/api/health").status_code == code, host
+
+
+def test_allowed_hosts_from_the_environment(monkeypatch):
+    monkeypatch.setenv("TOPOP_ALLOWED_HOSTS", "box.lan, *.corp.example,")
+    hosts = allowed_hosts()
+    assert hosts == ["localhost", "127.0.0.1", "[::1]", "box.lan", "*.corp.example"]
+    ok = OriginMiddleware(app, hosts)._ok
+    assert ok("http://box.lan:8000") and ok("https://cad.corp.example") and ok("http://[::1]")
+    assert not ok("https://evil.example") and not ok("null") and not ok("file:///x")
+
+
+def test_3mf_upload(api: TestClient):
+    data = trimesh.creation.box(extents=[10, 20, 30]).export(file_type="3mf")
+    res = api.post("/api/meshes", files={"file": ("part.3mf", data)})
+    assert res.status_code == 200, res.text
+    info = res.json()
+    assert info["is_watertight"] and np.allclose(info["bbox"], [[-5, -10, -15], [5, 10, 15]])
+
+
+def test_reupload_under_another_extension_keeps_the_stored_type(tmp_path: Path):
+    data = trimesh.creation.box(extents=[1, 2, 3]).export(file_type="stl")
+    store = Store(tmp_path)
+    first = store.add_mesh(data, "part.stl")
+    again = store.add_mesh(data, "part.ply")  # same bytes, same id
+    assert again.id == first.id and again.name == "part.ply"
+    assert len(Store(tmp_path).get_mesh(first.id).faces) == 12  # a fresh store still loads it
+    Store(tmp_path).add_mesh(data, "copy.obj")  # not in memory: parsed as what it was stored as
+    assert Store(tmp_path).mesh_info(first.id).n_faces == 12
+    assert sorted(p.name for p in (tmp_path / "meshes").iterdir()) == [
+        f"{first.id}.json",
+        f"{first.id}.stl",
+    ]
+
+
+def test_stores_on_one_data_dir_see_each_others_projects_and_runs(
+    api: TestClient, cantilever: Path, tmp_path: Path
+):
+    assert api.get("/api/projects").json() == [] and api.get("/api/runs").json() == []
+    other = Session(tmp_path)  # e.g. `topop mcp` on the same TOPOP_DATA_DIR
+    mesh = other.load_mesh(cantilever)
+    body = ProjectIn.model_validate(cantilever_project(mesh.id, max_iter=2))
+    project = other.create_project(body)
+    assert api.get(f"/api/projects/{project.id}").json()["name"] == "cantilever"
+    assert [p["id"] for p in api.get("/api/projects").json()] == [project.id]
+    other.set_params(project.id, volfrac=0.4)  # edited in the other process: re-read
+    assert api.get(f"/api/projects/{project.id}").json()["params"]["volfrac"] == 0.4
+
+    run = other.run(project.id)
+    assert run.status == "done"
+    assert api.get(f"/api/runs/{run.id}").json()["status"] == "done"
+    assert [r["id"] for r in api.get("/api/runs").json()] == [run.id]
+    with np.load(io.BytesIO(api.get(f"/api/runs/{run.id}/result.npz").content)) as z:
+        assert z["rho"].shape == (18, 8, 8)
+
+    gui = create_project(api, {"name": "from the GUI"})["id"]  # and the other way round
+    assert other.get_project(gui).name == "from the GUI"
+    assert gui in {p.id for p in Store(tmp_path).list_projects()}
+
+
+def test_persist_failure_still_sends_done(api: TestClient, cantilever: Path, monkeypatch):
+    def full(self, rec):
+        raise MemoryError("np.savez could not allocate")
+
+    monkeypatch.setattr(Store, "persist_run", full)
+    mid = upload(api, cantilever)["id"]
+    rid, msgs = streamed(api, create_project(api, cantilever_project(mid, max_iter=2))["id"])
+    assert msgs[-1]["type"] == "done"
+    assert "result not persisted: np.savez could not allocate" in msgs[-1]["message"]
+    info = api.get(f"/api/runs/{rid}").json()
+    assert info["status"] == "done" and "result not persisted" in info["message"]
+    assert api.get(f"/api/runs/{rid}/result.npz").status_code == 200  # still in memory
+
+
+def test_finished_run_releases_its_arrays(api: TestClient, cantilever: Path):
+    mid = upload(api, cantilever)["id"]
+    rid, msgs = streamed(api, create_project(api, cantilever_project(mid, max_iter=2))["id"])
+    assert msgs[-1]["type"] == "done"
+    rec = api.app.state.store.get_run(rid)
+    assert rec.rho is None and rec.built is None and rec.stress is None
+    assert rec.latest_frame is None
+    for url in ("result.npz", "result.vti", "stress", "preview.png"):
+        assert api.get(f"/api/runs/{rid}/{url}").status_code == 200, url
+    stl = api.get(f"/api/runs/{rid}/result.stl", params={"threshold": 0.2, "trim": True})
+    assert stl.status_code == 200 and len(stl.content) > 84
+    with api.websocket_connect(f"/api/runs/{rid}/stream") as ws:  # a late joiner
+        replay = collect(ws)
+    assert statuses(replay) == ["started", "done"] and struct.unpack("<I", replay[1][:4]) == (2,)
+
+
+def test_result_request_in_the_finish_window_waits_for_the_result(
+    api: TestClient, cantilever: Path, tmp_path: Path
+):
+    mid = upload(api, cantilever)["id"]
+    rid, _ = streamed(api, create_project(api, cantilever_project(mid, max_iter=2))["id"])
+    store = api.app.state.store
+    rec = store.get_run(rid)
+    npz = tmp_path / "runs" / f"{rid}.npz"
+    rho, grid, active, passive = from_npz_bytes(npz.read_bytes())
+    npz.unlink()  # as in `_finish` before the files exist
+    store._results.clear()
+    codes: list[int] = []
+
+    def request() -> None:
+        codes.append(api.get(f"/api/runs/{rid}/result.npz").status_code)
+
+    with rec.lock:  # `_finish` sets the status, then the result, under this lock
+        rec.info.status = "done"
+        reader = threading.Thread(target=request)
+        reader.start()
+        time.sleep(0.3)
+        rec.rho, rec.built = rho, SimpleNamespace(grid=grid, active=active, passive=passive)
+    reader.join(30)
+    assert codes == [200]
+
+
+def test_base_exception_in_the_worker_fails_the_run(api: TestClient, cantilever: Path, monkeypatch):
+    class Abort(BaseException):
+        pass
+
+    def abort(*args, **kwargs):
+        raise Abort("worker torn down")
+
+    monkeypatch.setattr("topop.server.jobs.optimize", abort)
+    mid = upload(api, cantilever)["id"]
+    pid = create_project(api, cantilever_project(mid, max_iter=2))["id"]
+    rid, msgs = streamed(api, pid)
+    assert msgs[-1]["type"] == "error" and "Abort" in msgs[-1]["message"]
+    assert api.get(f"/api/runs/{rid}").json()["status"] == "error"
+    runs = api.app.state.runs
+    assert runs.semaphore.acquire(timeout=10)  # released for the next run
+    runs.semaphore.release()
+
+    def leave(*args, **kwargs):
+        raise SystemExit("bye")
+
+    monkeypatch.setattr("topop.server.jobs.optimize", leave)  # re-raised, after marking the run
+    store = api.app.state.store
+    rec = store.new_run(store.get_project(pid), SimpleNamespace(active=None, problem=None), None)
+    with pytest.raises(SystemExit):
+        runs._worker(rec, rec.built, ParamsSpec())
+    assert rec.info.status == "error" and "SystemExit: bye" in rec.info.error
+    assert runs.semaphore.acquire(timeout=1)
+    runs.semaphore.release()
+
+
+def test_too_many_queued_runs_is_429(api: TestClient, cantilever: Path, monkeypatch):
+    monkeypatch.setenv("TOPOP_MAX_QUEUED", "1")
+    mid = upload(api, cantilever)["id"]
+    pid = create_project(api, cantilever_project(mid, max_iter=2))["id"]
+    sem = api.app.state.runs.semaphore
+    sem.acquire()  # a run in progress: new ones queue
+    try:
+        first = api.post("/api/runs", json={"project_id": pid}).json()
+        assert first["status"] == "queued"
+        refused = api.post("/api/runs", json={"project_id": pid})
+        assert refused.status_code == 429 and "TOPOP_MAX_QUEUED=1" in refused.json()["detail"]
+        api.post(f"/api/runs/{first['id']}/cancel")
+        second = api.post("/api/runs", json={"project_id": pid})
+        assert second.status_code == 200  # room again
+        api.post(f"/api/runs/{second.json()['id']}/cancel")
+        assert api.app.state.store.get_run(first["id"]).built is None  # cancelled: released
+    finally:
+        sem.release()
+
+
+def test_store_start_removes_stale_temp_files(tmp_path: Path, monkeypatch):
+    Store(tmp_path)
+    stale = tmp_path / "projects" / ".abc.json.deadbeef.tmp"
+    fresh = tmp_path / "runs" / ".r.npz.cafebabe.tmp"  # may be another process writing now
+    stale.write_bytes(b"x")
+    fresh.write_bytes(b"y")
+    os.utime(stale, (time.time() - 3600,) * 2)
+    Store(tmp_path)
+    assert not stale.exists() and fresh.exists()
+
+    def no_space(fd):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "fsync", no_space)  # written data is synced before the rename
+    with pytest.raises(OSError, match="No space"):
+        _write_atomic(tmp_path / "x.json", b"{}")
+    assert not (tmp_path / "x.json").exists() and not list(tmp_path.glob(".x.json.*"))
