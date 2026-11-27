@@ -587,9 +587,23 @@
           helper.renderOrder = 6;
         }
         V.keep.add(helper);
+        // Faint fill so the box volume reads, then the part's cells it actually captures.
+        const size = [0, 1, 2].map((d) => kp.max[d] - kp.min[d]);
+        const fill = new THREE.Mesh(
+          new THREE.BoxGeometry(...size),
+          new THREE.MeshBasicMaterial({ color, transparent: true, opacity: sel ? 0.12 : 0.07, depthWrite: false, side: THREE.DoubleSide }),
+        );
+        fill.position.set(...[0, 1, 2].map((d) => (kp.min[d] + kp.max[d]) / 2));
+        fill.renderOrder = 5;
+        V.keep.add(fill);
+        if (g) {
+          const boxCells = new Set();
+          forEachBoxCell(g, kp, (e) => boxCells.add(e));
+          if (boxCells.size) V.keep.add(keepVoxelMesh(g, boxCells, color, sel ? 0.42 : 0.26, kp.id));
+        }
       }
       if (g && kp.cells && kp.cells.size && kp.cellsGrid === g) {
-        const vox = keepVoxelMesh(g, kp, color, sel);
+        const vox = keepVoxelMesh(g, kp.cells, color, sel ? 0.5 : 0.32, kp.id);
         V.keep.add(vox);
         V.keepVox.push(vox);
       }
@@ -616,9 +630,8 @@
 
   // Translucent cubes for the painted cells; only cells on the outside of the set are drawn. Drawn
   // without depth test so cells inside the part show through it.
-  function keepVoxelMesh(g, kp, color, sel) {
+  function keepVoxelMesh(g, cells, color, opacity, keepId) {
     const { nx, ny, nz, h, origin } = g;
-    const cells = kp.cells;
     const has = (i, j, k) => i >= 0 && j >= 0 && k >= 0 && i < nx && j < ny && k < nz && cells.has((i * ny + j) * nz + k);
     const list = [];
     for (const e of cells) {
@@ -629,7 +642,7 @@
     }
     const n = list.length / 3;
     const geo = new THREE.BoxGeometry(h * 0.92, h * 0.92, h * 0.92);
-    const mat = new THREE.MeshLambertMaterial({ color, transparent: true, opacity: sel ? 0.5 : 0.32, depthTest: false, depthWrite: false });
+    const mat = new THREE.MeshLambertMaterial({ color, transparent: true, opacity, depthTest: false, depthWrite: false });
     const mesh = new THREE.InstancedMesh(geo, mat, Math.max(1, n));
     const m4 = new THREE.Matrix4();
     for (let q = 0; q < n; q++) {
@@ -639,7 +652,7 @@
     mesh.count = n;
     mesh.frustumCulled = false;
     mesh.renderOrder = 6;
-    mesh.userData.keepId = kp.id;
+    mesh.userData.keepId = keepId;
     return mesh;
   }
 
@@ -1139,8 +1152,10 @@
 
   function keepKind(kp) {
     const nv = kp.cells && kp.cellsGrid === S.grid ? kp.cells.size : 0;
-    if (kp.min && nv) return `box + voxels (${fmt.int(nv)})`;
-    if (kp.min) return 'box';
+    const total = S.grid ? regionCells(S.grid, kp).size : 0;
+    const inPart = S.grid ? ` \u00b7 ${fmt.int(total)} cells in part` : '';
+    if (kp.min && nv) return `box + voxels (${fmt.int(nv)})${inPart}`;
+    if (kp.min) return `box${inPart}`;
     return `voxels (${fmt.int(nv)})`;
   }
 
