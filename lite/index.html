@@ -32,6 +32,9 @@
   --rho-hi: #1f4f9e;
   --surface-model: #3e6fb8;
   --select: #f0a020;
+  --axis-x: #d33a2c;
+  --axis-y: #2f9a3a;
+  --axis-z: #2f63d8;
   --shadow: 0 1px 2px rgba(20, 30, 45, 0.08), 0 4px 14px rgba(20, 30, 45, 0.08);
   --font-ui: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-num: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -47,7 +50,7 @@
     --load: #ff7c45; --keep-solid: #a689f5; --keep-void: #77818d; --danger: #ff6b5e;
     --vp-top: #1a222b; --vp-bottom: #0c1116; --model: #4f5d6d; --grid-major: #2d3845;
     --grid-minor: #212a34; --rho-lo: #34465e; --rho-hi: #8cb8ff; --surface-model: #79a6ea;
-    --select: #ffb547;
+    --select: #ffb547; --axis-x: #ff6a5c; --axis-y: #5ed16a; --axis-z: #6a9bff;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.35);
     color-scheme: dark;
   }
@@ -59,7 +62,7 @@
   --load: #ff7c45; --keep-solid: #a689f5; --keep-void: #77818d; --danger: #ff6b5e;
   --vp-top: #1a222b; --vp-bottom: #0c1116; --model: #4f5d6d; --grid-major: #2d3845;
   --grid-minor: #212a34; --rho-lo: #34465e; --rho-hi: #8cb8ff; --surface-model: #79a6ea;
-  --select: #ffb547;
+  --select: #ffb547; --axis-x: #ff6a5c; --axis-y: #5ed16a; --axis-z: #6a9bff;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.35);
   color-scheme: dark;
 }
@@ -183,6 +186,17 @@ input[type="number"], input[type="text"], select.field {
 .bc-list .x { width: 22px; height: 22px; border: 0; background: transparent; border-radius: 3px; cursor: pointer; color: var(--muted); font-size: 15px; line-height: 1; }
 .bc-list .x:hover:not(:disabled) { background: var(--sunken); color: var(--danger); }
 .bc-list .empty { display: block; color: var(--faint); background: transparent; border-style: dashed; }
+.bc-list button.t { text-align: left; background: none; border: 0; padding: 0; cursor: pointer; border-radius: 2px; }
+.bc-list li[aria-current="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.paint-opts { display: grid; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
+.paint-opts .seg button { height: 24px; font-size: 12px; }
+.vp-paint {
+  position: absolute; bottom: 36px; left: 50%; transform: translateX(-50%); width: max-content; max-width: calc(100% - 16px);
+  text-align: center; font-size: 12px; pointer-events: none;
+  padding: 3px 9px; border-radius: 4px; border: 1px solid var(--accent); color: var(--accent);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+}
 .readout { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
 .readout div { background: var(--surface); padding: 5px 7px; min-width: 0; }
 .readout small { display: block; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
@@ -268,6 +282,7 @@ input[type="number"], input[type="text"], select.field {
   .panel::before { content: ""; display: block; width: 36px; height: 4px; border-radius: 2px; background: var(--line-strong); margin: 7px auto 0; }
   .vp-hint { display: none; }
   .selcard { bottom: 8px; padding: 8px 10px; }
+  .vp-paint { bottom: 8px; }
   .legend { display: none; }
   .brand span { display: none; }
   .tb-label { display: none; }
@@ -366,7 +381,7 @@ input[type="number"], input[type="text"], select.field {
     <details class="sec" id="sec-keep">
       <summary>Keep regions<span class="tag" id="keep-tag"></span></summary>
       <div class="sec-body">
-        <p class="note">Axis-aligned boxes. Keep-in elements stay solid, keep-out elements stay empty.</p>
+        <p class="note">Boxes or painted voxels. Keep-in elements stay solid, keep-out elements stay empty. Select a region in the list or click its outline; drag the arrows in the view to move a face.</p>
         <div class="row">
           <label for="keep-mode">Type</label>
           <select id="keep-mode" class="field grow">
@@ -378,7 +393,27 @@ input[type="number"], input[type="text"], select.field {
           <span>min</span><input id="keep-x0" type="number" step="any" aria-label="min x"><input id="keep-y0" type="number" step="any" aria-label="min y"><input id="keep-z0" type="number" step="any" aria-label="min z">
           <span>max</span><input id="keep-x1" type="number" step="any" aria-label="max x"><input id="keep-y1" type="number" step="any" aria-label="max y"><input id="keep-z1" type="number" step="any" aria-label="max z">
         </div>
-        <div class="btn-row"><button id="keep-add" class="btn small" type="button">Add box</button></div>
+        <p class="note" id="keep-edit">New box: enter min and max, then Add box.</p>
+        <div class="btn-row">
+          <button id="keep-add" class="btn small" type="button">Add box</button>
+          <button id="keep-convert" class="btn small" type="button" disabled title="Turn the selected box into its voxel set, so it can be painted">Convert box to voxels</button>
+          <button id="keep-paint" class="btn small" type="button" aria-pressed="false">Paint voxels</button>
+        </div>
+        <div class="paint-opts" id="paint-opts" hidden>
+          <div class="row">
+            <label id="brush-mode-label">Brush</label>
+            <div class="seg" role="group" aria-labelledby="brush-mode-label">
+              <button type="button" data-brush="add" aria-pressed="true">Add</button>
+              <button type="button" data-brush="erase" aria-pressed="false">Erase</button>
+            </div>
+          </div>
+          <div class="slider">
+            <label for="brush">Brush radius (voxels)</label><output id="brush-out" for="brush">1</output>
+            <input id="brush" type="range" min="0" max="3" step="1" value="1">
+          </div>
+          <p class="note">Drag on the part to paint the selected region (a new one of the type above if none is selected). Drag off the part to orbit. Esc leaves paint mode.</p>
+        </div>
+        <p class="note" id="keep-note" hidden></p>
         <ul class="bc-list" id="keep-list"></ul>
       </div>
     </details>
@@ -444,6 +479,7 @@ input[type="number"], input[type="text"], select.field {
   <main class="viewport" id="viewport">
     <canvas id="gl"></canvas>
     <div class="vp-status" id="vp-status" data-state="idle"><i class="dot"></i><span id="vp-status-text">Loading…</span></div>
+    <div class="vp-paint" id="vp-paint" hidden>Paint voxels: drag on the part · Esc to leave</div>
     <div class="rho-bar" id="rho-bar" hidden><i></i><span><b id="rho-bar-lo">0.50</b><b>density</b><b>1</b></span></div>
     <div class="legend"><span><i style="background: var(--support)"></i>Support</span><span><i style="background: var(--load)"></i>Load</span><span><i style="background: var(--select)"></i>Selection</span></div>
     <div class="vp-hint">Drag: orbit · Right-drag / two fingers: pan · Wheel / pinch: zoom · Click: select face</div>
