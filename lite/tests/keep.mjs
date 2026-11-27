@@ -96,7 +96,7 @@ async function dragHandle(page, axis, side, px, sign = 1) {
   await page.click('#keep-add');
   const k0 = await sel(page);
   const nh = await page.evaluate(() => window.topopLite.api.keepHandles().length);
-  check('Add box selects the new region and shows 6 face handles', k0 && nh === 6 && (await rows(page))[0].endsWith('box'), JSON.stringify({ k0, nh, rows: await rows(page) }));
+  check('Add box selects the new region and shows 6 face handles', k0 && nh === 6 && /· box · \d[\d,]* cells in part$/.test((await rows(page))[0]), JSON.stringify({ k0, nh, rows: await rows(page) }));
 
   // 2. Drag the +x handle outward: max x moves by whole voxels, the fields follow, the camera does not orbit.
   const cam0 = await page.evaluate(() => window.topopLite.api.camera());
@@ -193,7 +193,7 @@ async function dragHandle(page, axis, side, px, sign = 1) {
   await mouseStroke(page, [10, 18, 25], [10, 46, 25]);
   const kv = await sel(page);
   const rowV = (await rows(page))[2];
-  check('painting into a box region: row says box + voxels (N)', kv.mode === 'void' && kv.min && kv.n > 0 && rowV.endsWith(`box + voxels (${kv.n})`), rowV);
+  check('painting into a box region: row says box + voxels (N)', kv.mode === 'void' && kv.min && kv.n > 0 && rowV.includes(`box + voxels (${kv.n}) · `) && /cells in part$/.test(rowV), rowV);
   await page.keyboard.press('Escape');
 
   // Clicking the outline of the keep-out box selects it.
