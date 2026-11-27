@@ -13,7 +13,11 @@
     res: 40,
     grid: null,
     bcs: [],
+    // Keep regions: { id, mode: 'solid'|'void', min, max (box, or null), cells: Set<element id> | null,
+    // cellsGrid: the grid the cell ids belong to }.
     keeps: [],
+    keepSel: null,
+    paint: { on: false, mode: 'add', radius: 1 },
     nextId: 1,
     selection: null,
     status: 'idle',
@@ -317,28 +321,81 @@
     return [origin[0] + i * h, origin[1] + j * h, origin[2] + k * h];
   }
 
-  function buildPassive(grid, keeps) {
-    if (!keeps.length) return null;
+  // Active elements whose centre lies in the region's box (inclusive), then its painted cells.
+  function forEachBoxCell(grid, kp, fn) {
+    if (!kp.min) return;
     const { nx, ny, nz, h, origin, active } = grid;
-    const pas = new Int8Array(nx * ny * nz);
-    for (const kp of keeps) {
-      const v = kp.mode === 'solid' ? 1 : -1;
-      for (let i = 0; i < nx; i++) {
-        const x = origin[0] + (i + 0.5) * h;
-        if (x < kp.min[0] || x > kp.max[0]) continue;
-        for (let j = 0; j < ny; j++) {
-          const y = origin[1] + (j + 0.5) * h;
-          if (y < kp.min[1] || y > kp.max[1]) continue;
-          for (let k = 0; k < nz; k++) {
-            const z = origin[2] + (k + 0.5) * h;
-            if (z < kp.min[2] || z > kp.max[2]) continue;
-            const e = (i * ny + j) * nz + k;
-            if (active[e]) pas[e] = v;
-          }
+    for (let i = 0; i < nx; i++) {
+      const x = origin[0] + (i + 0.5) * h;
+      if (x < kp.min[0] || x > kp.max[0]) continue;
+      for (let j = 0; j < ny; j++) {
+        const y = origin[1] + (j + 0.5) * h;
+        if (y < kp.min[1] || y > kp.max[1]) continue;
+        for (let k = 0; k < nz; k++) {
+          const z = origin[2] + (k + 0.5) * h;
+          if (z < kp.min[2] || z > kp.max[2]) continue;
+          const e = (i * ny + j) * nz + k;
+          if (active[e]) fn(e);
         }
       }
     }
+  }
+
+  function forEachRegionCell(grid, kp, fn) {
+    forEachBoxCell(grid, kp, fn);
+    if (kp.cells && kp.cellsGrid === grid) for (const e of kp.cells) if (grid.active[e]) fn(e);
+  }
+
+  function regionCells(grid, kp) {
+    const out = new Set();
+    forEachRegionCell(grid, kp, (e) => out.add(e));
+    return out;
+  }
+
+  function buildPassive(grid, keeps) {
+    if (!keeps.length) return null;
+    const pas = new Int8Array(grid.nx * grid.ny * grid.nz);
+    for (const kp of keeps) {
+      const v = kp.mode === 'solid' ? 1 : -1;
+      forEachRegionCell(grid, kp, (e) => { pas[e] = v; });
+    }
     return pas;
+  }
+
+  function cellAt(g, x, y, z) {
+    const i = Math.floor((x - g.origin[0]) / g.h), j = Math.floor((y - g.origin[1]) / g.h), k = Math.floor((z - g.origin[2]) / g.h);
+    if (i < 0 || j < 0 || k < 0 || i >= g.nx || j >= g.ny || k >= g.nz) return -1;
+    return (i * g.ny + j) * g.nz + k;
+  }
+
+  function cellIJK(g, e) {
+    const k = e % g.nz, t = (e - k) / g.nz, j = t % g.ny;
+    return [(t - j) / g.ny, j, k];
+  }
+
+  // Painted cells follow the part when the grid changes: each old cell centre marks the new cell that
+  // contains it, and every new cell whose centre lies in an old painted cell is marked too (refinement).
+  function remapCells(g0, g1, cells) {
+    const out = new Set();
+    if (!cells.size) return out;
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (const e of cells) {
+      const c = cellIJK(g0, e);
+      const p = c.map((v, d) => g0.origin[d] + (v + 0.5) * g0.h);
+      const n = cellAt(g1, p[0], p[1], p[2]);
+      if (n >= 0 && g1.active[n]) out.add(n);
+      for (let d = 0; d < 3; d++) { lo[d] = Math.min(lo[d], c[d]); hi[d] = Math.max(hi[d], c[d]); }
+    }
+    const dims = [g1.nx, g1.ny, g1.nz];
+    const r0 = [0, 1, 2].map((d) => Math.max(0, Math.floor((g0.origin[d] + lo[d] * g0.h - g1.origin[d]) / g1.h)));
+    const r1 = [0, 1, 2].map((d) => Math.min(dims[d] - 1, Math.ceil((g0.origin[d] + (hi[d] + 1) * g0.h - g1.origin[d]) / g1.h)));
+    for (let i = r0[0]; i <= r1[0]; i++) for (let j = r0[1]; j <= r1[1]; j++) for (let k = r0[2]; k <= r1[2]; k++) {
+      const n = (i * g1.ny + j) * g1.nz + k;
+      if (!g1.active[n] || out.has(n)) continue;
+      const o = cellAt(g0, g1.origin[0] + (i + 0.5) * g1.h, g1.origin[1] + (j + 0.5) * g1.h, g1.origin[2] + (k + 0.5) * g1.h);
+      if (o >= 0 && cells.has(o)) out.add(n);
+    }
+    return out;
   }
 
   // ---------------------------------------------------------------- three.js view
@@ -391,6 +448,7 @@
     renderPending = true;
     requestAnimationFrame(() => {
       renderPending = false;
+      updateHandleScale();
       V.renderer.render(V.scene, V.camera);
     });
   }
@@ -502,12 +560,175 @@
         }
       }
     }
-    for (const kp of S.keeps) {
-      const box = new THREE.Box3(new THREE.Vector3(...kp.min), new THREE.Vector3(...kp.max));
-      V.bc.add(new THREE.Box3Helper(box, new THREE.Color(token(kp.mode === 'solid' ? '--keep-solid' : '--keep-void'))));
-    }
     V.root.add(V.bc);
+    buildKeepView();
+  }
+
+  // ---------------------------------------------------------------- keep regions: view
+  const AXIS_TOKENS = ['--axis-x', '--axis-y', '--axis-z'];
+  const HANDLE_PX = 26; // arrow length on screen
+  const keepToken = (kp) => (kp.mode === 'solid' ? '--keep-solid' : '--keep-void');
+  const selectedKeep = () => S.keeps.find((k) => k.id === S.keepSel) || null;
+
+  function buildKeepView() {
+    disposeObj(V.keep);
+    V.keep = new THREE.Group();
+    V.handles = null;
+    V.keepVox = [];
+    const g = S.grid;
+    for (const kp of S.keeps) {
+      const color = new THREE.Color(token(keepToken(kp)));
+      const sel = kp.id === S.keepSel;
+      if (kp.min) {
+        const helper = new THREE.Box3Helper(new THREE.Box3(new THREE.Vector3(...kp.min), new THREE.Vector3(...kp.max)), color);
+        if (sel) {
+          helper.material.depthTest = false;
+          helper.material.transparent = true;
+          helper.renderOrder = 6;
+        }
+        V.keep.add(helper);
+      }
+      if (g && kp.cells && kp.cells.size && kp.cellsGrid === g) {
+        const vox = keepVoxelMesh(g, kp, color, sel);
+        V.keep.add(vox);
+        V.keepVox.push(vox);
+      }
+    }
+    const kp = selectedKeep();
+    if (kp && kp.min && S.status !== 'running') {
+      V.handles = makeHandles(kp);
+      V.keep.add(V.handles);
+    }
+    V.root.add(V.keep);
     requestRender();
+  }
+
+  let keepViewPending = false;
+  function scheduleKeepView() {
+    if (keepViewPending) return;
+    keepViewPending = true;
+    requestAnimationFrame(() => {
+      keepViewPending = false;
+      buildKeepView();
+      renderKeepList();
+    });
+  }
+
+  // Translucent cubes for the painted cells; only cells on the outside of the set are drawn. Drawn
+  // without depth test so cells inside the part show through it.
+  function keepVoxelMesh(g, kp, color, sel) {
+    const { nx, ny, nz, h, origin } = g;
+    const cells = kp.cells;
+    const has = (i, j, k) => i >= 0 && j >= 0 && k >= 0 && i < nx && j < ny && k < nz && cells.has((i * ny + j) * nz + k);
+    const list = [];
+    for (const e of cells) {
+      if (!g.active[e]) continue;
+      const [i, j, k] = cellIJK(g, e);
+      if (has(i - 1, j, k) && has(i + 1, j, k) && has(i, j - 1, k) && has(i, j + 1, k) && has(i, j, k - 1) && has(i, j, k + 1)) continue;
+      list.push(i, j, k);
+    }
+    const n = list.length / 3;
+    const geo = new THREE.BoxGeometry(h * 0.92, h * 0.92, h * 0.92);
+    const mat = new THREE.MeshLambertMaterial({ color, transparent: true, opacity: sel ? 0.5 : 0.32, depthTest: false, depthWrite: false });
+    const mesh = new THREE.InstancedMesh(geo, mat, Math.max(1, n));
+    const m4 = new THREE.Matrix4();
+    for (let q = 0; q < n; q++) {
+      m4.makeTranslation(origin[0] + (list[3 * q] + 0.5) * h, origin[1] + (list[3 * q + 1] + 0.5) * h, origin[2] + (list[3 * q + 2] + 0.5) * h);
+      mesh.setMatrixAt(q, m4);
+    }
+    mesh.count = n;
+    mesh.frustumCulled = false;
+    mesh.renderOrder = 6;
+    mesh.userData.keepId = kp.id;
+    return mesh;
+  }
+
+  // One arrow per face of the selected box, at the face centre, pointing outward. Sized in pixels.
+  function makeHandles(kp) {
+    const grp = new THREE.Group();
+    const cone = new THREE.ConeGeometry(0.2, 0.42, 16).translate(0, 0.79, 0);
+    const stem = new THREE.CylinderGeometry(0.045, 0.045, 0.6, 8).translate(0, 0.3, 0);
+    const plate = new THREE.PlaneGeometry(0.34, 0.34).rotateX(-Math.PI / 2);
+    const up = new THREE.Vector3(0, 1, 0);
+    const c = [0, 1, 2].map((d) => (kp.min[d] + kp.max[d]) / 2);
+    for (let a = 0; a < 3; a++) for (let side = 0; side < 2; side++) {
+      const mat = new THREE.MeshBasicMaterial({ color: token(AXIS_TOKENS[a]), depthTest: false, transparent: true, side: THREE.DoubleSide });
+      const hd = new THREE.Group();
+      for (const geo of [cone, stem, plate]) {
+        const m = new THREE.Mesh(geo, mat);
+        m.renderOrder = 8;
+        hd.add(m);
+      }
+      const p = c.slice();
+      p[a] = side ? kp.max[a] : kp.min[a];
+      const n = new THREE.Vector3();
+      n.setComponent(a, side ? 1 : -1);
+      hd.position.set(...p);
+      hd.quaternion.setFromUnitVectors(up, n);
+      hd.userData = { axis: a, side, normal: n };
+      grp.add(hd);
+    }
+    return grp;
+  }
+
+  function worldPerPixel(p) {
+    const dist = V.camera.position.distanceTo(p);
+    return (2 * dist * Math.tan((V.camera.fov * Math.PI) / 360)) / Math.max(1, $('gl').clientHeight);
+  }
+
+  function updateHandleScale() {
+    if (!V.handles) return;
+    for (const hd of V.handles.children) hd.scale.setScalar(worldPerPixel(hd.position) * HANDLE_PX);
+  }
+
+  function toClient(p) {
+    const v = p.clone().project(V.camera);
+    const r = $('gl').getBoundingClientRect();
+    return { x: r.left + ((v.x + 1) / 2) * r.width, y: r.top + ((1 - v.y) / 2) * r.height, ok: v.z > -1 && v.z < 1 };
+  }
+
+  function distToSeg(px, py, a, b) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const l2 = dx * dx + dy * dy;
+    const t = l2 ? Math.max(0, Math.min(1, ((px - a.x) * dx + (py - a.y) * dy) / l2)) : 0;
+    return Math.hypot(px - a.x - t * dx, py - a.y - t * dy);
+  }
+
+  function handleScreen(hd) {
+    const len = worldPerPixel(hd.position) * HANDLE_PX;
+    return { a: toClient(hd.position), b: toClient(hd.position.clone().addScaledVector(hd.userData.normal, len)) };
+  }
+
+  function handleAt(cx, cy, tol) {
+    if (!V.handles) return null;
+    V.camera.updateMatrixWorld();
+    let best = null, bd = tol;
+    for (const hd of V.handles.children) {
+      const { a, b } = handleScreen(hd);
+      if (!a.ok || !b.ok) continue;
+      const d = distToSeg(cx, cy, a, b);
+      if (d < bd) { bd = d; best = hd; }
+    }
+    return best;
+  }
+
+  // Region whose box outline passes within tol pixels of the click.
+  function keepOutlineAt(cx, cy, tol) {
+    V.camera.updateMatrixWorld();
+    let best = null, bd = tol;
+    for (const kp of S.keeps) {
+      if (!kp.min) continue;
+      const P = [];
+      for (let q = 0; q < 8; q++) P.push(toClient(new THREE.Vector3(q & 1 ? kp.max[0] : kp.min[0], q & 2 ? kp.max[1] : kp.min[1], q & 4 ? kp.max[2] : kp.min[2])));
+      for (let q = 0; q < 8; q++) for (const bit of [1, 2, 4]) {
+        if (q & bit) continue;
+        const a = P[q], b = P[q | bit];
+        if (!a.ok || !b.ok) continue;
+        const d = distToSeg(cx, cy, a, b);
+        if (d < bd) { bd = d; best = kp; }
+      }
+    }
+    return best;
   }
 
   function ensureVoxelMesh() {
@@ -612,7 +833,7 @@
     if (V.bc) V.bc.visible = true;
     $('rho-bar').hidden = v !== 'voxels';
     $('rho-bar-lo').textContent = (+$('thr').value).toFixed(2);
-    document.querySelectorAll('.seg button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.view === v)));
+    document.querySelectorAll('.seg [data-view]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.view === v)));
     requestRender();
   }
 
@@ -644,35 +865,186 @@
     drawSpark();
   }
 
-  // ---------------------------------------------------------------- picking
+  // ---------------------------------------------------------------- picking, handle drags, voxel paint
+  // pointerdown is caught on the viewport in the capture phase, before OrbitControls sees it on the
+  // canvas, so a handle drag or a paint stroke can switch orbiting off for that pointer.
   function initPicking() {
     const canvas = $('gl');
     let down = null;
     let touches = 0;
-    canvas.addEventListener('pointerdown', (e) => {
+    let drag = null;
+    const endDrag = () => {
+      if (!drag) return;
+      const d = drag;
+      drag = null;
+      V.controls.enabled = true;
+      d.end();
+    };
+    $('viewport').addEventListener('pointerdown', (e) => {
+      if (e.target !== canvas) return;
       touches++;
+      if (drag) { endDrag(); down = null; return; }
+      if (touches === 1 && e.button === 0 && S.status !== 'running' && V.design) {
+        const tol = e.pointerType === 'touch' ? 26 : 14;
+        const hd = handleAt(e.clientX, e.clientY, tol);
+        drag = hd ? startHandleDrag(hd, e) : S.paint.on ? startStroke(e) : null;
+        if (drag) {
+          drag.id = e.pointerId;
+          V.controls.enabled = false;
+          canvas.setPointerCapture?.(e.pointerId);
+          down = null;
+          return;
+        }
+      }
       down = touches === 1 ? { x: e.clientX, y: e.clientY, t: performance.now() } : null;
+    }, true);
+    canvas.addEventListener('pointermove', (e) => {
+      if (drag && e.pointerId === drag.id) drag.move(e);
     });
     const end = (e) => {
       touches = Math.max(0, touches - 1);
+      if (drag && e.pointerId === drag.id) { endDrag(); return; }
       if (!down || e.type === 'pointercancel') { down = null; return; }
       const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
       const quick = performance.now() - down.t < 600;
       down = null;
-      if (moved < 6 && quick && e.button === 0) pick(e.clientX, e.clientY);
+      if (moved < 6 && quick && e.button === 0 && !S.paint.on) pick(e.clientX, e.clientY, e.pointerType === 'touch');
     };
     canvas.addEventListener('pointerup', end);
     canvas.addEventListener('pointercancel', end);
   }
 
-  function pick(cx, cy) {
-    if (!V.design || S.status === 'running') return;
+  function rayAt(cx, cy) {
     const rect = $('gl').getBoundingClientRect();
     const p = new THREE.Vector2(((cx - rect.left) / rect.width) * 2 - 1, -((cy - rect.top) / rect.height) * 2 + 1);
+    V.camera.updateMatrixWorld();
     V.raycaster.setFromCamera(p, V.camera);
+    return V.raycaster.ray;
+  }
+
+  // Drag one face of the selected box along its axis, in whole voxels from where the drag started.
+  function startHandleDrag(hd, e) {
+    const kp = selectedKeep();
+    if (!kp || !kp.min) return null;
+    const { axis: a, side } = hd.userData;
+    const anchor = hd.position.clone();
+    const dir = new THREE.Vector3();
+    dir.setComponent(a, 1);
+    const param = (ev) => {
+      const ray = rayAt(ev.clientX, ev.clientY);
+      const w0 = ray.origin.clone().sub(anchor);
+      const b = ray.direction.dot(dir), d = ray.direction.dot(w0), ee = dir.dot(w0);
+      const den = 1 - b * b;
+      return den < 1e-6 ? null : (ee - b * d) / den;
+    };
+    const t0 = param(e);
+    if (t0 === null) return null;
+    const v0 = side ? kp.max[a] : kp.min[a];
+    const m = S.mesh;
+    let changed = false;
+    return {
+      move(ev) {
+        const t = param(ev);
+        if (t === null) return;
+        const g = S.grid, step = g ? g.h : 0;
+        const gap = step || m.diag * 1e-3;
+        let dv = Math.max(-2 * m.diag, Math.min(2 * m.diag, t - t0));
+        if (step) dv = Math.round(dv / step) * step;
+        let v = v0 + dv;
+        if (side && v < kp.min[a] + gap) v = step ? v0 + Math.ceil((kp.min[a] + gap - v0) / step - 1e-9) * step : kp.min[a] + gap;
+        if (!side && v > kp.max[a] - gap) v = step ? v0 + Math.floor((kp.max[a] - gap - v0) / step + 1e-9) * step : kp.max[a] - gap;
+        const arr = side ? kp.max : kp.min;
+        if (arr[a] === v) return;
+        arr[a] = v;
+        if (!changed) { changed = true; invalidateResult(); }
+        syncKeepFields();
+        scheduleKeepView();
+      },
+      end() {
+        renderKeepList();
+        buildKeepView();
+      },
+    };
+  }
+
+  // Nearest hit on the part or on the shown keep voxels; erasing prefers the voxels so it can dig in.
+  function paintHit(cx, cy) {
+    const ray = rayAt(cx, cy);
+    const dh = V.raycaster.intersectObject(V.design, false)[0];
+    const sel = S.keepSel;
+    const vox = (V.keepVox || []).filter((m) => sel === null || m.userData.keepId === sel);
+    const vh = vox.length ? V.raycaster.intersectObjects(vox, false)[0] : null;
+    const hit = S.paint.mode === 'erase' && vh ? vh : !dh ? vh : !vh ? dh : dh.distance <= vh.distance ? dh : vh;
+    return hit ? { point: hit.point, dir: ray.direction.clone() } : null;
+  }
+
+  function startStroke(e) {
+    const g = S.grid;
+    if (!g || !g.count || !paintHit(e.clientX, e.clientY)) return null;
+    let kp = selectedKeep();
+    if (!kp && S.paint.mode === 'add') {
+      kp = { id: S.nextId++, mode: $('keep-mode').value, min: null, max: null, cells: new Set(), cellsGrid: g };
+      S.keeps.push(kp);
+      S.keepSel = kp.id;
+      syncKeepFields();
+    }
+    if (kp && (!kp.cells || kp.cellsGrid !== g)) { kp.cells = new Set(); kp.cellsGrid = g; }
+    const targets = kp ? [kp] : S.keeps.filter((k) => k.cells && k.cellsGrid === g);
+    let changed = false;
+    let last = { x: e.clientX, y: e.clientY };
+    const dab = (cx, cy) => {
+      const hit = paintHit(cx, cy);
+      if (!hit) return;
+      const p = hit.point.clone().addScaledVector(hit.dir, g.h / 2);
+      const c = cellAt(g, p.x, p.y, p.z);
+      if (c < 0) return;
+      if (brushCells(g, cellIJK(g, c), targets) && !changed) { changed = true; invalidateResult(); }
+    };
+    dab(e.clientX, e.clientY);
+    buildKeepView();
+    renderKeepList();
+    return {
+      move(ev) {
+        const n = Math.max(1, Math.ceil(Math.hypot(ev.clientX - last.x, ev.clientY - last.y) / 4));
+        for (let q = 1; q <= n; q++) dab(last.x + ((ev.clientX - last.x) * q) / n, last.y + ((ev.clientY - last.y) * q) / n);
+        last = { x: ev.clientX, y: ev.clientY };
+        scheduleKeepView();
+      },
+      end() {
+        buildKeepView();
+        renderKeepList();
+      },
+    };
+  }
+
+  function brushCells(g, [i0, j0, k0], targets) {
+    const r = S.paint.radius, add = S.paint.mode === 'add';
+    let n = 0;
+    for (let di = -r; di <= r; di++) for (let dj = -r; dj <= r; dj++) for (let dk = -r; dk <= r; dk++) {
+      if (di * di + dj * dj + dk * dk > r * r + 1e-9) continue;
+      const i = i0 + di, j = j0 + dj, k = k0 + dk;
+      if (i < 0 || j < 0 || k < 0 || i >= g.nx || j >= g.ny || k >= g.nz) continue;
+      const e = (i * g.ny + j) * g.nz + k;
+      for (const kp of targets) {
+        if (add) { if (g.active[e] && !kp.cells.has(e)) { kp.cells.add(e); n++; } }
+        else if (kp.cells.delete(e)) n++;
+      }
+    }
+    return n;
+  }
+
+  function pick(cx, cy, touch = false) {
+    if (!V.design || S.status === 'running') return;
+    const kp = keepOutlineAt(cx, cy, touch ? 16 : 7);
+    if (kp) {
+      selectKeep(kp.id, true);
+      return;
+    }
+    rayAt(cx, cy);
     const hit = V.raycaster.intersectObject(V.design, false)[0];
     if (!hit) {
       selectTris(null);
+      selectKeep(null);
       return;
     }
     selectTris(growFace(S.mesh, hit.faceIndex));
@@ -759,36 +1131,145 @@
     $('bc-tag').textContent = `${ns} fixed \u00b7 ${nl} load${nl === 1 ? '' : 's'}`;
   }
 
+  function keepLabel(kp) {
+    let n = 0;
+    for (const k of S.keeps) { if (k.mode === kp.mode) n++; if (k === kp) break; }
+    return `${kp.mode === 'solid' ? 'Keep-in' : 'Keep-out'} ${n}`;
+  }
+
+  function keepKind(kp) {
+    const nv = kp.cells && kp.cellsGrid === S.grid ? kp.cells.size : 0;
+    if (kp.min && nv) return `box + voxels (${fmt.int(nv)})`;
+    if (kp.min) return 'box';
+    return `voxels (${fmt.int(nv)})`;
+  }
+
   function renderKeepList() {
     const ul = $('keep-list');
     ul.replaceChildren();
-    S.keeps.forEach((kp, i) => {
+    const busy = S.status === 'running';
+    for (const kp of S.keeps) {
       const li = document.createElement('li');
+      li.dataset.id = kp.id;
+      li.setAttribute('aria-current', String(kp.id === S.keepSel));
       const sw = document.createElement('i');
       sw.className = 'sw';
-      sw.style.background = `var(${kp.mode === 'solid' ? '--keep-solid' : '--keep-void'})`;
-      const t = document.createElement('div');
+      sw.style.background = `var(${keepToken(kp)})`;
+      const t = document.createElement('button');
+      t.type = 'button';
       t.className = 't';
-      t.textContent = kp.mode === 'solid' ? 'Keep-in box' : 'Keep-out box';
+      t.textContent = `${keepLabel(kp)} \u00b7 ${keepKind(kp)}`;
+      t.title = kp.id === S.keepSel ? 'Selected: click to deselect' : 'Select to edit';
+      t.addEventListener('click', () => selectKeep(kp.id === S.keepSel ? null : kp.id));
       const small = document.createElement('small');
-      small.textContent = `(${kp.min.map(fmt.len).join(', ')}) \u2192 (${kp.max.map(fmt.len).join(', ')})`;
+      const g = S.grid;
+      small.textContent = kp.min
+        ? `(${kp.min.map(fmt.len).join(', ')}) \u2192 (${kp.max.map(fmt.len).join(', ')})`
+        : g ? `painted on the ${g.nx} \u00d7 ${g.ny} \u00d7 ${g.nz} grid` : 'painted cells';
       t.append(small);
       const x = document.createElement('button');
       x.className = 'x';
       x.type = 'button';
       x.textContent = '\u00d7';
-      x.setAttribute('aria-label', 'Remove box');
-      x.disabled = S.status === 'running';
+      x.setAttribute('aria-label', `Remove ${keepLabel(kp)}`);
+      x.disabled = busy;
       x.addEventListener('click', () => {
-        S.keeps.splice(i, 1);
+        S.keeps = S.keeps.filter((k) => k !== kp);
+        if (S.keepSel === kp.id) S.keepSel = null;
         invalidateResult();
+        syncKeepFields();
         renderKeepList();
-        buildBCMarkers();
+        buildKeepView();
       });
       li.append(sw, t, x);
       ul.append(li);
-    });
+    }
     $('keep-tag').textContent = S.keeps.length ? String(S.keeps.length) : '';
+    updateKeepButtons();
+  }
+
+  const KEEP_FIELDS = ['keep-x0', 'keep-y0', 'keep-z0', 'keep-x1', 'keep-y1', 'keep-z1'];
+
+  // The min/max fields show the selected region's box; with no box selected they describe a new box.
+  function syncKeepFields() {
+    const kp = selectedKeep();
+    const note = $('keep-edit');
+    if (kp && kp.min) {
+      KEEP_FIELDS.forEach((id, q) => {
+        const v = q < 3 ? kp.min[q] : kp.max[q - 3];
+        if (document.activeElement !== $(id) || +$(id).value !== v) $(id).value = +v.toPrecision(7);
+      });
+      $('keep-mode').value = kp.mode;
+      note.textContent = `Editing ${keepLabel(kp)}: type values or drag the arrows in the view (steps of one voxel).`;
+    } else if (kp) {
+      $('keep-mode').value = kp.mode;
+      note.textContent = `${keepLabel(kp)} has no box: paint it, or Add box to start a new box.`;
+    } else {
+      note.textContent = 'New box: enter min and max, then Add box.';
+    }
+    updateKeepButtons();
+  }
+
+  function updateKeepButtons() {
+    const kp = selectedKeep();
+    const busy = S.status === 'running';
+    $('keep-convert').disabled = busy || !kp || !kp.min || !S.grid;
+    $('keep-paint').disabled = busy || !S.grid;
+  }
+
+  function selectKeep(id, reveal = false) {
+    S.keepSel = id;
+    if (reveal) $('sec-keep').open = true;
+    syncKeepFields();
+    renderKeepList();
+    buildKeepView();
+  }
+
+  function onKeepFieldInput(final) {
+    const kp = selectedKeep();
+    if (!kp || !kp.min || S.status === 'running') return;
+    const v = KEEP_FIELDS.map((id) => parseFloat($(id).value));
+    const a = v.slice(0, 3), b = v.slice(3);
+    if (v.every(Number.isFinite) && a.every((x, d) => x < b[d])) {
+      if (a.some((x, d) => x !== kp.min[d]) || b.some((x, d) => x !== kp.max[d])) {
+        kp.min = a;
+        kp.max = b;
+        invalidateResult();
+        renderKeepList();
+        buildKeepView();
+      }
+    } else if (final) syncKeepFields();
+  }
+
+  function convertKeepToVoxels() {
+    const kp = selectedKeep(), g = S.grid;
+    if (!kp || !kp.min || !g || S.status === 'running') return;
+    const cells = kp.cells && kp.cellsGrid === g ? kp.cells : new Set();
+    forEachBoxCell(g, kp, (e) => cells.add(e));
+    kp.cells = cells;
+    kp.cellsGrid = g;
+    kp.min = kp.max = null;
+    syncKeepFields();
+    renderKeepList();
+    buildKeepView();
+  }
+
+  function setPaint(on) {
+    on = !!on && !!S.grid && S.status !== 'running';
+    S.paint.on = on;
+    $('keep-paint').setAttribute('aria-pressed', String(on));
+    $('paint-opts').hidden = !on;
+    $('vp-paint').hidden = !on;
+    if (on) {
+      $('sec-keep').open = true;
+      if (S.selection) selectTris(null);
+    }
+  }
+
+  function setBrushMode(mode) {
+    S.paint.mode = mode;
+    document.querySelectorAll('[data-brush]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.brush === mode)));
+    $('vp-paint').textContent = `Paint voxels (${mode === 'add' ? 'add' : 'erase'}): drag on the part \u00b7 Esc to leave`;
   }
 
   function defaultKeepFields() {
@@ -807,6 +1288,9 @@
     S.mesh = mesh;
     S.bcs = [];
     S.keeps = [];
+    S.keepSel = null;
+    setPaint(false);
+    $('keep-note').hidden = true;
     S.selection = null;
     S.res = opts.res || S.res;
     $('res').value = S.res;
@@ -830,6 +1314,7 @@
     renderBCList();
     renderKeepList();
     defaultKeepFields();
+    syncKeepFields();
     buildSelectionMesh();
     renderSelCard();
     buildBCMarkers();
@@ -868,10 +1353,25 @@
     note.textContent = g.count === 0 ? 'No voxels inside the part: the mesh may not be closed, or the grid is too coarse.' : `Capped at ${g.res} to stay under ${fmt.int(MAX_ACTIVE)} elements.`;
     for (const bc of S.bcs) bc.nodes = resolveNodes(S.mesh, g, bc.tris);
     if (S.selection) S.selection.nodes = resolveNodes(S.mesh, g, S.selection.tris);
+    let before = 0, after = 0, nr = 0;
+    for (const kp of S.keeps) {
+      if (!kp.cells || !kp.cellsGrid || kp.cellsGrid === g) continue;
+      before += kp.cells.size;
+      kp.cells = remapCells(kp.cellsGrid, g, kp.cells);
+      kp.cellsGrid = g;
+      after += kp.cells.size;
+      nr++;
+    }
+    if (nr) {
+      const kn = $('keep-note');
+      kn.hidden = false;
+      kn.textContent = `Painted voxels are tied to the grid, so they were remapped to the new ${g.nx} \u00d7 ${g.ny} \u00d7 ${g.nz} grid by cell centre: ${fmt.int(before)} \u2192 ${fmt.int(after)} cells.`;
+    }
     disposeObj(V.vox);
     V.vox = null;
     invalidateResult();
     renderBCList();
+    renderKeepList();
     renderSelCard();
     buildBCMarkers();
   }
@@ -1042,9 +1542,11 @@
   function setRunning(on) {
     $('run').disabled = on;
     $('stop').disabled = !on;
-    for (const id of ['res', 'volfrac', 'maxit', 'rmin', 'file', 'example', 'keep-add']) $(id).disabled = on;
+    for (const id of ['res', 'volfrac', 'maxit', 'rmin', 'file', 'example', 'keep-add', 'keep-mode', ...KEEP_FIELDS]) $(id).disabled = on;
+    if (on) setPaint(false);
     renderBCList();
     renderKeepList();
+    buildKeepView();
     renderSelCard();
     updateExportUi();
   }
@@ -1283,7 +1785,7 @@
         setStatus('running', 'Stopping after this iteration\u2026');
       }
     });
-    document.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => setView(b.dataset.view)));
+    document.querySelectorAll('.seg [data-view]').forEach((b) => b.addEventListener('click', () => setView(b.dataset.view)));
     $('fit').addEventListener('click', fitView);
     $('example').addEventListener('change', (e) => { if (EXAMPLES[e.target.value]) loadExample(e.target.value); });
     $('file').addEventListener('change', (e) => {
@@ -1310,18 +1812,46 @@
       const v = (id) => +$(id).value;
       const a = [v('keep-x0'), v('keep-y0'), v('keep-z0')], b = [v('keep-x1'), v('keep-y1'), v('keep-z1')];
       if (a.concat(b).some((x) => !Number.isFinite(x))) return;
-      S.keeps.push({ mode: $('keep-mode').value, min: a.map((x, i) => Math.min(x, b[i])), max: a.map((x, i) => Math.max(x, b[i])) });
+      const lo = a.map((x, i) => Math.min(x, b[i])), hi = a.map((x, i) => Math.max(x, b[i]));
+      if (lo.some((x, i) => x === hi[i])) return;
+      const kp = { id: S.nextId++, mode: $('keep-mode').value, min: lo, max: hi, cells: null, cellsGrid: null };
+      S.keeps.push(kp);
       invalidateResult();
-      renderKeepList();
-      buildBCMarkers();
+      selectKeep(kp.id);
     });
+    for (const id of KEEP_FIELDS) {
+      $(id).addEventListener('input', () => onKeepFieldInput(false));
+      $(id).addEventListener('change', () => onKeepFieldInput(true));
+    }
+    $('keep-mode').addEventListener('change', () => {
+      const kp = selectedKeep();
+      if (!kp || S.status === 'running') return;
+      kp.mode = $('keep-mode').value;
+      invalidateResult();
+      syncKeepFields();
+      renderKeepList();
+      buildKeepView();
+    });
+    $('keep-convert').addEventListener('click', convertKeepToVoxels);
+    $('keep-paint').addEventListener('click', () => setPaint(!S.paint.on));
+    document.querySelectorAll('[data-brush]').forEach((b) => b.addEventListener('click', () => setBrushMode(b.dataset.brush)));
+    bindSlider('brush', (v) => v, () => { S.paint.radius = +$('brush').value; });
+    setBrushMode('add');
     $('export').addEventListener('click', saveStl);
     $('copy').addEventListener('click', copyAscii);
     const about = $('about');
     $('about-open').addEventListener('click', () => { about.hidden = false; $('about-close').focus(); });
     $('about-close').addEventListener('click', () => { about.hidden = true; });
     about.addEventListener('click', (e) => { if (e.target === about) about.hidden = true; });
-    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { if (!about.hidden) about.hidden = true; else selectTris(null); } });
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      if (!about.hidden) about.hidden = true;
+      else if (S.paint.on) setPaint(false);
+      else {
+        selectTris(null);
+        if (S.keepSel !== null) selectKeep(null);
+      }
+    });
     // Drag and drop anywhere on the page.
     let depth = 0;
     const drop = $('drop');
@@ -1374,6 +1904,17 @@
   S.api = {
     loadExample, startRun, setView, buildSurface, regrid, selectTris, growFace, addBC, removeBC, prepareMesh, voxelize,
     fit: fitView,
+    selectKeep, setPaint, setBrushMode, regionCells, remapCells, buildPassive,
+    // Screen positions of the selected box's face handles: base and tip of each arrow.
+    keepHandles: () => {
+      if (!V.handles) return [];
+      V.camera.updateMatrixWorld();
+      updateHandleScale();
+      return V.handles.children.map((hd) => {
+        const { a, b } = handleScreen(hd);
+        return { axis: hd.userData.axis, side: hd.userData.side, base: [a.x, a.y], tip: [b.x, b.y] };
+      });
+    },
     controls: () => V.controls,
     camera: () => V.camera.position.toArray(),
     // World point -> client (page) coordinates on the canvas.
