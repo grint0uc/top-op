@@ -1,17 +1,28 @@
 name: Release
 
-# Push a tag like v0.3.0: build the sdist and wheel and publish them as a GitHub release whose notes are the
-# matching "## [0.3.0]" section of CHANGELOG.md.
+# Push a tag like v0.3.0, or run it by hand (Actions > Release > Run workflow) with a tag name and a branch:
+# build the sdist and wheel and publish them as a GitHub release whose notes are the matching
+# "## [0.3.0]" section of CHANGELOG.md. A manual run creates the tag on the chosen branch.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create and release, e.g. v0.3.0"
+        required: true
+      target:
+        description: "Branch the tag points at"
+        required: true
+        default: main
 
 permissions:
   contents: write
 
 env:
   UV_LOCKED: "1"
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -19,6 +30,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target || github.ref }}
 
       - uses: astral-sh/setup-uv@v6
         with:
@@ -26,10 +39,10 @@ jobs:
 
       - name: Tag matches the package version
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${TAG#v}"
           version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' topop/__init__.py)
           if [ "$tag" != "$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match topop/__init__.py version $version"
+            echo "::error::tag $TAG does not match topop/__init__.py version $version"
             exit 1
           fi
 
@@ -41,7 +54,7 @@ jobs:
 
       - name: Release notes from CHANGELOG.md
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${TAG#v}"
           awk -v v="$version" '
             index($0, "## [" v "]") == 1 { on = 1; next }
             on && /^## \[/ { exit }
@@ -55,9 +68,11 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          name: top-op ${{ github.ref_name }}
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ inputs.target || github.sha }}
+          name: top-op ${{ env.TAG }}
           body_path: release-notes.md
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(env.TAG, '-') }}
           files: |
             dist/*.whl
             dist/*.tar.gz
