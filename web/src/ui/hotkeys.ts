@@ -1,6 +1,8 @@
 import { useEffect } from 'react';
 import { deleteActive } from '../state/actions';
 import { type ToolMode, useStore } from '../state/store';
+import { getViewport } from '../viewport/mount';
+import { useUi } from './uiStore';
 
 const MODE_KEYS: Record<string, ToolMode> = { '1': 'orbit', '2': 'pick', '3': 'paint', '4': 'gizmo', '5': 'query' };
 const GIZMO_KEYS = { g: 'translate', r: 'rotate', s: 'scale' } as const;
@@ -12,13 +14,14 @@ function isTyping(t: EventTarget | null): boolean {
   return t instanceof HTMLInputElement && TEXT_INPUT.has(t.type);
 }
 
-/** 1-5 modes, g/r/s gizmo mode, Esc clears the selection, Delete removes the active load/support/reference. */
+/** 1-5 modes, g/r/s gizmo mode, f fit all, Esc clears the selection, Delete removes the active load/support/reference. */
 export function useHotkeys(): void {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (isTyping(e.target)) return;
       const s = useStore.getState();
       if (e.key === 'Escape') {
+        if (useUi.getState().menu) return; // the context menu takes this Esc
         s.clearSelection();
         s.setPreview(null);
         s.setActiveItem(null);
@@ -39,6 +42,7 @@ export function useHotkeys(): void {
       }
       const g = GIZMO_KEYS[e.key.toLowerCase() as keyof typeof GIZMO_KEYS];
       if (g) s.setGizmoMode(g);
+      else if (e.key.toLowerCase() === 'f') getViewport()?.fitAll();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);

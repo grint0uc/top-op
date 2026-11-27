@@ -1,11 +1,34 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "topop"
 dynamic = ["version"]
-description = "3D topology optimization tool: voxel SIMP core, FastAPI server, Three.js frontend"
+description = "3D topology optimization for your own STL/STEP parts: voxel SIMP core, browser GUI, CLI and MCP server"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Luka Virk" }]
+keywords = [
+    "topology optimization",
+    "SIMP",
+    "FEA",
+    "3D printing",
+    "generative design",
+    "MCP",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Manufacturing",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 requires-python = ">=3.12"
 dependencies = [
     "numpy",
@@ -30,6 +53,12 @@ dependencies = [
 accel = ["embreex"]
 step = ["cadquery-ocp>=7.8"]  # STEP import via the OCC kernel only (~65 MB wheel)
 examples = ["cadquery>=2.5"]  # regenerate examples/bracket.step (pulls vtk etc., dev only)
+
+[project.urls]
+Homepage = "https://github.com/grint0uc/top-op"
+Repository = "https://github.com/grint0uc/top-op"
+Issues = "https://github.com/grint0uc/top-op/issues"
+Changelog = "https://github.com/grint0uc/top-op/blob/HEAD/CHANGELOG.md"
 
 [project.scripts]
 topop = "topop.cli:main"

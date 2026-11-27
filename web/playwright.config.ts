@@ -15,8 +15,9 @@ function chromiumPath(): string | undefined {
     .filter((d) => /^chromium-\d+$/.test(d))
     .sort()
     .pop();
-  const exe = dir ? join(root, dir, 'chrome-linux', 'chrome') : undefined;
-  return exe && existsSync(exe) ? exe : undefined;
+  if (!dir) return undefined;
+  // the archive layout changed from chrome-linux/ to chrome-linux64/ between Chromium revisions
+  return ['chrome-linux', 'chrome-linux64'].map((d) => join(root, dir, d, 'chrome')).find((exe) => existsSync(exe));
 }
 
 // Two projects:

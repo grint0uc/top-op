@@ -1,32 +1,36 @@
-import { DomainPanel } from './ui/DomainPanel';
-import { ImportPanel } from './ui/ImportPanel';
-import { LoadsPanel } from './ui/LoadsPanel';
-import { NoticeBar } from './ui/NoticeBar';
-import { RefModelsPanel } from './ui/RefModelsPanel';
-import { ResultsPanel } from './ui/ResultsPanel';
-import { RunPanel } from './ui/RunPanel';
-import { SupportsPanel } from './ui/SupportsPanel';
+import { useState } from 'react';
+import { useAutoVoxelize } from './ui/DomainPanel';
+import { ContextMenu, FeatureTree } from './ui/FeatureTree';
+import { FileInputs, useWindowDrop } from './ui/ImportPanel';
+import { PropertyManager } from './ui/PropertyManager';
+import { Ribbon, TitleBar } from './ui/Ribbon';
+import { JobMonitor } from './ui/RunPanel';
+import { StatusBar } from './ui/StatusBar';
 import { ViewportHost } from './ui/ViewportHost';
 import { useHotkeys } from './ui/hotkeys';
 
 export function App() {
+  const [dropping, setDropping] = useState(false);
   useHotkeys();
+  useAutoVoxelize();
+  useWindowDrop(setDropping);
   return (
-    <div className="layout">
-      <aside className="sidebar">
-        <h1 className="brand">top-op</h1>
-        <NoticeBar />
-        <ImportPanel />
-        <DomainPanel />
-        <LoadsPanel />
-        <SupportsPanel />
-        <RefModelsPanel />
-        <RunPanel />
-        <ResultsPanel />
-      </aside>
-      <main className="main">
-        <ViewportHost />
-      </main>
+    <div className="app">
+      <TitleBar />
+      <Ribbon />
+      <div className="workspace">
+        <aside className="left-pane" aria-label="Specification tree">
+          <FeatureTree />
+          <JobMonitor />
+        </aside>
+        <main className="center">
+          <ViewportHost dropping={dropping} />
+        </main>
+        <PropertyManager />
+      </div>
+      <StatusBar />
+      <FileInputs />
+      <ContextMenu />
     </div>
   );
 }

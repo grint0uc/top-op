@@ -1,0 +1,63 @@
+name: Release
+
+# Push a tag like v0.3.0: build the sdist and wheel and publish them as a GitHub release whose notes are the
+# matching "## [0.3.0]" section of CHANGELOG.md.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  UV_LOCKED: "1"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+
+      - name: Tag matches the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' topop/__init__.py)
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match topop/__init__.py version $version"
+            exit 1
+          fi
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Wheel ships the built frontend
+        run: unzip -l dist/*.whl | grep -q 'topop/server/static/index.html'
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on && /^\[[^]]*\]: / { exit }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "No CHANGELOG.md section for $version." > release-notes.md
+          fi
+          cat release-notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: top-op ${{ github.ref_name }}
+          body_path: release-notes.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/*.whl
+            dist/*.tar.gz

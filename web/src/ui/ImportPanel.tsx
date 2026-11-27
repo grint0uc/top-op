@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { exportProjectJson, fetchMissingMeshes, importDesignMesh, loadProjectFile, reuploadRefMesh } from '../state/actions';
+import { useEffect, useMemo } from 'react';
+import { fetchMissingMeshes, importDesignMesh, importRefMesh, loadProjectFile, reuploadRefMesh } from '../state/actions';
 import { type RequiredMesh, designEntry, requiredMeshes } from '../state/derived';
 import { useStore } from '../state/store';
-import { Banner, Btn, Section } from './controls';
+import { Banner, Btn, Group, Props } from './controls';
 import { DesignTransform } from './DesignTransform';
 import { Sparkline } from './Sparkline';
 
@@ -16,7 +16,17 @@ function fileList(f: File): FileList {
 }
 
 /** Required meshes the browser does not hold: one row each with a re-upload input (ids are content hashes). */
-function MissingMeshes({ missing }: { missing: RequiredMesh[] }) {
+export function MissingMeshes() {
+  const project = useStore((s) => s.project);
+  const meshes = useStore((s) => s.meshes);
+  const meshMemo = useStore((s) => s.meshMemo);
+  const required = useMemo(() => requiredMeshes({ project, meshes, meshMemo }), [project, meshes, meshMemo]);
+  const missing = required.filter((m) => !m.loaded);
+  if (missing.length === 0) return null;
+  return <MissingList missing={missing} />;
+}
+
+function MissingList({ missing }: { missing: RequiredMesh[] }) {
   const memo = useStore((s) => s.meshMemo);
   const busy = useStore((s) => s.busy);
   const names = missing.map((m) => {
@@ -62,7 +72,7 @@ function MissingMeshes({ missing }: { missing: RequiredMesh[] }) {
   );
 }
 
-function LoadedRun() {
+export function LoadedRun() {
   const loaded = useStore((s) => s.loadedRun);
   if (!loaded) return null;
   const { run, fileName, onServer } = loaded;
@@ -123,172 +133,161 @@ function LoadedRun() {
   );
 }
 
-export function ImportPanel() {
-  const entry = useStore((s) => designEntry(s));
-  const project = useStore((s) => s.project);
-  const meshes = useStore((s) => s.meshes);
-  const meshMemo = useStore((s) => s.meshMemo);
-  const required = useMemo(() => requiredMeshes({ project, meshes, meshMemo }), [project, meshes, meshMemo]);
-  const name = useStore((s) => s.project.name);
-  const busy = useStore((s) => s.busy);
-  const [over, setOver] = useState(false);
-  const input = useRef<HTMLInputElement>(null);
-  const projectInput = useRef<HTMLInputElement>(null);
+/** Opens one of the app's hidden file inputs (they are mounted once, in FileInputs). */
+export function pickFile(which: 'mesh' | 'project' | 'ref'): void {
+  document.getElementById(`file-${which}`)?.click();
+}
 
-  const take = (files: FileList | null | undefined) => {
-    const f = files?.[0];
-    if (!f) return;
-    // a .json dropped on the window is a project, anything else a design mesh
-    if (/\.json$/i.test(f.name)) void loadProjectFile(f);
-    else void importDesignMesh(f);
-  };
+/** Mock backend only: serves examples/bracket.stl from the repo root. */
+export async function loadExample(): Promise<void> {
+  const res = await fetch('/mock/examples/bracket.stl');
+  if (res.ok) takeFiles(fileList(new File([await res.arrayBuffer()], 'bracket.stl')));
+}
 
-  // dropping a file anywhere on the window imports it as the design mesh (or loads it as a project if it is .json)
-  useEffect(() => {
-    const over = (e: DragEvent) => e.preventDefault();
-    const drop = (e: DragEvent) => {
-      e.preventDefault();
-      setOver(false);
-      take(e.dataTransfer?.files);
-    };
-    window.addEventListener('dragover', over);
-    window.addEventListener('drop', drop);
-    return () => {
-      window.removeEventListener('dragover', over);
-      window.removeEventListener('drop', drop);
-    };
-  }, []);
+function takeFiles(files: FileList | null | undefined): void {
+  const f = files?.[0];
+  if (!f) return;
+  // a .json is a project, anything else a design mesh
+  if (/\.json$/i.test(f.name)) void loadProjectFile(f);
+  else void importDesignMesh(f);
+}
 
-  const info = entry?.info;
-  const size = info ? info.bbox[1]!.map((v, k) => v - info.bbox[0]![k]!) : null;
-  const missing = required.filter((m) => !m.loaded);
-
+/** The hidden inputs behind every Import / Open / Reference STL command (and the e2e file uploads). */
+export function FileInputs() {
   return (
-    <Section title="Import">
-      <div
-        className={`dropzone ${over ? 'over' : ''}`}
-        onDragEnter={() => setOver(true)}
-        onDragLeave={() => setOver(false)}
-        onDrop={() => setOver(false)}
-      >
-        <input
-          ref={input}
-          type="file"
-          accept={MESH_ACCEPT}
-          data-testid="mesh-file-input"
-          className="visually-hidden"
-          onChange={(e) => {
-            take(e.target.files);
-            e.target.value = ''; // allow re-selecting the same file
-          }}
-        />
-        <Btn variant="primary" onClick={() => input.current?.click()} disabled={busy === 'Upload'} testId="choose-mesh">
-          {busy === 'Upload' ? 'Uploading...' : 'Choose STL / STEP'}
-        </Btn>
-        <span className="dim">or drop a file anywhere</span>
-      </div>
-      {IS_MOCK && (
-        <div className="row">
-          <Btn
-            onClick={async () => {
-              const res = await fetch('/mock/examples/bracket.stl');
-              if (res.ok) take(fileList(new File([await res.arrayBuffer()], 'bracket.stl')));
-            }}
-            testId="load-example"
-            title="Mock backend only: serves examples/bracket.stl from the repo root"
-          >
-            Load example bracket
-          </Btn>
-        </div>
-      )}
-
-      {missing.length > 0 && <MissingMeshes missing={missing} />}
-
-      {info && (
-        <dl className="kv" data-testid="mesh-info">
-          <dt>Name</dt>
-          <dd>{info.name}</dd>
-          <dt>Source</dt>
-          <dd data-testid="mesh-source" data-source={info.source}>
-            {info.source === 'step' ? 'STEP (tessellated)' : 'mesh'}
-          </dd>
-          {info.n_brep_faces != null && (
-            <>
-              <dt>B-rep faces</dt>
-              <dd data-testid="mesh-brep-faces">{info.n_brep_faces.toLocaleString()}</dd>
-            </>
-          )}
-          <dt>Faces</dt>
-          <dd data-testid="mesh-faces">{info.n_faces.toLocaleString()}</dd>
-          <dt>Vertices</dt>
-          <dd>{info.n_vertices.toLocaleString()}</dd>
-          {size && (
-            <>
-              <dt>Size</dt>
-              <dd>{size.map((v) => v.toPrecision(4)).join(' x ')}</dd>
-            </>
-          )}
-          {info.volume != null && (
-            <>
-              <dt>Volume</dt>
-              <dd>{info.volume.toPrecision(5)}</dd>
-            </>
-          )}
-        </dl>
-      )}
-      <DesignTransform />
-      {info && !info.is_watertight && (
-        <Banner kind="error" testId="watertight-warning">
-          Mesh is not watertight. Voxelization may leak or fill incorrectly; repair the STL before optimizing.
-        </Banner>
-      )}
-
-      <label className="field">
-        <span className="field-label">Project</span>
-        <input
-          type="text"
-          className="text"
-          value={name}
-          data-testid="project-name"
-          onChange={(e) => useStore.getState().setProjectName(e.target.value)}
-        />
-      </label>
+    <div className="visually-hidden">
       <input
-        ref={projectInput}
+        id="file-mesh"
+        type="file"
+        accept={MESH_ACCEPT}
+        data-testid="mesh-file-input"
+        tabIndex={-1}
+        onChange={(e) => {
+          takeFiles(e.target.files);
+          e.target.value = ''; // allow re-selecting the same file
+        }}
+      />
+      <input
+        id="file-project"
         type="file"
         accept=".json,application/json"
-        className="visually-hidden"
         data-testid="project-file-input"
+        tabIndex={-1}
         onChange={(e) => {
           const f = e.target.files?.[0];
           if (f) void loadProjectFile(f);
           e.target.value = '';
         }}
       />
-      <div className="row wrap">
-        <Btn
-          onClick={() => projectInput.current?.click()}
-          disabled={busy === 'Load project'}
-          testId="load-project"
-          title="A project.json from Results (run export) or a saved project: restores loads, supports, parameters and the run history"
-        >
-          Load project.json
-        </Btn>
-        <Btn onClick={exportProjectJson} disabled={!info} testId="export-project" title="Save the current setup as a project.json (no run)">
-          Save project
-        </Btn>
-        <Btn
-          onClick={() => {
-            useStore.getState().resetProject();
-          }}
-          testId="new-project"
-          title="Discard the current project"
-        >
-          New project
-        </Btn>
-        {IS_MOCK && <span className="badge" title="Served by web/mock, not the Python server">MOCK API</span>}
-      </div>
-      <LoadedRun />
-    </Section>
+      <input
+        id="file-ref"
+        type="file"
+        accept={MESH_ACCEPT}
+        data-testid="ref-file-input"
+        tabIndex={-1}
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) void importRefMesh(f);
+          e.target.value = '';
+        }}
+      />
+    </div>
+  );
+}
+
+/** Dropping a file anywhere on the window imports it as the design mesh (or loads it as a project if it is .json). */
+export function useWindowDrop(onOver: (over: boolean) => void): void {
+  useEffect(() => {
+    const over = (e: DragEvent) => {
+      e.preventDefault();
+      onOver(true);
+    };
+    const leave = (e: DragEvent) => {
+      if (e.relatedTarget === null) onOver(false);
+    };
+    const drop = (e: DragEvent) => {
+      e.preventDefault();
+      onOver(false);
+      takeFiles(e.dataTransfer?.files);
+    };
+    window.addEventListener('dragover', over);
+    window.addEventListener('dragleave', leave);
+    window.addEventListener('drop', drop);
+    return () => {
+      window.removeEventListener('dragover', over);
+      window.removeEventListener('dragleave', leave);
+      window.removeEventListener('drop', drop);
+    };
+  }, [onOver]);
+}
+
+/** Design body page: what was imported and where it sits. */
+export function PartPage() {
+  const entry = useStore((s) => designEntry(s));
+  const busy = useStore((s) => s.busy);
+  const info = entry?.info;
+  const size = info ? info.bbox[1]!.map((v, k) => v - info.bbox[0]![k]!) : null;
+
+  return (
+    <>
+      <Group title="Design body" icon="part" testId="group-design">
+        {!info && (
+          <div className="stack">
+            <p className="dim">No design body yet. Import an STL or STEP file, or drop one anywhere on the window.</p>
+            <div className="row">
+              <Btn variant="primary" icon="import" onClick={() => pickFile('mesh')} disabled={busy === 'Upload'} testId="choose-mesh">
+                {busy === 'Upload' ? 'Uploading...' : 'Import STL / STEP'}
+              </Btn>
+            </div>
+          </div>
+        )}
+        {info && (
+          <Props testId="mesh-info">
+            <dt>Name</dt>
+            <dd className="ellipsis" title={info.name}>
+              {info.name}
+            </dd>
+            <dt>Source</dt>
+            <dd data-testid="mesh-source" data-source={info.source}>
+              {info.source === 'step' ? 'STEP (tessellated)' : 'mesh'}
+            </dd>
+            {info.n_brep_faces != null && (
+              <>
+                <dt>B-rep faces</dt>
+                <dd data-testid="mesh-brep-faces">{info.n_brep_faces.toLocaleString()}</dd>
+              </>
+            )}
+            <dt>Faces</dt>
+            <dd data-testid="mesh-faces">{info.n_faces.toLocaleString()}</dd>
+            <dt>Vertices</dt>
+            <dd>{info.n_vertices.toLocaleString()}</dd>
+            {size && (
+              <>
+                <dt>Size</dt>
+                <dd>{size.map((v) => v.toPrecision(4)).join(' \u00d7 ')}</dd>
+              </>
+            )}
+            {info.volume != null && (
+              <>
+                <dt>Volume</dt>
+                <dd>{info.volume.toPrecision(5)}</dd>
+              </>
+            )}
+            <dt>Watertight</dt>
+            <dd>{info.is_watertight ? 'yes' : 'no'}</dd>
+          </Props>
+        )}
+        {info && !info.is_watertight && (
+          <Banner kind="error" testId="watertight-warning">
+            Mesh is not watertight. Voxelization may leak or fill incorrectly; repair the STL before optimizing.
+          </Banner>
+        )}
+      </Group>
+      {info && (
+        <Group title="Placement" icon="gizmo">
+          <DesignTransform />
+        </Group>
+      )}
+    </>
   );
 }

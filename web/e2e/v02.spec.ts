@@ -3,7 +3,7 @@
 // The same stages run against the real server in real.spec.ts.
 import { readFileSync } from 'node:fs';
 import { type Page, expect, test } from '@playwright/test';
-import { BRACKET_STEP, defineBoundaries, importBracket, runBracket, state, viewportStats } from './helpers';
+import { BRACKET_STEP, defineBoundaries, importBracket, openPage, runBracket, state, viewportStats } from './helpers';
 
 type Body = { method: string; url: string; json: Record<string, any> }; // eslint-disable-line @typescript-eslint/no-explicit-any -- request bodies are inspected loosely
 
@@ -25,6 +25,7 @@ test.describe('run parameters (mock backend)', () => {
     const writes = recordProjectWrites(page);
     await importBracket(page);
     await defineBoundaries(page);
+    await openPage(page, 'study');
 
     // optimizer: oc/mma; a stress limit forces mma and says so, without touching the stored choice
     const opt = page.getByTestId('p-optimizer');
@@ -65,6 +66,7 @@ test.describe('run parameters (mock backend)', () => {
     await expect(rows).toHaveCount(2);
 
     await page.getByTestId('p-max-iter').fill('3');
+    await openPage(page, 'domain');
     await page.getByTestId('domain-elements').fill('24');
     await page.getByTestId('run-start').click();
     await expect.poll(() => state(page, (s) => s.run.status), { timeout: 30_000 }).toBe('done');
@@ -113,6 +115,7 @@ test.describe('run parameters (mock backend)', () => {
     expect((await overlays()).overhang).toBeNull();
 
     // x plane through the middle of the part (80 mm long): a quad in x = 40 spanning the grid in y and z
+    await openPage(page, 'study');
     await page.getByTestId('sym-add').click();
     await expect.poll(async () => (await overlays()).symmetry.length).toBe(1);
     let q = (await overlays()).symmetry[0]!;
@@ -162,7 +165,9 @@ test.describe('run parameters (mock backend)', () => {
   test('progress carries stress_max (third sparkline series) and the constraint with a green/red tag', async ({ page }) => {
     await importBracket(page);
     await defineBoundaries(page);
+    await openPage(page, 'domain');
     await page.getByTestId('domain-elements').fill('24');
+    await openPage(page, 'study');
     await page.getByTestId('p-max-iter').fill('3');
     await page.getByTestId('run-start').click();
     await expect.poll(() => state(page, (s) => s.run.status), { timeout: 30_000 }).toBe('done');
@@ -198,6 +203,7 @@ test.describe('results (mock backend)', () => {
     expect(base.densityColorMode).toBe('density');
     expect(base.densityCount).toBeGreaterThan(0);
     await expect(page.getByTestId('stress-legend')).toHaveCount(0);
+    await openPage(page, 'results');
 
     const reply = page.waitForResponse((r) => /\/api\/runs\/[^/]+\/stress$/.test(r.url()));
     await page.getByTestId('color-stress').check();
@@ -242,10 +248,13 @@ test.describe('results (mock backend)', () => {
   test('/stress answers 409 while the run is going, and the toggle waits for the end', async ({ page }) => {
     await importBracket(page);
     await defineBoundaries(page);
+    await openPage(page, 'domain');
     await page.getByTestId('domain-elements').fill('24');
+    await openPage(page, 'study');
     await page.getByTestId('p-max-iter').fill('300');
     await page.getByTestId('run-start').click();
     await expect.poll(() => state(page, (s) => s.run.history.length)).toBeGreaterThan(0);
+    await openPage(page, 'results');
     await expect(page.getByTestId('color-stress')).toBeDisabled();
     const id = await state(page, (s) => s.run.id);
     const early = await page.request.get(`/api/runs/${id}/stress`);
@@ -258,6 +267,7 @@ test.describe('results (mock backend)', () => {
 
   test('Trim to CAD: the STL link and the result-mesh load carry trim=, and X-Topop-Warnings is shown', async ({ page }) => {
     await runBracket(page, 3);
+    await openPage(page, 'results');
     const link = page.getByTestId('download-stl');
     await expect(link).toHaveAttribute('href', /\/api\/runs\/[^/]+\/result\.stl\?threshold=0\.5&smooth=3&trim=false$/);
     const plain = await page.request.get((await link.getAttribute('href'))!);
@@ -289,6 +299,7 @@ test.describe('results (mock backend)', () => {
 
   test('export buttons fetch the file: a download arrives, X-Topop-Warnings and a 409 are shown next to the buttons', async ({ page }) => {
     await runBracket(page, 3);
+    await openPage(page, 'results');
     const stl = page.getByTestId('download-stl');
     const href = await stl.getAttribute('href'); // the href stays for right-click / open in new tab
     expect(href).toMatch(/\/api\/runs\/[^/]+\/result\.stl\?/);
@@ -477,7 +488,8 @@ test.describe('design mesh transform (mock backend)', () => {
     expect(arrow[0]!).toBeCloseTo(centroid[0]! + 10, 2);
     expect(arrow[1]!).toBeCloseTo(centroid[1]!, 2);
     expect(arrow[2]!).toBeCloseTo(centroid[2]!, 2);
-    // moving the design moves the marker with it
+    // moving the design moves the marker with it (the new load's page is open: back to the design body's)
+    await openPage(page, 'part');
     await page.getByTestId('design-pos-x').fill('20');
     await expect.poll(async () => (await viewportStats(page)).arrowAt[0]![0]).toBeCloseTo(centroid[0]! + 20, 2);
     await page.getByTestId('design-pos-x').fill('10');

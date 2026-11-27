@@ -12,6 +12,14 @@ export const state = <T>(page: Page, fn: (s: StoreState) => T): Promise<T> =>
 
 export const viewportStats = (page: Page) => page.evaluate(() => window.__topopViewport!.stats());
 
+export type PageId = 'part' | 'refs' | 'loads' | 'supports' | 'domain' | 'study' | 'material' | 'results';
+
+/** Opens a property page by clicking its feature-tree node (the property manager shows one page at a time). */
+export async function openPage(page: Page, id: PageId): Promise<void> {
+  await page.getByTestId(`tree-${id}`).click();
+  await expect(page.getByTestId('property-manager')).toHaveAttribute('data-page', id);
+}
+
 /** Uploads examples/bracket.stl as the design mesh and waits until the viewport shows it. */
 export async function importBracket(page: Page): Promise<void> {
   await page.goto('/');
@@ -53,7 +61,9 @@ export async function defineBoundaries(page: Page): Promise<void> {
 export async function runBracket(page: Page, maxIter = 4): Promise<void> {
   await importBracket(page);
   await defineBoundaries(page);
+  await openPage(page, 'domain');
   await page.getByTestId('domain-elements').fill('24');
+  await openPage(page, 'study');
   await page.getByTestId('p-max-iter').fill(String(maxIter));
   await page.getByTestId('run-start').click();
   await expect.poll(() => state(page, (s) => s.run.status), { timeout: 30_000 }).toBe('done');

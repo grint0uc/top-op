@@ -70,7 +70,7 @@ export class DensityView {
     this.clearResultMesh();
     const geometry = new STLLoader().parse(stl);
     geometry.computeVertexNormals();
-    const material = new THREE.MeshStandardMaterial({ color: 0x3ddc97, roughness: 0.6, metalness: 0.1, side: THREE.DoubleSide });
+    const material = new THREE.MeshStandardMaterial({ color: 0x7fa6d4, roughness: 0.5, metalness: 0.15, side: THREE.DoubleSide });
     this.resultMesh = new THREE.Mesh(geometry, material);
     this.resultMesh.name = 'result';
     this.group.add(this.resultMesh);

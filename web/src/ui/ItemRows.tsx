@@ -41,10 +41,10 @@ export function ItemActions({
   const hasCurrent = useStore((s) => currentSelectionSpec(s) !== null);
   return (
     <div className="row wrap" onClick={(e) => e.stopPropagation()}>
-      <Btn onClick={() => reselect(selection)} testId="item-select" title="Show this selection in the viewport (query selections open the Query tab)">
+      <Btn icon="pick" onClick={() => reselect(selection)} testId="item-select" title="Show this selection in the viewport (query selections open the Query tab)">
         Select
       </Btn>
-      <Btn onClick={() => void resolvePreview(selection, label)} testId="item-preview" title="Resolve to grid nodes and show them as points">
+      <Btn icon="preview" onClick={() => void resolvePreview(selection, label)} testId="item-preview" title="Resolve to grid nodes and show them as points">
         Preview
       </Btn>
       <Btn
@@ -55,10 +55,11 @@ export function ItemActions({
         disabled={!hasCurrent}
         testId="item-replace"
         title="Replace this item's selection with the current selection"
+        icon="reset"
       >
         Use current
       </Btn>
-      <Btn onClick={onDelete} variant="danger" testId="item-delete">
+      <Btn onClick={onDelete} variant="danger" icon="trash" testId="item-delete">
         Delete
       </Btn>
     </div>

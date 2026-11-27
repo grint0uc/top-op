@@ -1,205 +1,233 @@
 # top-op
 
 [![CI](https://github.com/grint0uc/top-op/actions/workflows/ci.yml/badge.svg)](https://github.com/grint0uc/top-op/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Voxel SIMP topology optimization for your own 3D models. Import an STL, mark where it is held and
-where it is pushed, run, and export the optimized shape as an STL. It comes with three front ends over
-the same engine: a browser GUI, a CLI for scripted runs, and an MCP server so a Claude session can
-drive the whole workflow without the GUI.
+top-op is a 3D topology optimizer for your own parts. Import an STL (or a STEP file), mark where the
+part is held and where it is pushed, say how much material you want to keep, and it removes the rest:
+out comes a lighter shape that carries the same loads, as an STL you can print or bring back into CAD.
+It uses voxel SIMP (the textbook density method) on the CPU, runs locally with no cloud account, and
+has three front ends over the same engine: a browser GUI, a command line for scripted runs, and an MCP
+server so Claude can set up and run a study for you.
 
-Python (numpy/scipy) core, FastAPI server, Three.js frontend. One run at a time, on the CPU. No cloud.
+![Setup: a bracket with a load, a support and a keep-out region](docs/img/gui-setup-light.png)
 
-## Features
+![Result: optimized bracket over the ghosted design space](docs/img/gui-results-light.png)
 
-- Voxel SIMP compliance minimization with the OC or MMA optimizer, multiple load cases, keep-in / keep-out reference bodies.
-- Von Mises **stress constraint** (p-norm, `stress_limit`), per-iteration `stress_max`, stress field in the VTI and NPZ exports.
-- **Symmetry planes** (mirror any axis, exact symmetry) and an **overhang filter** for additive manufacturing (45 degrees, any build direction).
-- **STEP import** (optional extra): faces are exact B-rep faces, holes are cylinder facets with their radius and axis.
-- **Trim to CAD**: `result.stl` can be intersected with the design mesh, so flat faces and hole walls come out exact.
-- The same workflow from the GUI, the CLI (`topop run`) and an MCP server for Claude.
+![The same result in the dark theme](docs/img/gui-results-dark.png)
 
-![Setup: bracket with a load (red face), a support (blue) and a keep-out cylinder](docs/img/bracket-setup.png)
+## Try it in your browser
 
-![Result after 8 iterations: optimized arch over the ghosted bracket](docs/img/bracket-result.png)
+`lite/` holds **top-op lite**, a single-page version that runs entirely in the browser (no install,
+no server): STL import, click-to-select faces for supports and loads, keep-in / keep-out boxes, a
+SIMP solver in a Web Worker and STL export. It is limited to about 40 000 elements and has none of
+the advanced options below. Open it at <https://claude.ai/artifact/52bTh6bZ9fuH14dxokNY3J>.
 
-The second shot is a deliberately short 8-iteration run (`max_iter = 8`) with a coarse 24-element grid.
+## Install
 
-## Install (macOS arm64, M1)
+You need [uv](https://docs.astral.sh/uv/) (it fetches Python 3.12+ by itself). Node is only needed
+to rebuild the frontend; the built GUI is committed and ships in the package. CI runs on Linux;
+macOS and Windows use the same pure-Python package but are not tested in CI.
+
+macOS / Linux:
 
 ```
-brew install uv node        # node is only needed to rebuild the frontend
+curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/grint0uc/top-op
 cd top-op
 uv sync
-uv run topop serve          # http://localhost:8000
+uv run topop serve            # open http://localhost:8000
 ```
 
-The built frontend is committed (`topop/server/static/`), so `uv sync` is enough to run the GUI.
-`uv` fetches Python 3.12+ on its own. Rebuild the frontend with `make build` (needs node 22).
-
-## GUI workflow
-
-1. **Import**: choose an STL or drop it on the page. The panel shows faces, size, volume and whether the
-   mesh is watertight (non-watertight meshes voxelize poorly).
-2. **Domain**: set "elements along longest" (the resolution). The panel shows grid size, active elements,
-   estimated memory and time per iteration; amber above 150k active elements, red above 300k.
-   Debug at 30-40, refine to 60-100 at the end.
-3. **Select** a region with one of: Pick (click = face, shift+click = grow the flat face, ctrl+click =
-   remove), Paint (brush over faces), Query (facets / normal / plane forms, same as the agent's), or a
-   primitive (+ box, + sphere, + cylinder with a gizmo and numeric fields). "Resolve preview" shows the
-   grid nodes the selection hits. Zero nodes means it missed.
-4. **Loads and supports**: "Add from selection" in the Loads or Supports panel. Loads take a total force
-   vector (split over the nodes) and a load case; supports fix X/Y/Z. Supports must stop all rigid motion.
-5. **Reference models** (optional): add an STL or a generated box/sphere/cylinder, move it with the gizmo,
-   set it to *keep out* (forced void, clearance) or *keep in* (forced solid, extends the domain).
-6. **Run**: set volume fraction, penalty, filter radius `rmin`, max iterations, then Start. Density
-   updates live in the viewport; the plot shows compliance (blue, log) and volume (orange). Stop keeps
-   the partial result.
-7. **Results**: the density threshold slider and smoothing control the surface; "Load result mesh" shows
-   the marching-cubes surface over the ghosted design.
-8. **Export**: STL (threshold + smoothing as set), VTI (density field), NPZ (raw), `project.json`
-   (reloads in the GUI via "Load project.json" and re-runs with `topop run`). The buttons fetch the file, so a
-   server warning (e.g. "Trim to CAD" falling back to the untrimmed STL) or error shows next to them.
-
-Hotkeys 1-5 switch Orbit / Pick / Paint / Gizmo / Query. Projects persist in `~/.cache/topop`
-(`TOPOP_DATA_DIR` to move it).
-
-## Headless
+Windows (PowerShell):
 
 ```
-uv run topop describe examples/bracket.stl                     # bbox + facet table, largest first
-uv run topop describe examples/bracket.stl --png bracket.png   # plus a preview render
-uv run topop run examples/bracket.json --out out/              # 40 iterations, about 16 s
-uv run topop run examples/bracket.json --symmetry y --trim     # mirror-symmetric, STL clipped to the CAD
-uv run topop run examples/cantilever.json --stress-limit 0.1 --out out/   # stress-constrained (mma)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+git clone https://github.com/grint0uc/top-op
+cd top-op
+uv sync
+uv run topop serve
 ```
 
-`topop run` writes `result.stl`, `result.png`, `result.vti`, `density.npz` and `run.json` (re-runnable).
-Exit codes: 0 done, 1 failed, 2 invalid case, 3 out of memory. Flags: `--max-iter`, `--resolution`,
-`--threshold`, `--smooth`, `--quiet`, `--trim`, `--optimizer oc|mma`, `--stress-limit`, `--overhang +z`
-(`--overhang=-z` for negative directions), `--symmetry y[=pos]` (repeatable). The summary names the max
-von Mises stress and, with a limit, whether the constraint ended satisfied. A case file is the project JSON with meshes as `path`s; see
-`examples/bracket.json` (facet support, normal-query load, keep-out slot) and `examples/README.md`.
-
-## Claude / MCP
+Without cloning, as a command-line tool (puts `topop` on your PATH):
 
 ```
-claude mcp add top-op -- uv run --directory /path/to/top-op topop mcp
+uv tool install "git+https://github.com/grint0uc/top-op"
+pipx install "git+https://github.com/grint0uc/top-op"
+pip install "git+https://github.com/grint0uc/top-op"          # into an active Python 3.12+ venv
 ```
 
-Tools cover the whole workflow: `load_mesh`, `describe_mesh`, `preview_mesh`, `create_project`,
-`add_load`, `add_support`, `add_ref_model`, `set_params` (symmetry, stress, overhang), `set_grid`,
-`voxel_stats`, `run`, `result_preview`, `result_stress_summary`, `export_stl(trim=true)`, `facet_faces`, and more. A session looks like this:
+Optional extras: `step` (STEP import through OpenCascade, about 65 MB) and `accel` (Embree ray
+casting). In a clone: `uv sync --extra step`; with pip: `pip install "topop[step] @ git+https://github.com/grint0uc/top-op"`.
+
+## Quick start (GUI)
+
+`uv run topop serve` (or `topop serve` after a tool install), then open http://localhost:8000.
+The ribbon tabs follow the workflow:
+
+1. **Model**: import an STL or STEP file (Import, or drop it on the window); `examples/bracket.stl`
+   is a good first part. Watertight meshes voxelize best.
+2. **Boundary conditions**: select faces (click, shift+click grows a flat face, paint, or a query by
+   normal / plane / facet), then add a **Force** (total vector, split over the nodes) or a **Fixture**
+   (fixed X/Y/Z). "Preview nodes" shows which grid nodes a selection hits. Supports must stop all
+   rigid motion.
+3. **Domain**: set the resolution (elements along the longest side; start at 30-40) and check the
+   element count and the memory and time estimates. Add reference bodies (STL, box, sphere,
+   cylinder) as keep-in (forced solid) or keep-out (forced void, for clearances and bolt access).
+4. **Optimize**: volume fraction, penalty, filter radius, iterations, optimizer, symmetry planes,
+   stress limit, overhang direction; then Run. The density updates live; Stop keeps the partial result.
+5. **Results**: density or von Mises view, iso threshold and smoothing, then export STL (optionally
+   trimmed to the CAD surface), VTI (for ParaView), NPZ, or `project.json` to reload or re-run headless.
+
+Projects and runs persist in `~/.cache/topop` (set `TOPOP_DATA_DIR` to move it).
+
+## Headless CLI
 
 ```
-you:    Optimize examples/bracket.stl. Fix the plate bottom, push the wall's outer face in +X, keep 30 %.
-claude: load_mesh + describe_mesh -> facet 0 is the plate bottom (4687 mm2, -Z), facet 2 the wall outer face (-X).
-claude: create_project(40 elements), add_support(facets [0]), add_load(normal -X within the upper wall, 100 N).
-claude: voxel_stats shows both selections resolved to nodes; run(max_iter=5) as a smoke test, then run(40).
-claude: result_preview(iso) looks like two legs around the hole; export_stl(run_id, "out/bracket.stl").
+uv run topop describe examples/bracket.stl                    # bbox + facet table (planes, cylinders/holes)
+uv run topop describe examples/bracket.stl --png bracket.png  # plus a preview render
+uv run topop run examples/cantilever.json --max-iter 3 --out out/cantilever   # smoke test, ~2 s
+uv run topop run examples/bracket.json --out out/bracket      # 40 iterations, ~17 s on 4 cores
+uv run topop run examples/bracket.json --symmetry y --trim --out out/sym   # mirror-symmetric, clipped to the CAD
+uv run topop run examples/cantilever.json --stress-limit 0.1 --out out/s   # stress-constrained (MMA)
+uv run topop struts out/bracket                               # turn the result into round struts
 ```
 
-Details, pitfalls and the `.mcp.json` form: [docs/AGENT.md](docs/AGENT.md). Runs made through MCP or the CLI
-share `TOPOP_DATA_DIR` with `topop serve`, so they open in the GUI.
+A case file is the project JSON with meshes given as file `path`s; see `examples/bracket.json`
+(facet support, normal-query load, keep-out slot) and [examples/README.md](examples/README.md).
+`topop run` writes `result.stl`, `result.png`, `result.vti`, `density.npz` and `run.json` (which
+re-runs as a case). Exit codes: 0 done, 1 failed, 2 invalid case or arguments, 3 out of memory.
+Overrides: `--max-iter`, `--resolution`, `--threshold`, `--smooth`, `--optimizer oc|mma`,
+`--stress-limit`, `--overhang +z` (write `--overhang=-z` for negative directions),
+`--symmetry AXIS[=POS]` (repeatable), `--trim`, `--quiet`. `topop struts` reads a run directory and
+writes `struts.stl`, `struts.png` and `struts.json` (`--mode layout|skeleton`; `topop struts --help`).
+Every command has `--help`.
 
-## Selections
+## Using it from Claude
 
-Loads and supports take a selection, resolved on the server to grid nodes. Coordinates are in the
-mesh's own units. `mesh_id` defaults to `"design"` (`"ref:<id>"` names a reference model).
+Claude does not need the GUI: the MCP server runs headless and Claude Code starts it on demand.
+No clone needed, `uvx` fetches and runs it straight from GitHub:
 
-| kind | what it picks | JSON |
-|---|---|---|
-| faces | raw triangle ids (GUI clicks and paint) | `{"kind":"faces","face_ids":[12,13,40]}` |
-| facets | face groups from `describe`: planes, cylinders (holes); STEP: B-rep faces | `{"kind":"facets","facet_ids":[0],"angle_deg":5}` |
-| normal | faces pointing along a direction | `{"kind":"normal","direction":[0,0,1],"angle_deg":10,"within":[[x0,y0,z0],[x1,y1,z1]]}` |
-| plane | grid nodes on a plane, no mesh needed | `{"kind":"plane","point":[0,0,0],"normal":[1,0,0],"tol":0}` |
-| box | surface nodes inside a box | `{"kind":"box","min":[0,0,0],"max":[10,60,20]}` |
-| sphere | surface nodes inside a sphere | `{"kind":"sphere","center":[5,30,60],"radius":8}` |
-| cylinder | surface nodes inside a cylinder | `{"kind":"cylinder","center":[40,30,10],"radius":6,"height":14,"axis":"z"}` |
+```
+claude mcp add top-op -- uvx --from git+https://github.com/grint0uc/top-op topop mcp
+```
 
-The `within` box clips on node coordinates, and nodes sit up to h/2 outside the true surface: pad a box
-derived from the mesh bbox by one voxel per side. Facet ids are ranks by area for a given `angle_deg`
-(`kind`, `radius` and `axis` tell a Ø12 hole from a plane; STEP ids are stable B-rep faces).
+Other setups:
 
-**Units.** None are enforced. Whatever the mesh is in (the examples are mm) is the length unit; E,
-forces and lengths must be consistent. Compliance comes out in those units and is only comparable between
-runs of the same setup, not across resolutions. Default `E = 1`, `nu = 0.3`.
+```
+claude mcp add top-op -- uv run --directory /path/to/top-op topop mcp     # from a clone
+claude mcp add top-op -- topop mcp                                       # after uv tool / pipx install
+```
+
+The MCP server exposes 28 tools covering the whole workflow (`load_mesh`, `describe_mesh`,
+`create_project`, `add_load`, `add_support`, `add_ref_model`, `set_params`, `voxel_stats`, `run`,
+`result_preview`, `export_stl`, `generate_struts`, ...). Ask something like *"Optimize
+examples/bracket.stl: fix the bottom of the plate, push the wall's outer face in +X with 100 N, keep
+30 %"* and Claude reads the facet table, picks the faces, smoke-tests and runs. Runs share the data
+directory with `topop serve`, so they open in the GUI. Details and pitfalls: [docs/AGENT.md](docs/AGENT.md).
+
+## Features
+
+- Voxel SIMP compliance minimization with the **OC** or **MMA** optimizer, density filter and
+  Heaviside projection; hex8 finite elements with a geometric-multigrid or banded direct solver.
+- **Multiple load cases**, each with its own forces; supports shared.
+- **Keep-in / keep-out** reference bodies (any STL or a box, sphere or cylinder, placed with a gizmo).
+- **Symmetry planes**: densities mirrored every iteration, so the result is exactly symmetric.
+- **Stress constraint**: p-norm aggregated von Mises limit with automatic p-continuation
+  ([docs/STRESS.md](docs/STRESS.md)); the von Mises field is in every result.
+- **Overhang filter** for 3D printing (Langelaar's 45 degree AM filter, any of six build directions).
+- **STEP import** (optional extra): selections use the exact B-rep faces; holes are cylinder facets
+  with their radius and axis.
+- **Selections an agent can describe**: facets, face normal, plane, box / sphere / cylinder regions.
+- **Trim to CAD**: intersect the result with the design mesh so flat faces and hole walls stay exact.
+- **Strut generation**: turn a result into an explicit truss of round bars (minimum-volume layout LP
+  or the medial axis of the solid), FE-verified against the SIMP result.
+- **Live progress**: density frames and compliance / volume / stress plots stream to the GUI.
+- Exports: STL, VTI (density and stress for ParaView), NPZ, re-runnable `project.json` / `run.json`.
+
+## Limitations
+
+- Voxel boundaries are stair-stepped: resolution is the only real fix (export smoothing is cosmetic).
+  Features thinner than about 2 voxels vanish, and the filter radius sets the smallest member.
+- Linear elasticity, one isotropic material. No contact, plasticity, buckling, fatigue, dynamics.
+- The stress is a voxel stress: sharp inner corners overshoot, so keep a margin and compare relatively.
+  One stress limit per study (not per region or per load case).
+- The overhang filter shapes the part; it does not generate support structures.
+- CPU only, one run at a time per server (more runs queue). A memory guard refuses runs estimated
+  above 6 GB (about 500k active elements); keep to about 150k on a 16 GB machine.
+- Facets of a mesh (as opposed to STEP) are recovered from the tessellation; freeform surfaces can
+  come out as one large `other` facet. Use a normal, plane or region selection instead.
+- No units are enforced: lengths, forces and E just have to be consistent (the examples are mm, E = 1).
 
 ## Performance
 
-Measured on a shared 4-core x86_64 Linux box (4 vCPU, 15 GB, load average 2-7, so single timings scatter
-up to 2x), not on the M1. Time is per whole iteration (assembly, solve, sensitivities, filter, OC),
-iterations 2-6 to 2-30. Re-measure on the M1 with `uv run pytest tests/test_perf.py`; it also recalibrates
-the time estimate shown in the GUI.
+Per-iteration time (assembly, solve, sensitivities, filter, update) and peak memory, measured on a
+shared 4-vCPU x86_64 Linux machine with 15 GB RAM (Python 3.13, OpenBLAS). Timings there scatter by up
+to 2x with load; see [docs/PERF.md](docs/PERF.md) for the method and the full tables.
 
-| active elements | grid | s/iteration | setup | peak RSS (float64 / float32) |
+| active elements | grid | s / iteration | setup | peak RSS (float64 / float32) |
 |---:|---|---:|---:|---|
-| 4 800 | 60x20x4 | 0.14 | 0.1-0.5 s | 0.25 GB / not measured |
-| 100 000 | 50x50x40 | 1.5-2.1 | 5.0 s | 1.5 GB / 1.2 GB |
-| 250 880 | 80x56x56 | 3.8-4.3 | 13.7 s | 3.6 GB / 2.8 GB |
+| 4 800 | 60x20x4 | 0.14 | 0.1-0.5 s | 0.25 GB |
+| 100 000 | 50x50x40 | 1.5 | 5-6 s | 1.3 GB / 1.1 GB |
+| 250 880 | 80x56x56 | 3.5-3.8 | 9-15 s | 3.0 GB / 2.5 GB |
 
-Targets for the M1: 100k <= 6 s/iteration; 250k <= 20 s/iteration and <= 8 GB. The memory guard refuses
-a run whose estimate exceeds 6 GB (roughly 400k elements; 1M is estimated at 13.8 GB) and `run` fails fast
-with exit code 3. Design for up to about 250k active elements; keep <= 150k on a 16 GB machine.
-Solver details: [docs/PERF.md](docs/PERF.md).
+A typical study is 40-100 iterations. `uv run pytest tests/test_perf.py` re-measures on your machine
+and checks the time and memory estimates shown in the GUI against what it measures.
 
-## Known limitations
-
-- The boundary is stair-stepped: resolution is the only fix. Smoothing on export is cosmetic. Features
-  thinner than about 2 voxels vanish, and `rmin` limits the smallest member.
-- Facets of a mesh (not STEP) are found from the tessellation: a finely tessellated freeform surface can still become one
-  huge `other` facet (normal 0). Check area and bbox in `describe`, lower `angle_deg`, or use `normal`, `plane` or a
-  primitive. STEP input has none of this: its facets are the exact B-rep faces.
-- A non-identity `design_mesh.transform` in an imported `project.json` is not drawn correctly by the
-  viewport. The GUI never writes one.
-- Stress is a voxel stress (density-weighted, stair-stepped boundaries): sharp inner corners overshoot, so keep margin.
-  The stress constraint forces MMA and is slower per iteration; the overhang filter does not generate support structures.
-  `--trim` needs a watertight design mesh (it warns and falls back to the untrimmed STL).
-- Not supported: tet meshes, contact, plasticity or fatigue, several stress limits, GPU.
-- One run at a time per process; further runs queue.
-
-## Layout
+## Project layout
 
 ```
 topop/
-  cli.py            serve | run | describe | mcp
-  agent.py          headless Session shared by the CLI and the MCP server
-  mcp_server.py     MCP tools over the same API
-  core/             pure numpy/scipy, no web imports (contract: problem.py)
-    fem.py solver.py filters.py optimize.py   hex8 FEM, multigrid/banded solve, density filter, OC loop
-    voxelize.py selection.py export.py        mesh -> grid, selections -> nodes, marching cubes / VTI / NPZ
-  server/           FastAPI (contract: schemas.py -> openapi.json -> web/src/api/types.gen.ts)
-    static/         built frontend, committed
-web/                React panels + vanilla Three.js viewport (src/), Playwright specs (e2e/), mock API (mock/)
-tests/              pytest (core, server, CLI, MCP, perf)
-examples/           cantilever and bracket STLs + case files (make_examples.py regenerates them)
-docs/               PLAN.md, AGENT.md, PERF.md
+  cli.py          serve | run | describe | struts | mcp
+  agent.py        headless Session shared by the CLI and the MCP server
+  mcp_server.py   MCP tools over the same API
+  core/           pure numpy/scipy, no web imports (contract: problem.py)
+                  fem, solver, filters, optimize, mma, voxelize, selection, step, struts, export
+  server/         FastAPI app (contract: schemas.py -> OpenAPI -> web/src/api/types.gen.ts)
+    static/       built frontend, committed and shipped in the wheel
+web/              React panels + vanilla Three.js viewport, Playwright specs (e2e/), mock API
+lite/             top-op lite, the in-browser single-page version
+tests/            pytest: core, server, CLI, MCP, perf
+examples/         cantilever and bracket (STL, STEP, case files); make_examples.py regenerates them
+docs/             PLAN.md (design), AGENT.md (Claude/MCP), PERF.md, STRESS.md
 ```
 
 ## Development
 
 ```
-make install     uv sync --all-groups and npm ci
-make test        full pytest              make test-fast   pytest -m "not slow"
-make lint        ruff check + format check + web typecheck
-make check       lint + test-fast (the pre-commit gate)
-make static-check  committed topop/server/static equals a fresh frontend build
-make ci          what CI runs: lint, test-fast on 2 threads, static-check, e2e (both projects)
-make build       frontend into topop/server/static/ (commit the result)
-make dev         uvicorn --reload on :8000 and Vite dev server (proxies /api)
-make e2e         Playwright: both projects    make e2e-mock  UI against web/mock
-make e2e-real    UI + real server on :8765    make types     regenerate types.gen.ts from the API
+make install       uv sync --all-groups and npm ci
+make test          full pytest              make test-fast   pytest -m "not slow"
+make lint          ruff check + format check + web typecheck
+make check         lint + test-fast (run before committing)
+make build         frontend into topop/server/static/ (commit the result)
+make dev           API with reload on :8000 and the Vite dev server (proxies /api)
+make e2e           Playwright, mock backend and real server
+make static-check  the committed topop/server/static equals a fresh build
+make types         regenerate web/src/api/types.gen.ts from the API schema
 ```
 
-CI (`.github/workflows/ci.yml`, every push and pull request, Python 3.13 + Node 22) runs `make ci`'s steps on
-ubuntu-latest after installing Chromium for Playwright. The `slow` tests and the wall-clock perf tests run
-weekly and on demand in `.github/workflows/slow.yml` (perf failures there are advisory). Before pushing a
-`web/` change: `make build` and commit `topop/server/static/`, or CI's static check fails.
+CI (`.github/workflows/ci.yml`) runs lint, the fast tests, the static-bundle check and both
+Playwright projects on every push and pull request; `slow.yml` runs the slow and perf tests weekly.
+Pushing a `v*` tag builds the wheel and sdist and attaches them to a GitHub release (`release.yml`).
+Conventions (grid ordering, transforms, wire formats) are in [CLAUDE.md](CLAUDE.md); how to contribute
+is in [CONTRIBUTING.md](CONTRIBUTING.md); what changed is in [CHANGELOG.md](CHANGELOG.md).
 
-Conventions (grid ordering, transforms, wire formats) are in [CLAUDE.md](CLAUDE.md).
+## Citing and acknowledgements
 
-## Docs
+If top-op helps your work, please cite the repository (https://github.com/grint0uc/top-op). It
+builds on:
 
-- [docs/PLAN.md](docs/PLAN.md): design, API contract, work packages, v0.1 status.
-- [docs/AGENT.md](docs/AGENT.md): driving top-op from a Claude session (MCP and CLI).
-- [docs/PERF.md](docs/PERF.md): solver performance work and measurements.
+- K. Liu and A. Tovar, "An efficient 3D topology optimization code written in Matlab",
+  *Structural and Multidisciplinary Optimization* 50, 1175-1196 (2014) (top3d): the hex8 SIMP
+  formulation and the OC update.
+- K. Svanberg, "The method of moving asymptotes - a new method for structural optimization",
+  *International Journal for Numerical Methods in Engineering* 24, 359-373 (1987): the MMA optimizer.
+- M. Langelaar, "An additive manufacturing filter for topology optimization of print-ready designs",
+  *Structural and Multidisciplinary Optimization* 55, 871-883 (2017): the overhang filter.
+
+And on numpy, scipy, pyamg, trimesh, manifold3d, scikit-image, FastAPI, three.js and OpenCascade
+(through cadquery-ocp).
+
+## License
+
+MIT, see [LICENSE](LICENSE). Copyright (c) 2026 Luka Virk.

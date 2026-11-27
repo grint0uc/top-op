@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { expect, test } from '@playwright/test';
-import { BRACKET, defineBoundaries, importBracket, state, viewportStats } from './helpers';
+import { BRACKET, defineBoundaries, importBracket, openPage, state, viewportStats } from './helpers';
 
 const BRACKET_ID = createHash('sha256').update(readFileSync(BRACKET)).digest('hex').slice(0, 16);
 
@@ -63,7 +63,8 @@ test.describe('query selections (mock backend)', () => {
     await expect(page.getByTestId('query-status')).toHaveText('incomplete');
 
     // "Select" on the load brings its query back into the form
-    await page.getByTestId('load-row').first().getByTestId('item-select').click();
+    await expect(page.getByTestId('load-row').first()).toHaveAttribute('aria-selected', 'true'); // its page holds the actions
+    await page.getByTestId('item-select').click();
     expect(await state(page, (s) => s.tool)).toBe('query');
     await expect(page.getByTestId('normal-vec-x')).toHaveValue('1');
     expect(await state(page, (s) => s.selection.query)).toEqual(await state(page, (s) => s.project.loads[0]!.selection));
@@ -141,7 +142,9 @@ test.describe('project import and run handling (mock backend)', () => {
   test('exports before completion answer 409', async ({ page }) => {
     await importBracket(page);
     await defineBoundaries(page);
+    await openPage(page, 'domain');
     await page.getByTestId('domain-elements').fill('24');
+    await openPage(page, 'study');
     await page.getByTestId('p-max-iter').fill('200');
     await page.getByTestId('run-start').click();
     await expect.poll(() => state(page, (s) => s.run.history.length)).toBeGreaterThan(0);
@@ -159,7 +162,9 @@ test.describe('project import and run handling (mock backend)', () => {
     const baseURL = String(test.info().project.use.baseURL);
     await importBracket(page);
     await defineBoundaries(page);
+    await openPage(page, 'domain');
     await page.getByTestId('domain-elements').fill('24');
+    await openPage(page, 'study');
     await page.getByTestId('p-max-iter').fill('300');
     await page.getByTestId('run-start').click();
     await expect.poll(() => state(page, (s) => s.run.history.length)).toBeGreaterThan(1);
@@ -168,7 +173,9 @@ test.describe('project import and run handling (mock backend)', () => {
     try {
       await importBracket(other);
       await defineBoundaries(other);
+      await openPage(other, 'domain');
       await other.getByTestId('domain-elements').fill('24');
+      await openPage(other, 'study');
       await other.getByTestId('p-max-iter').fill('3');
       await other.evaluate(() => {
         const w = window as unknown as { __statuses: string[] };
@@ -232,6 +239,7 @@ test.describe('project import and run handling (mock backend)', () => {
     // the mock (like the server) still has the mesh: loaded by id, no re-upload prompt
     await expect.poll(async () => (await viewportStats(page)).designFaces).toBe(1326);
     await expect(page.getByTestId('reupload-notice')).toHaveCount(0);
+    await openPage(page, 'results');
     await expect(page.getByTestId('loaded-run')).toBeVisible();
     await expect(page.getByTestId('loaded-run-iters')).toHaveText('5');
     await expect(page.getByTestId('loaded-run-gone')).toBeVisible(); // this run id is not on the server
@@ -307,6 +315,7 @@ test.describe('project import and run handling (mock backend)', () => {
 test.describe('generated keep-out volumes (mock backend)', () => {
   test('+ cylinder uploads a unit cylinder; the transform matrix carries translation, rotation and scale', async ({ page }) => {
     await importBracket(page);
+    await openPage(page, 'refs');
     await page.getByTestId('add-ref-cylinder').click();
     await expect.poll(() => state(page, (s) => s.project.ref_models.length)).toBe(1);
     await expect.poll(async () => (await viewportStats(page)).refs).toBe(1);

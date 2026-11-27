@@ -7,6 +7,11 @@ import { Viewport } from './Viewport';
 
 let current: { canvas: HTMLCanvasElement; vp: Viewport; unbind: () => void } | null = null;
 
+/** The live viewport, once the canvas is mounted. */
+export function getViewport(): Viewport | null {
+  return current?.vp ?? null;
+}
+
 export function mountViewport(canvas: HTMLCanvasElement): Viewport {
   if (current?.canvas === canvas) return current.vp;
   teardown();

@@ -1,16 +1,35 @@
 import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { Icon, type IconName } from './icons';
 
-/** Collapsible sidebar section. Children stay mounted when collapsed so local input state survives. */
-export function Section({ title, children, defaultOpen = true }: { title: string; children: ReactNode; defaultOpen?: boolean }) {
+/** Property-manager group box (collapsible). Children stay mounted when folded so local input state survives. */
+export function Group({
+  title,
+  children,
+  defaultOpen = true,
+  testId,
+  icon,
+  aside,
+}: {
+  title: string;
+  children: ReactNode;
+  defaultOpen?: boolean;
+  testId?: string;
+  icon?: IconName;
+  /** extra content on the right of the header (a count, a tag) */
+  aside?: ReactNode;
+}) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <section className="panel" data-testid={`panel-${title.toLowerCase().replace(/\s+/g, '-')}`}>
-      <h2>
-        <button type="button" className="panel-toggle" aria-expanded={open} onClick={() => setOpen(!open)}>
-          {title}
+    <section className="group" data-testid={testId}>
+      <h3 className="group-head">
+        <button type="button" className="group-toggle" aria-expanded={open} onClick={() => setOpen(!open)}>
+          <Icon name="chevron" size={12} className="caret" />
+          {icon && <Icon name={icon} size={14} />}
+          <span className="grow">{title}</span>
         </button>
-      </h2>
-      <div className="panel-body" hidden={!open}>
+        {aside}
+      </h3>
+      <div className="group-body" hidden={!open}>
         {children}
       </div>
     </section>
@@ -165,26 +184,39 @@ export function Btn({
   variant,
   title,
   active,
+  icon,
 }: {
-  children: ReactNode;
+  children?: ReactNode;
   onClick?: () => void;
   disabled?: boolean;
   testId?: string;
-  variant?: 'primary' | 'danger';
+  variant?: 'primary' | 'danger' | 'ghost';
   title?: string;
   active?: boolean;
+  icon?: IconName;
 }) {
   return (
     <button
       type="button"
-      className={`btn ${variant ?? ''} ${active ? 'active' : ''}`}
+      className={`btn ${variant ?? ''} ${active ? 'active' : ''} ${children ? '' : 'icon-only'}`}
       onClick={onClick}
       disabled={disabled}
       data-testid={testId}
       title={title}
+      aria-label={children ? undefined : title}
       aria-pressed={active}
     >
+      {icon && <Icon name={icon} size={14} />}
       {children}
     </button>
+  );
+}
+
+/** Read-only key/value rows of a property page. */
+export function Props({ children, testId, className }: { children: ReactNode; testId?: string; className?: string }) {
+  return (
+    <dl className={`kv ${className ?? ''}`} data-testid={testId}>
+      {children}
+    </dl>
   );
 }

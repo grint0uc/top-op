@@ -3,6 +3,7 @@ import {
   canvasCentre,
   defineBoundaries,
   importBracket,
+  openPage,
   selectFlatFaceAtCentre,
   state,
   viewportStats,
@@ -109,9 +110,10 @@ test.describe('frontend against the mock backend', () => {
     await expect.poll(() => state(page, (s) => s.project.loads.length)).toBe(1);
     expect(await state(page, (s) => s.selection.faceIds.length)).toBe(0);
 
-    const row = page.getByTestId('load-row').first();
-    await row.getByTestId('force-x').fill('10');
-    await row.getByTestId('force-z').fill('-250');
+    // the new load is active: its property page holds the force fields
+    await expect(page.getByTestId('load-row').first()).toHaveAttribute('aria-selected', 'true');
+    await page.getByTestId('force-x').fill('10');
+    await page.getByTestId('force-z').fill('-250');
     await expect.poll(() => state(page, (s) => s.project.loads[0]?.force)).toEqual([10, 0, -250]);
     const load = await state(page, (s) => s.project.loads[0]!);
     expect(load.selection.kind).toBe('faces');
@@ -160,7 +162,8 @@ test.describe('frontend against the mock backend', () => {
     await expect.poll(async () => (await viewportStats(page)).glyphs).toBe(1);
 
     // fix checkboxes edit the support
-    await page.getByTestId('support-row').first().getByTestId('fix-z').uncheck();
+    await expect(page.getByTestId('support-row').first()).toHaveAttribute('aria-selected', 'true');
+    await page.getByTestId('fix-z').uncheck();
     await expect.poll(() => state(page, (s) => s.project.supports[0]?.fix)).toEqual([true, true, false]);
   });
 
@@ -205,7 +208,9 @@ test.describe('frontend against the mock backend', () => {
   test('5. run 8 iterations: progress records, a density frame, DensityView instances, done', async ({ page }) => {
     await importBracket(page);
     await defineBoundaries(page);
+    await openPage(page, 'domain');
     await page.getByTestId('domain-elements').fill('24');
+    await openPage(page, 'study');
     await page.getByTestId('p-max-iter').fill('8');
     await page.getByTestId('run-start').click();
 
@@ -230,6 +235,7 @@ test.describe('frontend against the mock backend', () => {
     expect(await page.getByTestId('sparkline').getAttribute('data-points')).toBe('8');
 
     // threshold slider re-thresholds the same frame: fewer cells at 0.9 than at 0.1
+    await openPage(page, 'results');
     await page.getByTestId('threshold').fill('0.1');
     const low = (await viewportStats(page)).densityCount;
     await page.getByTestId('threshold').fill('0.9');
@@ -241,7 +247,9 @@ test.describe('frontend against the mock backend', () => {
   test('5b. stop cancels a running job', async ({ page }) => {
     await importBracket(page);
     await defineBoundaries(page);
+    await openPage(page, 'domain');
     await page.getByTestId('domain-elements').fill('24');
+    await openPage(page, 'study');
     await page.getByTestId('p-max-iter').fill('200');
     await page.getByTestId('run-start').click();
     await expect.poll(() => state(page, (s) => s.run.history.length), { timeout: 10_000 }).toBeGreaterThanOrEqual(2);
@@ -263,7 +271,9 @@ test.describe('frontend against the mock backend', () => {
   test('6. result downloads respond and the result mesh loads', async ({ page }) => {
     await importBracket(page);
     await defineBoundaries(page);
+    await openPage(page, 'domain');
     await page.getByTestId('domain-elements').fill('24');
+    await openPage(page, 'study');
     await page.getByTestId('p-max-iter').fill('3');
     await page.getByTestId('run-start').click();
     await expect.poll(() => state(page, (s) => s.run.status), { timeout: 15_000 }).toBe('done');
@@ -282,6 +292,7 @@ test.describe('frontend against the mock backend', () => {
     expect(exported.project.loads).toHaveLength(1);
     expect(exported.run.status).toBe('done');
 
+    await openPage(page, 'results');
     await page.getByTestId('load-result').click();
     await expect.poll(async () => (await viewportStats(page)).result).toBe(true);
     await page.screenshot({ path: 'test-results/viewport-result.png' });
@@ -342,6 +353,7 @@ test.describe('frontend against the mock backend', () => {
 
   test('9. domain warnings: amber above 150k active elements, red above 300k', async ({ page }) => {
     await importBracket(page);
+    await openPage(page, 'domain');
     const set = (v: string) => page.getByTestId('domain-elements').fill(v);
     await set('60');
     await expect(page.getByTestId('voxel-stats')).toHaveAttribute('data-level', 'ok');

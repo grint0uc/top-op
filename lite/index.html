@@ -1,0 +1,486 @@
+<title>top-op lite</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: CAD workbench. Toolbar on top, collapsible property panel on the left, 3D viewport fills
+   the rest; below 760px the viewport sits on top and the panel becomes a bottom sheet. */
+:root {
+  --bg: #e9edf2;
+  --panel: #f6f8fa;
+  --surface: #ffffff;
+  --sunken: #eef1f5;
+  --line: #d3dae3;
+  --line-strong: #b7c1cd;
+  --text: #18212b;
+  --muted: #5a6676;
+  --faint: #687382;
+  --warn: #b13f0c;
+  --accent: #2563c9;
+  --accent-hover: #1d52aa;
+  --accent-soft: #dce7f8;
+  --on-accent: #ffffff;
+  --support: #0e8577;
+  --load: #d2480f;
+  --keep-solid: #6b45c8;
+  --keep-void: #8c96a3;
+  --danger: #b42318;
+  --vp-top: #f3f5f8;
+  --vp-bottom: #d5dce5;
+  --model: #a9b6c6;
+  --grid-major: #b9c3cf;
+  --grid-minor: #cfd6df;
+  --rho-lo: #b7c7dc;
+  --rho-hi: #1f4f9e;
+  --surface-model: #3e6fb8;
+  --select: #f0a020;
+  --shadow: 0 1px 2px rgba(20, 30, 45, 0.08), 0 4px 14px rgba(20, 30, 45, 0.08);
+  --font-ui: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-num: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --radius: 6px;
+  box-sizing: border-box;
+  height: 100%;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1419; --panel: #151b22; --surface: #1b232c; --sunken: #121820; --line: #28323e;
+    --line-strong: #394655; --text: #e2e8ef; --muted: #98a4b3; --faint: #808b9a; --warn: #ff7c45; --accent: #5b94f2;
+    --accent-hover: #78a8f6; --accent-soft: #1d2c44; --on-accent: #0b1320; --support: #2cc0ac;
+    --load: #ff7c45; --keep-solid: #a689f5; --keep-void: #77818d; --danger: #ff6b5e;
+    --vp-top: #1a222b; --vp-bottom: #0c1116; --model: #4f5d6d; --grid-major: #2d3845;
+    --grid-minor: #212a34; --rho-lo: #34465e; --rho-hi: #8cb8ff; --surface-model: #79a6ea;
+    --select: #ffb547;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.35);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1419; --panel: #151b22; --surface: #1b232c; --sunken: #121820; --line: #28323e;
+  --line-strong: #394655; --text: #e2e8ef; --muted: #98a4b3; --faint: #808b9a; --warn: #ff7c45; --accent: #5b94f2;
+  --accent-hover: #78a8f6; --accent-soft: #1d2c44; --on-accent: #0b1320; --support: #2cc0ac;
+  --load: #ff7c45; --keep-solid: #a689f5; --keep-void: #77818d; --danger: #ff6b5e;
+  --vp-top: #1a222b; --vp-bottom: #0c1116; --model: #4f5d6d; --grid-major: #2d3845;
+  --grid-minor: #212a34; --rho-lo: #34465e; --rho-hi: #8cb8ff; --surface-model: #79a6ea;
+  --select: #ffb547;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.35);
+  color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 var(--font-ui);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 10px;
+  -webkit-font-smoothing: antialiased;
+}
+.num, input[type="number"], output { font-family: var(--font-num); font-variant-numeric: tabular-nums; }
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.app {
+  height: 100%;
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Toolbar */
+.toolbar {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 5px 6px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.toolbar::-webkit-scrollbar { display: none; }
+.brand { display: flex; align-items: center; gap: 7px; padding: 0 6px 0 2px; white-space: nowrap; }
+.brand svg { flex: none; }
+.brand b { font-weight: 600; letter-spacing: -0.01em; font-size: 14px; }
+.brand span { font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); border: 1px solid currentColor; border-radius: 3px; padding: 0 4px; line-height: 15px; }
+.sep { width: 1px; align-self: stretch; background: var(--line); margin: 2px 2px; flex: none; }
+.spacer { flex: 1; }
+.btn {
+  display: inline-flex; align-items: center; gap: 6px; flex: none;
+  height: 28px; padding: 0 10px; border-radius: 4px; cursor: pointer; white-space: nowrap;
+  background: var(--surface); border: 1px solid var(--line); color: var(--text);
+}
+.btn:hover:not(:disabled) { border-color: var(--line-strong); background: var(--sunken); }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+.btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn.ghost { background: transparent; border-color: transparent; }
+.btn.ghost:hover:not(:disabled) { background: var(--sunken); border-color: var(--line); }
+.btn.small { height: 24px; padding: 0 8px; font-size: 12px; }
+.btn svg { width: 14px; height: 14px; flex: none; }
+.seg { display: inline-flex; flex: none; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; background: var(--surface); }
+.seg button { height: 26px; padding: 0 10px; border: 0; background: transparent; cursor: pointer; color: var(--muted); }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.seg button:disabled { opacity: 0.4; cursor: default; }
+select.tb { height: 28px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); padding: 0 6px; flex: none; max-width: 190px; }
+
+/* Panel */
+.panel {
+  min-height: 0; min-width: 0;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+details.sec { border-bottom: 1px solid var(--line); }
+details.sec > summary {
+  list-style: none; cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 12px; font-size: 11px; font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; color: var(--muted);
+}
+details.sec > summary::-webkit-details-marker { display: none; }
+details.sec > summary::before {
+  content: ""; width: 0; height: 0; border-left: 4px solid currentColor; border-top: 4px solid transparent; border-bottom: 4px solid transparent;
+  transition: transform 0.12s; flex: none;
+}
+details.sec[open] > summary::before { transform: rotate(90deg); }
+details.sec > summary .tag { margin-left: auto; font-family: var(--font-num); font-weight: 500; letter-spacing: 0; text-transform: none; color: var(--faint); }
+.sec-body { padding: 2px 12px 12px; display: grid; gap: 8px; }
+.row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.row > label { color: var(--muted); flex: none; }
+.row .grow { flex: 1; min-width: 0; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; text-align: right; font-family: var(--font-num); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.slider { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; align-items: center; }
+.slider label { color: var(--muted); font-size: 12px; }
+.slider output { font-size: 12px; text-align: right; min-width: 4ch; }
+.slider input { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); margin: 0; }
+.note { font-size: 12px; color: var(--muted); margin: 0; }
+.note.warn { color: var(--warn); }
+.note.err { color: var(--danger); }
+.hint { font-size: 12px; color: var(--muted); margin: 0; padding: 8px 10px; border: 1px dashed var(--line-strong); border-radius: 4px; }
+input[type="number"], input[type="text"], select.field {
+  height: 26px; min-width: 0; width: 100%; padding: 0 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); font-size: 12px;
+}
+.xyz { display: grid; grid-template-columns: auto repeat(3, minmax(0, 1fr)); gap: 4px; align-items: center; font-size: 12px; }
+.xyz span { color: var(--muted); }
+.bc-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.bc-list li {
+  display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 8px;
+  padding: 5px 4px 5px 8px; background: var(--surface); border: 1px solid var(--line); border-radius: 4px; font-size: 12px;
+}
+.bc-list .sw { width: 10px; height: 10px; border-radius: 2px; }
+.bc-list .t { min-width: 0; overflow-wrap: anywhere; }
+.bc-list .t small { display: block; color: var(--muted); font-family: var(--font-num); font-size: 11px; }
+.bc-list .x { width: 22px; height: 22px; border: 0; background: transparent; border-radius: 3px; cursor: pointer; color: var(--muted); font-size: 15px; line-height: 1; }
+.bc-list .x:hover:not(:disabled) { background: var(--sunken); color: var(--danger); }
+.bc-list .empty { display: block; color: var(--faint); background: transparent; border-style: dashed; }
+.readout { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+.readout div { background: var(--surface); padding: 5px 7px; min-width: 0; }
+.readout small { display: block; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.readout b { display: block; font-family: var(--font-num); font-variant-numeric: tabular-nums; font-weight: 500; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.spark { width: 100%; height: 64px; display: block; background: var(--surface); border: 1px solid var(--line); border-radius: 4px; }
+.btn-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.progress { height: 3px; background: var(--sunken); border-radius: 2px; overflow: hidden; }
+.progress i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
+
+/* Viewport */
+.viewport {
+  position: relative; min-height: 0; min-width: 0; overflow: hidden;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: linear-gradient(180deg, var(--vp-top), var(--vp-bottom));
+  container-type: inline-size;
+}
+.viewport canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+.vp-status {
+  position: absolute; top: 8px; left: 8px; max-width: calc(100% - 16px);
+  display: flex; align-items: center; gap: 8px; padding: 4px 9px; font-size: 12px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent); border: 1px solid var(--line); border-radius: 4px; pointer-events: none;
+}
+.vp-status .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
+.vp-status[data-state="running"] .dot { background: var(--accent); animation: pulse 1s infinite; }
+.vp-status[data-state="done"] .dot { background: var(--support); }
+.vp-status[data-state="error"] .dot { background: var(--danger); }
+@keyframes pulse { 50% { opacity: 0.3; } }
+.legend {
+  position: absolute; left: 8px; bottom: 8px; display: flex; gap: 10px; flex-wrap: wrap; font-size: 11px; color: var(--muted);
+  padding: 3px 8px; background: color-mix(in srgb, var(--surface) 80%, transparent); border: 1px solid var(--line); border-radius: 4px; pointer-events: none;
+}
+.legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: 0; }
+.vp-hint {
+  position: absolute; right: 8px; bottom: 8px; font-size: 11px; color: var(--muted); pointer-events: none; text-align: right;
+  padding: 3px 8px; background: color-mix(in srgb, var(--surface) 80%, transparent); border: 1px solid var(--line); border-radius: 4px;
+}
+/* The hint and the legend share the bottom edge; drop the hint before they collide. */
+@container (max-width: 720px) { .vp-hint { display: none; } }
+.rho-bar { position: absolute; right: 8px; top: 8px; display: grid; gap: 2px; font-size: 10px; color: var(--muted); font-family: var(--font-num); pointer-events: none; }
+.rho-bar i { display: block; width: 110px; height: 6px; border-radius: 3px; background: linear-gradient(90deg, var(--rho-lo), var(--rho-hi)); }
+.rho-bar span { display: flex; justify-content: space-between; }
+.selcard {
+  position: absolute; left: 50%; bottom: 36px; transform: translateX(-50%);
+  width: min(560px, calc(100% - 16px));
+  display: grid; gap: 8px; padding: 10px 12px;
+  background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius); box-shadow: var(--shadow);
+}
+.selcard header { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.selcard header b { font-weight: 600; white-space: nowrap; }
+.selcard header span { color: var(--muted); font-size: 12px; font-family: var(--font-num); min-width: 0; overflow-wrap: anywhere; }
+.selcard header button { margin-left: auto; }
+.selcard .acts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.selcard .force { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.selcard .force label { font-size: 12px; color: var(--muted); }
+.selcard .force input { width: 76px; }
+.btn.support { border-color: var(--support); color: var(--support); font-weight: 600; }
+.btn.load { border-color: var(--load); color: var(--load); font-weight: 600; }
+.drop {
+  position: absolute; inset: 8px; display: grid; place-items: center; border: 2px dashed var(--accent); border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent-soft) 80%, transparent); color: var(--accent); font-weight: 600; pointer-events: none;
+}
+.fatal { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; text-align: center; color: var(--muted); }
+
+/* About */
+.about-wrap { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 16px max(16px, env(safe-area-inset-right, 0px)) 16px max(16px, env(safe-area-inset-left, 0px)); background: color-mix(in srgb, var(--bg) 60%, transparent); }
+.about {
+  width: min(560px, 100%); max-height: 100%; overflow-y: auto; padding: 18px 20px; display: grid; gap: 10px;
+  background: var(--surface); border: 1px solid var(--line-strong); border-radius: 8px; box-shadow: var(--shadow);
+}
+.about h2 { margin: 0; font-size: 16px; font-weight: 600; text-wrap: balance; }
+.about p, .about li { margin: 0; color: var(--muted); max-width: 65ch; }
+.about ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+.about a { color: var(--accent); }
+.about header { display: flex; align-items: center; gap: 8px; }
+.about header button { margin-left: auto; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+@media (max-width: 760px) {
+  body { padding-block: 6px; }
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 50%) minmax(0, 1fr); gap: 6px; }
+  .viewport { grid-row: 2; }
+  .panel { grid-row: 3; border-radius: 12px 12px var(--radius) var(--radius); box-shadow: var(--shadow); }
+  .panel::before { content: ""; display: block; width: 36px; height: 4px; border-radius: 2px; background: var(--line-strong); margin: 7px auto 0; }
+  .vp-hint { display: none; }
+  .selcard { bottom: 8px; padding: 8px 10px; }
+  .legend { display: none; }
+  .brand span { display: none; }
+  .tb-label { display: none; }
+  select.tb { max-width: 150px; }
+  .toolbar { gap: 4px; }
+  .btn { padding: 0 8px; }
+  .brand { order: -3; }
+  #run, #stop { order: -2; }
+  .brand + .sep { order: -2; }
+}
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+</style>
+
+<div class="app" id="app">
+  <header class="toolbar" role="toolbar" aria-label="Main">
+    <div class="brand">
+      <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true">
+        <rect x="1" y="1" width="18" height="18" rx="3" fill="var(--accent)"></rect>
+        <path d="M4 15 L4 5 L7 5 L7 11 Q7 12 8 12 L16 12 L16 15 Z" fill="var(--on-accent)"></path>
+        <path d="M7.6 5.2 L15.6 11.4" stroke="var(--on-accent)" stroke-width="1.6" stroke-linecap="round"></path>
+      </svg>
+      <b>top-op</b><span>lite</span>
+    </div>
+    <div class="sep"></div>
+    <label class="btn" for="file" title="Import an STL file (binary or ASCII)" aria-label="Open STL">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 10v3h12v-3M8 2v8M5 5l3-3 3 3"/></svg>
+      <span class="tb-label">Open STL</span>
+    </label>
+    <input id="file" class="visually-hidden" type="file" accept=".stl,model/stl,application/sla">
+    <select id="example" class="tb" aria-label="Example part">
+      <option value="bracket">Example: L-bracket</option>
+      <option value="cantilever">Example: cantilever</option>
+      <option value="custom" hidden>Imported part</option>
+    </select>
+    <div class="sep"></div>
+    <button id="run" class="btn primary" type="button">
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg>Run
+    </button>
+    <button id="stop" class="btn" type="button" disabled>
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx="1"/></svg>Stop
+    </button>
+    <div class="sep"></div>
+    <div class="seg" role="group" aria-label="View">
+      <button type="button" data-view="design" aria-pressed="true">Design</button>
+      <button type="button" data-view="voxels" aria-pressed="false" disabled>Density</button>
+      <button type="button" data-view="surface" aria-pressed="false" disabled>Surface</button>
+    </div>
+    <button id="fit" class="btn ghost" type="button" title="Fit view">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4"/></svg><span class="tb-label">Fit</span>
+    </button>
+    <div class="spacer"></div>
+    <button id="about-open" class="btn ghost" type="button">About</button>
+  </header>
+
+  <aside class="panel" id="panel" aria-label="Properties">
+    <details class="sec" open>
+      <summary>Part<span class="tag" id="part-tag"></span></summary>
+      <div class="sec-body">
+        <dl class="kv">
+          <dt>File</dt><dd id="part-name">–</dd>
+          <dt>Triangles</dt><dd id="part-tris">–</dd>
+          <dt>Size</dt><dd id="part-size">–</dd>
+        </dl>
+        <p class="note warn" id="part-note" hidden></p>
+        <p class="hint">Drop an STL anywhere on the page, or use Open STL. Units follow the file.</p>
+      </div>
+    </details>
+
+    <details class="sec" open>
+      <summary>Voxel grid<span class="tag" id="grid-tag"></span></summary>
+      <div class="sec-body">
+        <div class="slider">
+          <label for="res">Elements along longest axis</label><output id="res-out" for="res">40</output>
+          <input id="res" type="range" min="10" max="120" step="1" value="40">
+        </div>
+        <dl class="kv">
+          <dt>Grid</dt><dd id="grid-dims">–</dd>
+          <dt>Voxel size h</dt><dd id="grid-h">–</dd>
+          <dt>Active elements</dt><dd id="grid-active">–</dd>
+          <dt>Est. time / iteration</dt><dd id="grid-est">–</dd>
+        </dl>
+        <p class="note" id="grid-note" hidden></p>
+      </div>
+    </details>
+
+    <details class="sec" open id="sec-bc">
+      <summary>Supports &amp; loads<span class="tag" id="bc-tag"></span></summary>
+      <div class="sec-body">
+        <p class="note">Click a face in the view. Flat neighbours within 10° join the selection; then fix it or load it.</p>
+        <ul class="bc-list" id="bc-list"></ul>
+      </div>
+    </details>
+
+    <details class="sec" id="sec-keep">
+      <summary>Keep regions<span class="tag" id="keep-tag"></span></summary>
+      <div class="sec-body">
+        <p class="note">Axis-aligned boxes. Keep-in elements stay solid, keep-out elements stay empty.</p>
+        <div class="row">
+          <label for="keep-mode">Type</label>
+          <select id="keep-mode" class="field grow">
+            <option value="solid">Keep-in (solid)</option>
+            <option value="void">Keep-out (void)</option>
+          </select>
+        </div>
+        <div class="xyz">
+          <span>min</span><input id="keep-x0" type="number" step="any" aria-label="min x"><input id="keep-y0" type="number" step="any" aria-label="min y"><input id="keep-z0" type="number" step="any" aria-label="min z">
+          <span>max</span><input id="keep-x1" type="number" step="any" aria-label="max x"><input id="keep-y1" type="number" step="any" aria-label="max y"><input id="keep-z1" type="number" step="any" aria-label="max z">
+        </div>
+        <div class="btn-row"><button id="keep-add" class="btn small" type="button">Add box</button></div>
+        <ul class="bc-list" id="keep-list"></ul>
+      </div>
+    </details>
+
+    <details class="sec" open>
+      <summary>Optimize<span class="tag" id="opt-tag"></span></summary>
+      <div class="sec-body">
+        <div class="slider">
+          <label for="volfrac">Volume fraction</label><output id="volfrac-out" for="volfrac">0.30</output>
+          <input id="volfrac" type="range" min="0.05" max="0.8" step="0.01" value="0.3">
+        </div>
+        <div class="slider">
+          <label for="maxit">Max iterations</label><output id="maxit-out" for="maxit">60</output>
+          <input id="maxit" type="range" min="5" max="200" step="1" value="60">
+        </div>
+        <div class="slider">
+          <label for="rmin">Filter radius (voxels)</label><output id="rmin-out" for="rmin">1.5</output>
+          <input id="rmin" type="range" min="1.1" max="3" step="0.1" value="1.5">
+        </div>
+        <div class="progress" aria-hidden="true"><i id="progress"></i></div>
+        <div class="readout">
+          <div><small>Iteration</small><b id="ro-it">–</b></div>
+          <div><small>Compliance</small><b id="ro-c">–</b></div>
+          <div><small>Volume</small><b id="ro-v">–</b></div>
+          <div><small>Change</small><b id="ro-ch">–</b></div>
+          <div><small>ms / iter</small><b id="ro-ms">–</b></div>
+          <div><small>CG iters</small><b id="ro-cg">–</b></div>
+        </div>
+        <canvas class="spark" id="spark" aria-label="Compliance history"></canvas>
+        <p class="note" id="run-note">SIMP, penalty 3, density filter, OC update. Compliance is f·u with E = 1.</p>
+      </div>
+    </details>
+
+    <details class="sec" open>
+      <summary>Result<span class="tag" id="res-tag"></span></summary>
+      <div class="sec-body">
+        <div class="slider">
+          <label for="thr">Density threshold</label><output id="thr-out" for="thr">0.50</output>
+          <input id="thr" type="range" min="0.05" max="0.95" step="0.01" value="0.5">
+        </div>
+        <div class="row">
+          <label for="smooth">Surface smoothing</label>
+          <select id="smooth" class="field grow">
+            <option value="0">None</option>
+            <option value="1">1 pass</option>
+            <option value="2" selected>2 passes</option>
+            <option value="3">3 passes</option>
+          </select>
+        </div>
+        <dl class="kv">
+          <dt>Surface</dt><dd id="surf-info">run the optimizer first</dd>
+        </dl>
+        <div class="btn-row">
+          <button id="export" class="btn small" type="button" disabled title="Saves topop-result.zip containing topop-result.stl">Save STL (.zip)</button>
+          <button id="copy" class="btn small" type="button" disabled>Copy ASCII STL</button>
+        </div>
+        <p class="note" id="export-note">Checking whether this view can save files…</p>
+        <textarea id="copy-fallback" class="visually-hidden" aria-hidden="true" tabindex="-1"></textarea>
+      </div>
+    </details>
+  </aside>
+
+  <main class="viewport" id="viewport">
+    <canvas id="gl"></canvas>
+    <div class="vp-status" id="vp-status" data-state="idle"><i class="dot"></i><span id="vp-status-text">Loading…</span></div>
+    <div class="rho-bar" id="rho-bar" hidden><i></i><span><b id="rho-bar-lo">0.50</b><b>density</b><b>1</b></span></div>
+    <div class="legend"><span><i style="background: var(--support)"></i>Support</span><span><i style="background: var(--load)"></i>Load</span><span><i style="background: var(--select)"></i>Selection</span></div>
+    <div class="vp-hint">Drag: orbit · Right-drag / two fingers: pan · Wheel / pinch: zoom · Click: select face</div>
+    <section class="selcard" id="selcard" hidden aria-label="Selected face">
+      <header><b>Face selected</b><span id="sel-info"></span><button class="btn ghost small" id="sel-clear" type="button" aria-label="Clear selection">✕</button></header>
+      <div class="acts">
+        <button class="btn small support" id="add-support" type="button">Fix as support</button>
+        <div class="sep"></div>
+        <div class="force">
+          <label for="fx">Fx</label><input id="fx" type="number" step="any" value="0">
+          <label for="fy">Fy</label><input id="fy" type="number" step="any" value="0">
+          <label for="fz">Fz</label><input id="fz" type="number" step="any" value="-1000">
+          <label>N</label>
+        </div>
+        <button class="btn small load" id="add-load" type="button">Add load</button>
+      </div>
+    </section>
+    <div class="drop" id="drop" hidden>Drop STL to import</div>
+  </main>
+</div>
+
+<div class="about-wrap" id="about" hidden>
+  <section class="about" role="dialog" aria-modal="true" aria-labelledby="about-title">
+    <header><h2 id="about-title">About top-op lite</h2><button class="btn ghost small" id="about-close" type="button" aria-label="Close">✕</button></header>
+    <p>A lightweight, in-browser version of <a href="https://github.com/grint0uc/top-op" target="_blank" rel="noopener">top-op</a>, the open-source 3D topology optimization tool. Everything here runs on your device: the part is voxelized, then a SIMP optimizer removes material that carries little load until the target volume fraction is reached.</p>
+    <ul>
+      <li>Solver: 8-node hexahedra (E = 1, ν = 0.3), matrix-free Jacobi-preconditioned CG in a Web Worker, density filter, optimality-criteria update.</li>
+      <li>Limits: coarse grids (about 40 000 elements), one load case, STL input only (no STEP), no stress constraint, no symmetry or overhang control. The full app has all of these.</li>
+      <li>Units: none enforced. Use a consistent set such as mm, N and MPa. Because E = 1, compliance (N·mm) scales as 1/E; divide by your modulus in MPa for physical values.</li>
+      <li>Supports fix x, y and z on the grid nodes within 0.75 h of the selected faces; a load's force is the total, split evenly over its nodes.</li>
+    </ul>
+  </section>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/loaders/STLLoader.js"></script>
+<script src="mc.js"></script>
+<script src="solver.js"></script>
+<script src="app.js"></script>

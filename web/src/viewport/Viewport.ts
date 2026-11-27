@@ -12,12 +12,35 @@ import { Picker, type PickerDeps } from './Picker';
 import { Primitives } from './Primitives';
 import { SelectionPainter, type PainterDeps } from './SelectionPainter';
 
-export const BASE_HEX = 0xb8bec8;
-export const SELECT_HEX = 0xffa534;
-export const HOVER_HEX = 0x41e0ff;
-const BG_HEX = 0x14161a;
+export const BASE_HEX = 0xb4bdc8;
+export const SELECT_HEX = 0x1f78ff;
+export const HOVER_HEX = 0x7cc8ff;
 
 export type DesignAppearance = 'solid' | 'ghost' | 'hidden';
+export type DisplayStyle = 'shaded' | 'edges' | 'wireframe';
+export type StandardView = 'iso' | 'front' | 'back' | 'left' | 'right' | 'top' | 'bottom';
+
+/** Camera direction (from target towards the camera) and up vector of each standard view; Z is up. */
+const VIEWS: Record<StandardView, { dir: [number, number, number]; up: [number, number, number] }> = {
+  iso: { dir: [1, -1.2, 0.8], up: [0, 0, 1] },
+  front: { dir: [0, -1, 0], up: [0, 0, 1] },
+  back: { dir: [0, 1, 0], up: [0, 0, 1] },
+  right: { dir: [1, 0, 0], up: [0, 0, 1] },
+  left: { dir: [-1, 0, 0], up: [0, 0, 1] },
+  // straight down/up is degenerate for an orbit around Z: tilt by a hair so OrbitControls keeps working
+  top: { dir: [0, -1e-4, 1], up: [0, 0, 1] },
+  bottom: { dir: [0, -1e-4, -1], up: [0, 0, 1] },
+};
+
+const GRID_HEX = { light: [0xa7b2c0, 0xcfd6df], dark: [0x3d4757, 0x2a323e] } as const;
+// feature edges: dark lines on the solid part; on a ghosted part they are the outline, so they must read on the background
+const EDGE_HEX = { light: 0x1e2733, dark: 0x0b1018, ghostLight: 0x3c4859, ghostDark: 0xaab8ca } as const;
+
+export interface SectionSpec {
+  axis: 'x' | 'y' | 'z';
+  /** position as a fraction of the content box along the axis */
+  t: number;
+}
 
 export interface DesignMesh {
   meshId: string | null;
@@ -50,7 +73,7 @@ interface RefEntry {
   centre: THREE.Vector3;
 }
 
-export const REF_COLORS = { keep_in: 0x3ddc97, keep_out: 0xff5a5f } as const;
+export const REF_COLORS = { keep_in: 0x2f7bf6, keep_out: 0xe5484d } as const;
 
 export class Viewport {
   readonly renderer: THREE.WebGLRenderer;
@@ -75,11 +98,20 @@ export class Viewport {
 
   private readonly refs = new Map<string, RefEntry>();
   private grid: THREE.GridHelper | null = null;
-  private axes: THREE.AxesHelper | null = null;
   private faceHex = new Uint32Array(0);
   private faceNext = new Uint32Array(0);
   private gizmoTarget: { object: THREE.Object3D; onChange: () => void; onEnd: () => void } | null = null;
   private gizmoDragging = false;
+  private dark = false;
+  private display: DisplayStyle = 'edges';
+  private edges: THREE.LineSegments | null = null;
+  private section: SectionSpec | null = null;
+  private readonly sectionPlane = new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0);
+  private readonly sectionPlanes = [this.sectionPlane];
+  /** materials whose clipping planes were set, so turning the section off restores them */
+  private readonly clipped = new Set<THREE.Material>();
+  private readonly cameraListeners = new Set<() => void>();
+  private tween = 0;
   private dirty = true;
   private raf = 0;
   private disposed = false;
@@ -92,9 +124,11 @@ export class Viewport {
     deps: { picker: PickerDeps; painter: PainterDeps },
   ) {
     // preserveDrawingBuffer keeps screenshots/readPixels valid between the on-demand renders
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+    // transparent clear: the viewport gradient is CSS behind the canvas
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, preserveDrawingBuffer: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    this.renderer.setClearColor(BG_HEX);
+    this.renderer.setClearColor(0x000000, 0);
+    this.renderer.localClippingEnabled = true; // section plane (per material)
 
     this.camera = new THREE.PerspectiveCamera(40, 1, 0.1, 5000);
     this.camera.up.set(0, 0, 1); // engineering convention: Z up
@@ -148,8 +182,83 @@ export class Viewport {
   renderNow(): void {
     if (this.disposed) return;
     this.dirty = false;
+    if (this.section || this.clipped.size) this.applySection();
     this.renderer.render(this.scene, this.camera);
     this.renderCount++;
+    for (const fn of this.cameraListeners) fn();
+  }
+
+  /** Called after every render (view cube, triad). Returns the unsubscribe function. */
+  addCameraListener(fn: () => void): () => void {
+    this.cameraListeners.add(fn);
+    return () => this.cameraListeners.delete(fn);
+  }
+
+  // ---------------------------------------------------------------- theme / display
+  setTheme(dark: boolean): void {
+    if (dark === this.dark) return;
+    this.dark = dark;
+    this.applyDisplay();
+    this.rebuildGrid(this.design ? this.designBox() : this.lastGridBox);
+  }
+
+  setDisplayStyle(style: DisplayStyle): void {
+    this.display = style;
+    this.applyDisplay();
+  }
+
+  private applyDisplay(): void {
+    const d = this.design;
+    if (!d) return;
+    d.material.wireframe = this.display === 'wireframe';
+    if (this.edges) {
+      this.edges.visible = this.display === 'edges' && this.appearance !== 'hidden';
+      const m = this.edges.material as THREE.LineBasicMaterial;
+      const ghost = this.appearance === 'ghost';
+      m.color.setHex(ghost ? EDGE_HEX[this.dark ? 'ghostDark' : 'ghostLight'] : EDGE_HEX[this.dark ? 'dark' : 'light']);
+      m.opacity = ghost ? 0.35 : 0.9;
+    }
+    this.requestRender();
+  }
+
+  /** Clip the design, reference bodies and density cells with an axis-aligned plane (null: off). */
+  setSection(spec: SectionSpec | null): void {
+    this.section = spec;
+    if (spec) {
+      const box = this.contentBox();
+      const a = 'xyz'.indexOf(spec.axis);
+      const lo = box.min.getComponent(a);
+      const hi = box.max.getComponent(a);
+      const at = lo + (hi - lo) * Math.min(1, Math.max(0, spec.t));
+      const n = new THREE.Vector3();
+      n.setComponent(a, -1); // keep the part below the plane, cut away what is above it
+      this.sectionPlane.set(n, at);
+    }
+    this.requestRender();
+  }
+
+  private applySection(): void {
+    const want = this.section ? this.sectionPlanes : null;
+    const roots: THREE.Object3D[] = [this.density.group];
+    if (this.design) roots.push(this.design.mesh);
+    for (const r of this.refs.values()) roots.push(r.mesh);
+    const seen = new Set<THREE.Material>();
+    for (const root of roots) {
+      root.traverse((o) => {
+        const mat = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
+        if (!mat) return;
+        for (const m of Array.isArray(mat) ? mat : [mat]) {
+          seen.add(m);
+          if (m.clippingPlanes !== want) {
+            m.clippingPlanes = want;
+            m.needsUpdate = true;
+          }
+          if (want) this.clipped.add(m);
+        }
+      });
+    }
+    if (!want) this.clipped.clear();
+    else for (const m of this.clipped) if (!seen.has(m)) this.clipped.delete(m);
   }
 
   private resize(): void {
@@ -242,9 +351,16 @@ export class Viewport {
     pivot.name = 'design-pivot';
     const centre = geometry.boundingBox!.getCenter(new THREE.Vector3());
     pivot.position.copy(centre);
+    // feature edges (dihedral angle > 30 degrees) for the "shaded with edges" display style
+    const edgeMat = new THREE.LineBasicMaterial({ color: EDGE_HEX[this.dark ? 'dark' : 'light'], transparent: true, opacity: 0.9 });
+    this.edges = new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 30), edgeMat);
+    this.edges.name = 'design-edges';
+    this.edges.raycast = () => {}; // picking goes to the faces
+    mesh.add(this.edges);
     this.scene.add(mesh, pivot);
     this.design = { meshId: opts.meshId ?? null, data, geometry, mesh, material, pivot, centre };
     this.appearance = 'solid';
+    this.applyDisplay();
     this.faceHex = new Uint32Array(n).fill(BASE_HEX);
     this.faceNext = new Uint32Array(n);
     this.rebuildGrid(geometry.boundingBox!);
@@ -258,6 +374,11 @@ export class Viewport {
     this.scene.remove(this.design.mesh, this.design.pivot);
     this.design.geometry.dispose();
     this.design.material.dispose();
+    if (this.edges) {
+      this.edges.geometry.dispose();
+      (this.edges.material as THREE.Material).dispose();
+      this.edges = null;
+    }
     this.design = null;
     this.requestRender();
   }
@@ -273,6 +394,7 @@ export class Viewport {
     d.material.opacity = mode === 'ghost' ? 0.1 : 1;
     d.material.depthWrite = mode !== 'ghost';
     d.material.needsUpdate = true;
+    this.applyDisplay();
     this.requestRender();
   }
 
@@ -378,12 +500,13 @@ export class Viewport {
    * Iso view of the design. The orbit target is nudged onto the surface when the bbox centre is
    * empty space (an L-bracket), so the pixel at the viewport centre always lands on geometry.
    */
-  fitCamera(): void {
+  fitCamera(dirIn?: THREE.Vector3): void {
+    this.cancelTween();
     this.resize();
     const box = this.contentBox();
     const centre = box.getCenter(new THREE.Vector3());
     const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 1e-6);
-    const dir = new THREE.Vector3(1, -1.2, 0.8).normalize();
+    const dir = (dirIn ?? new THREE.Vector3(...VIEWS.iso.dir)).clone().normalize();
     const halfFov = THREE.MathUtils.degToRad(this.camera.fov / 2);
     const fitHalf = Math.atan(Math.tan(halfFov) * Math.min(1, this.camera.aspect));
     const dist = (radius / Math.sin(fitHalf)) * 1.1;
@@ -423,6 +546,67 @@ export class Viewport {
     this.requestRender();
   }
 
+  /** Fit everything on screen, looking from the current direction. */
+  fitAll(): void {
+    this.cancelTween();
+    const dir = this.camera.position.clone().sub(this.controls.target);
+    if (dir.lengthSq() < 1e-12) dir.set(...VIEWS.iso.dir);
+    this.fitView(dir.normalize(), this.camera.up.clone(), false);
+  }
+
+  /** Snap (with a short animation) to a standard view of everything on screen. */
+  setView(view: StandardView, animate = true): void {
+    const v = VIEWS[view];
+    this.fitView(new THREE.Vector3(...v.dir).normalize(), new THREE.Vector3(...v.up), animate);
+  }
+
+  private fitView(dir: THREE.Vector3, up: THREE.Vector3, animate: boolean): void {
+    this.cancelTween();
+    const box = this.contentBox();
+    const target = box.getCenter(new THREE.Vector3());
+    const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 1e-6);
+    const halfFov = THREE.MathUtils.degToRad(this.camera.fov / 2);
+    const fitHalf = Math.atan(Math.tan(halfFov) * Math.min(1, this.camera.aspect));
+    const dist = (radius / Math.sin(fitHalf)) * 1.05;
+    const fromTarget = this.controls.target.clone();
+    const fromOffset = this.camera.position.clone().sub(fromTarget);
+    const fromDist = fromOffset.length() || dist;
+    const fromDir = fromOffset.normalize();
+    const place = (k: number) => {
+      const t = k * k * (3 - 2 * k); // smoothstep
+      const d = new THREE.Vector3().copy(fromDir).lerp(dir, t);
+      if (d.lengthSq() < 1e-8) d.copy(dir); // opposite views: jump
+      d.normalize();
+      const dd = fromDist + (dist - fromDist) * t;
+      const tg = fromTarget.clone().lerp(target, t);
+      this.camera.up.copy(up);
+      this.camera.position.copy(tg).addScaledVector(d, dd);
+      this.camera.near = Math.max(dd / 1000, 1e-4);
+      this.camera.far = dd + radius * 20;
+      this.camera.lookAt(tg);
+      this.camera.updateProjectionMatrix();
+      this.controls.target.copy(tg);
+      this.controls.update();
+      this.requestRender();
+    };
+    if (!animate) {
+      place(1);
+      return;
+    }
+    const t0 = performance.now();
+    const step = () => {
+      const k = Math.min(1, (performance.now() - t0) / 280);
+      place(k);
+      this.tween = k < 1 ? requestAnimationFrame(step) : 0;
+    };
+    this.tween = requestAnimationFrame(step);
+  }
+
+  private cancelTween(): void {
+    if (this.tween) cancelAnimationFrame(this.tween);
+    this.tween = 0;
+  }
+
   /** First ray hit on a spiral of NDC offsets around the screen centre (centre itself first). */
   private nearestSurfaceToCentre(): THREE.Vector3 | null {
     const mesh = this.design!.mesh;
@@ -439,25 +623,24 @@ export class Viewport {
     return null;
   }
 
+  private lastGridBox = new THREE.Box3(new THREE.Vector3(-50, -50, 0), new THREE.Vector3(50, 50, 0));
+
   private rebuildGrid(box: THREE.Box3): void {
+    this.lastGridBox = box.clone();
     if (this.grid) {
       this.scene.remove(this.grid);
       this.grid.geometry.dispose();
-    }
-    if (this.axes) {
-      this.scene.remove(this.axes);
-      this.axes.geometry.dispose();
     }
     const size = box.getSize(new THREE.Vector3());
     const span = Math.max(size.x, size.y, size.z, 1e-3);
     const mag = 10 ** Math.floor(Math.log10(span * 2));
     const gridSize = Math.ceil((span * 2) / mag) * mag;
-    this.grid = new THREE.GridHelper(gridSize, 20, 0x3a414c, 0x262b33);
+    const [major, minor] = GRID_HEX[this.dark ? 'dark' : 'light'];
+    this.grid = new THREE.GridHelper(gridSize, 20, major, minor);
     this.grid.rotation.x = Math.PI / 2; // GridHelper lies in XZ; we want XY (Z up)
     this.grid.position.set((box.min.x + box.max.x) / 2, (box.min.y + box.max.y) / 2, box.min.z - span * 0.002);
-    this.axes = new THREE.AxesHelper(span * 0.6);
-    this.axes.position.copy(box.min);
-    this.scene.add(this.grid, this.axes);
+    // no in-scene axes: they ran along the part's edges from box.min; the triad overlay shows orientation
+    this.scene.add(this.grid);
   }
 
   // ---------------------------------------------------------------- reference models
@@ -575,7 +758,15 @@ export class Viewport {
     overlays: OverlayInfo;
     densityColorMode: string;
     densityColorSum: number;
+    viewDir: number[];
+    displayStyle: DisplayStyle;
+    wireframe: boolean;
+    edgesVisible: boolean;
+    section: SectionSpec | null;
+    clippedMaterials: number;
+    dark: boolean;
   } {
+    const dir = this.camera.position.clone().sub(this.controls.target).normalize();
     return {
       renders: this.renderCount,
       designFaces: this.design?.data.nTri ?? 0,
@@ -592,6 +783,13 @@ export class Viewport {
       overlays: this.overlays.describe(),
       densityColorMode: this.density.colorMode,
       densityColorSum: this.density.colorSum(),
+      viewDir: dir.toArray().map((v) => Math.round(v * 1e4) / 1e4),
+      displayStyle: this.display,
+      wireframe: this.design?.material.wireframe ?? false,
+      edgesVisible: !!this.edges?.visible,
+      section: this.section,
+      clippedMaterials: this.clipped.size,
+      dark: this.dark,
     };
   }
 
@@ -602,11 +800,10 @@ export class Viewport {
     return { x: r.left + ((v.x + 1) / 2) * r.width, y: r.top + ((1 - v.y) / 2) * r.height };
   }
 
-  /** Fraction of canvas pixels that differ from the background with grid/axes/gizmo hidden. */
+  /** Fraction of canvas pixels that differ from the (transparent) background with grid/gizmo hidden. */
   coverage(): number {
     const hidden: THREE.Object3D[] = [this.gizmo.getHelper(), this.overlays.group];
     if (this.grid) hidden.push(this.grid);
-    if (this.axes) hidden.push(this.axes);
     const was = hidden.map((o) => o.visible);
     hidden.forEach((o) => (o.visible = false));
     this.renderNow();
@@ -615,10 +812,11 @@ export class Viewport {
     const h = gl.drawingBufferHeight;
     const px = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
-    const ref = [px[0]!, px[1]!, px[2]!];
+    const ref = [px[0]!, px[1]!, px[2]!, px[3]!];
     let diff = 0;
     for (let i = 0; i < px.length; i += 4) {
-      if (Math.abs(px[i]! - ref[0]!) + Math.abs(px[i + 1]! - ref[1]!) + Math.abs(px[i + 2]! - ref[2]!) > 24) diff++;
+      const d = Math.abs(px[i]! - ref[0]!) + Math.abs(px[i + 1]! - ref[1]!) + Math.abs(px[i + 2]! - ref[2]!) + Math.abs(px[i + 3]! - ref[3]!);
+      if (d > 24) diff++;
     }
     hidden.forEach((o, i) => (o.visible = was[i]!));
     this.requestRender();
@@ -628,6 +826,8 @@ export class Viewport {
   dispose(): void {
     this.disposed = true;
     cancelAnimationFrame(this.raf);
+    this.cancelTween();
+    this.cameraListeners.clear();
     this.ro.disconnect();
     this.picker.dispose();
     this.painter.dispose();

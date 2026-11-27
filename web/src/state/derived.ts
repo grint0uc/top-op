@@ -5,8 +5,9 @@ import { queryLabel, selectionFaces } from './query';
 import type { MeshEntry, Prim, State } from './store';
 import { applyPoint, worldBBox, worldView } from './worldMesh';
 
-export const CASE_COLORS = [0xff5a5f, 0xffb020, 0xc77dff, 0x3ddc97, 0x56ccf2, 0xf78fb3];
-export const SUPPORT_COLOR = 0x4f9cf9;
+// load cases: red-orange first, then hues clear of the support teal and the selection blue
+export const CASE_COLORS = [0xf2552c, 0xe8a317, 0xa463f2, 0xe0457b, 0xb86b2e, 0x8a94a6];
+export const SUPPORT_COLOR = 0x12a594;
 
 export const caseColor = (c: number): number => CASE_COLORS[Math.abs(c) % CASE_COLORS.length]!;
 export const cssHex = (c: number): string => `#${c.toString(16).padStart(6, '0')}`;

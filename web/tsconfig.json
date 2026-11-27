@@ -17,5 +17,5 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "include": ["src", "e2e", "mock", "vite.config.ts", "playwright.config.ts"]
+  "include": ["src", "e2e", "shots", "mock", "vite.config.ts", "playwright.config.ts", "playwright.shots.config.ts"]
 }

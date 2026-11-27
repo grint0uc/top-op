@@ -1,7 +1,7 @@
 # Driving top-op from a Claude session
 
 Everything the GUI does is reachable headless: through the MCP server (`topop mcp`, interactive) or
-the CLI (`topop describe`, `topop run`, scripted). Both sit on `topop/agent.py` (`Session`) and share
+the CLI (`topop describe`, `topop run`, `topop struts`, scripted). Both sit on `topop/agent.py` (`Session`) and share
 `TOPOP_DATA_DIR` (default `~/.cache/topop`) with `topop serve`, so a run made here can be opened in the GUI.
 
 ## Setup
@@ -10,6 +10,7 @@ the CLI (`topop describe`, `topop run`, scripted). Both sit on `topop/agent.py` 
 claude mcp add top-op -- uv run --directory /path/to/top-op topop mcp
 ```
 
+After `uv tool install "git+https://github.com/grint0uc/top-op"` (or pipx), `claude mcp add top-op -- topop mcp` is enough.
 Equivalent `.mcp.json` entry: `{"mcpServers": {"top-op": {"command": "uv", "args": ["run", "--directory", "/path/to/top-op", "topop", "mcp"]}}}`.
 Optional `"env": {"TOPOP_DATA_DIR": "/some/dir"}` keeps projects somewhere else. A running `topop serve` on the
 same data dir picks up projects and finished runs made here (and the other way round) without a restart.
@@ -105,6 +106,17 @@ the **B-rep faces** as facets: `id` is the rank by exact area (descending), `bre
 `cylinder` facet with `radius` 6 and no guessing. `{"kind":"facets","facet_ids":[..]}` selects those faces exactly;
 `angle_deg` is ignored, and ids are stable for a given file (they do not renumber like mesh facets). `normal`, `plane`
 and the primitives work on the tessellation as for any mesh. Without the extra, uploading a STEP file fails with the install hint.
+
+## Struts (post-processing)
+
+`generate_struts(run_id)` (CLI `topop struts RUN_DIR`, reading the `run.json` and `density.npz` that `topop run --out RUN_DIR`
+wrote) turns a finished run into round bars with spherical joints, unioned with the keep-in bodies and clipped to the design,
+then voxelizes and FE-solves them. `mode="layout"` (default) is a minimum-volume truss LP over a ground structure of nodes at
+the loads, supports, keep-ins and sampled from the SIMP solid; `mode="skeleton"` follows the medial axis of the solid (for
+results that already look like beams). It reports bars, radii, volume vs the SIMP volume, compliance per load case vs SIMP
+(`compliance_ratio` < 1 is stiffer), `stress_max` and whether the mesh is watertight, and writes `struts.stl`, `struts.json`
+and `struts.png`. A warning that every bar sits at `min_radius` means the target volume is too small for the bar count: raise
+`node_spacing` (CLI `--spacing`) or lower `min_radius`.
 
 ## Pitfalls
 

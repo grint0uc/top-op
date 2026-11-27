@@ -45,9 +45,9 @@ export class Markers {
     };
   }
 
-  /** Where each load arrow starts (diagnostic: lets e2e check the markers follow the design transform). */
+  /** Where each load arrow is anchored, i.e. its tip (diagnostic: lets e2e check the markers follow the design transform). */
   arrowOrigins(): number[][] {
-    return this.arrows.children.map((a) => a.position.toArray().map((v) => Math.round(v * 1e4) / 1e4));
+    return this.arrows.children.map((a) => (a.userData.anchor as THREE.Vector3).toArray().map((v) => Math.round(v * 1e4) / 1e4));
   }
 
   setPoints(xyz: Float32Array | null, color = 0xffd23f): void {
@@ -77,12 +77,21 @@ export class Markers {
       const dir = new THREE.Vector3(...(it.force as [number, number, number]));
       if (dir.lengthSq() === 0) continue;
       dir.normalize();
-      const arrow = new THREE.ArrowHelper(dir, new THREE.Vector3(...it.at), len, it.color, len * 0.35, len * 0.2);
+      // CAD convention: a solid arrow pointing at the region, its tip on the anchor
+      const anchor = new THREE.Vector3(...it.at);
+      const arrow = new THREE.Group();
       arrow.name = `load:${it.id}`;
-      for (const part of [arrow.line, arrow.cone]) {
-        (part.material as THREE.Material).depthTest = false;
-        part.renderOrder = 6;
-      }
+      arrow.userData.anchor = anchor;
+      arrow.position.copy(anchor).addScaledVector(dir, -len);
+      arrow.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+      const mat = new THREE.MeshBasicMaterial({ color: it.color, depthTest: false });
+      const head = len * 0.32;
+      const shaft = new THREE.Mesh(new THREE.CylinderGeometry(len * 0.035, len * 0.035, len - head, 10), mat);
+      shaft.position.y = (len - head) / 2;
+      const cone = new THREE.Mesh(new THREE.ConeGeometry(len * 0.11, head, 18), mat.clone());
+      cone.position.y = len - head / 2;
+      for (const part of [shaft, cone]) part.renderOrder = 6;
+      arrow.add(shaft, cone);
       this.arrows.add(arrow);
     }
     this.vp.requestRender();
@@ -93,15 +102,31 @@ export class Markers {
     this.clear(this.glyphs);
     const h = this.scale * 0.05;
     for (const it of items) {
-      const cone = new THREE.Mesh(
-        new THREE.ConeGeometry(h * 0.6, h, 14),
-        new THREE.MeshBasicMaterial({ color: it.color, depthTest: false }),
+      // fixture symbol: a cone touching the support centroid from below, standing on a hatched ground plate
+      const glyph = new THREE.Group();
+      glyph.name = `support:${it.id}`;
+      glyph.position.set(it.at[0], it.at[1], it.at[2]);
+      const cone = new THREE.Mesh(new THREE.ConeGeometry(h * 0.6, h, 16), new THREE.MeshBasicMaterial({ color: it.color, depthTest: false }));
+      cone.rotation.x = Math.PI / 2; // apex towards +Z
+      cone.position.z = -h / 2;
+      const plate = new THREE.Mesh(
+        new THREE.CylinderGeometry(h * 0.95, h * 0.95, h * 0.08, 24),
+        new THREE.MeshBasicMaterial({ color: it.color, depthTest: false, transparent: true, opacity: 0.55 }),
       );
-      cone.name = `support:${it.id}`;
-      cone.rotation.x = Math.PI / 2; // apex towards +Z, touching the support centroid from below
-      cone.position.set(it.at[0], it.at[1], it.at[2] - h / 2);
-      cone.renderOrder = 6;
-      this.glyphs.add(cone);
+      plate.rotation.x = Math.PI / 2;
+      plate.position.z = -h * 1.04;
+      const hatch: number[] = [];
+      for (let k = -2; k <= 2; k++) {
+        const x = k * h * 0.4;
+        hatch.push(x, 0, -h * 1.08, x - h * 0.3, 0, -h * 1.4);
+      }
+      const lines = new THREE.LineSegments(
+        new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(hatch, 3)),
+        new THREE.LineBasicMaterial({ color: it.color, depthTest: false }),
+      );
+      for (const part of [cone, plate, lines]) part.renderOrder = 6;
+      glyph.add(cone, plate, lines);
+      this.glyphs.add(glyph);
     }
     this.vp.requestRender();
   }

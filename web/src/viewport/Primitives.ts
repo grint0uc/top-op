@@ -112,7 +112,7 @@ export class Primitives {
     }
     if (!this.active || this.active.prim.kind !== prim.kind) {
       this.setActive(null);
-      const group = makePrimitiveHelper(prim.kind, 0xffa534, 0.2);
+      const group = makePrimitiveHelper(prim.kind, 0x1f78ff, 0.2);
       this.root.add(group);
       this.active = { group, prim };
       setPrimitivePose(group, prim);

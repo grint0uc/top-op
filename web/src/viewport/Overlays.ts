@@ -31,7 +31,7 @@ const extentOf = (pts: THREE.Vector3[]): Extent => ({
   max: [0, 1, 2].map((k) => Math.max(...pts.map((p) => p.getComponent(k)))),
 });
 
-const PLANE_HEX = { x: 0xff5a5f, y: 0x3ddc97, z: 0x4f9cf9 } as const;
+const PLANE_HEX = { x: 0xe5484d, y: 0x2f9e44, z: 0x2f7bf6 } as const;
 const AM_HEX = 0xffd23f;
 const AXES = ['x', 'y', 'z'] as const;
 

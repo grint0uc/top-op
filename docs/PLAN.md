@@ -366,3 +366,18 @@ regression tests (414 tests, incl. slow):
 Still open: `estimate_bytes` counts active elements only (full-grid filter arrays of a sparse part in a
 large box are not counted); malformed STEP could crash OCC in-process (tessellate in a subprocess if it
 ever matters); the v0.1 tag exists only locally.
+
+## Status (v0.3)
+
+Version 0.3.0, the first public release (MIT, `CHANGELOG.md` has the per-version notes).
+
+| Area | Status |
+|------|--------|
+| Struts | `core/struts.py`: minimum-volume truss layout LP (HiGHS, multi-case, retried with more candidate bars when the capped set is infeasible) and medial-axis skeleton; capsule meshing unioned with keep-ins, FE verification against the SIMP result. Exposed as `topop struts`, MCP `generate_struts`, `Session.generate_struts`, `POST /api/runs/{id}/struts` + `GET .../struts.stl`. |
+| GUI | CAD-style workbench: ribbon with workflow tabs (Model, Boundary Conditions, Domain, Optimize, Results), feature tree, property pages, status bar, light and dark themes. Screenshots in `docs/img/gui-*.png`. |
+| Lite | `lite/`: single-page in-browser version (STL import, face selection, keep boxes, OC SIMP in a Web Worker, STL export, about 40k elements max), for trying top-op without installing. Hosted link still to be added to the README. |
+| Release | `LICENSE` (MIT), package metadata in `pyproject.toml` (the wheel ships `topop/server/static`), `CONTRIBUTING.md`, issue and PR templates, `.github/workflows/release.yml` (tag `v*` -> build, GitHub release with wheel + sdist, notes from the changelog section). Install from git with `uv tool install`, `pipx` or `pip`. |
+
+Still open: no PyPI upload (GitHub releases only); no version tags exist (the local v0.1 tag noted
+above is gone and 0.2.0 was never tagged; `v0.3.0` will be the first); macOS and Windows are not exercised in
+CI; the open points of the v0.3 review round above still apply.

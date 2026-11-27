@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { type APIResponse, type Page, expect, test } from '@playwright/test';
-import { BRACKET, selectFlatFaceAtCentre, state, viewportStats } from './helpers';
+import { BRACKET, openPage, selectFlatFaceAtCentre, state, viewportStats } from './helpers';
 
 test.describe.configure({ mode: 'serial', timeout: 120_000 });
 
@@ -65,6 +65,7 @@ test('1. upload bracket.stl: content-hash id, watertight MeshInfo, mesh in the v
 });
 
 test('2. resolution 24: VoxelStats come from the server', async () => {
+  await openPage(page, 'domain');
   await page.getByTestId('domain-elements').fill('24');
   // (the default 60-element grid is voxelized first; the debounced request for 24 replaces it)
   await expect.poll(() => state(page, (s) => s.voxel.stats?.nx ?? 0), { timeout: 30_000 }).toBe(26);
@@ -176,12 +177,13 @@ test('4. load from the normal query: +Z inside a box over the wall top, force (0
   const row = page.getByTestId('load-row').first();
   await expect(row).toContainText('normal +Z');
   await expect(row).toContainText('in box');
-  await row.getByTestId('force-z').fill('-100');
+  await expect(row).toHaveAttribute('aria-selected', 'true'); // the new load's page holds its fields
+  await page.getByTestId('force-z').fill('-100');
   await expect.poll(() => state(page, (s) => s.project.loads[0]?.force)).toEqual([0, 0, -100]);
   await expect.poll(async () => (await viewportStats(page)).arrows).toBe(1); // arrow anchored at the matching faces
 
   // resolve the stored load: same nodes as the query itself
-  await row.getByTestId('item-preview').click();
+  await page.getByTestId('item-preview').click();
   await expect.poll(() => state(page, (s) => s.preview?.source ?? '')).toContain('Load');
   expect(await state(page, (s) => s.preview!.count)).toBe(nodes);
   expect(await state(page, (s) => s.preview!.xyz.length / 3)).toBeGreaterThan(0);
@@ -202,6 +204,7 @@ test('4. load from the normal query: +Z inside a box over the wall top, force (0
 
 test('5. keep-out cylinder through the plate: the full matrix (with scale) reaches the voxelizer', async () => {
   await page.getByTestId('mode-orbit').click();
+  await openPage(page, 'refs');
   await page.getByTestId('add-ref-cylinder').click();
   await expect.poll(() => state(page, (s) => s.project.ref_models.length)).toBe(1);
   await expect.poll(async () => (await viewportStats(page)).refs).toBe(1);
@@ -237,6 +240,7 @@ test('5. keep-out cylinder through the plate: the full matrix (with scale) reach
 });
 
 test('6. run 8 iterations behind another run: queued -> started with stats -> progress, density, done', async () => {
+  await openPage(page, 'study');
   await page.getByTestId('p-max-iter').fill('8');
   await page.getByTestId('p-density-every').fill('1');
   expect(await state(page, (s) => [s.project.params.max_iter, s.project.params.density_every])).toEqual([8, 1]);
@@ -329,6 +333,7 @@ test('6. run 8 iterations behind another run: queued -> started with stats -> pr
   // the loaded wall (x in 0..10, top at z = 60) is still there after 8 iterations
   const s0 = await viewportStats(page);
   expect(s0.densityCount).toBeGreaterThan(0);
+  await openPage(page, 'results');
   await page.getByTestId('threshold').fill('0.05');
   const s1 = await viewportStats(page);
   expect(s1.densityMode).toBe('instanced');
@@ -443,6 +448,7 @@ test('9. Load project.json (RunExport): document restored, meshes fetched by id,
   await expect.poll(async () => (await viewportStats(page)).refs).toBe(1);
 
   // run history from the file, and the run is still on the server so Results works
+  await openPage(page, 'results');
   await expect(page.getByTestId('loaded-run')).toBeVisible();
   await expect(page.getByTestId('loaded-run-iters')).toHaveText('8');
   await expect(page.getByTestId('loaded-run-attached')).toBeVisible();
@@ -470,6 +476,7 @@ test('10. a project.json whose mesh the server does not know asks for a re-uploa
   await expect(page.getByTestId('reupload-notice')).toBeVisible();
   const row = page.getByTestId('required-mesh').first();
   await expect(row).toHaveAttribute('data-mesh-id', fake);
+  await openPage(page, 'results');
   await expect(page.getByTestId('loaded-run-gone')).toBeVisible(); // that run id is unknown to the server
   expect(await state(page, (s) => [s.project.loads.length, s.project.supports.length])).toEqual([1, 1]);
 
@@ -486,6 +493,7 @@ test('11. Stop cancels a running job; the partial result is exportable', async (
   await page.getByTestId('project-file-input').setInputFiles({ name: 'project.json', mimeType: 'application/json', buffer: Buffer.from(ctx.projectJson) });
   await expect.poll(() => state(page, (s) => [s.project.loads.length, s.project.supports.length])).toEqual([1, 1]);
   await expect.poll(() => state(page, (s) => Object.keys(s.meshes).length), { timeout: 30_000 }).toBe(2);
+  await openPage(page, 'study');
   await page.getByTestId('p-max-iter').fill('400');
   await page.getByTestId('p-tol').fill('0.000001'); // a fast runner must not converge to `done` before Stop is clicked
   await page.getByTestId('run-start').click();
@@ -514,6 +522,7 @@ test('12. the built app is also served by the API server itself', async () => {
 
 test('13. v0.2 params: symmetry y + overhang +z + max_iter 4 -> the progress frames carry a numeric stress_max', async () => {
   await page.getByTestId('mode-orbit').click();
+  await openPage(page, 'study');
   await page.getByTestId('sym-add').click();
   await page.getByTestId('sym-row').first().getByTestId('sym-axis').selectOption('y'); // the bracket, its loads and the keep-out are symmetric about y = 30
   await page.getByTestId('p-overhang').selectOption('+z');
@@ -559,6 +568,7 @@ test('14. Color by stress fetches /stress (12 + 4*nx*ny*nz bytes) and recolours 
   const before = await viewportStats(page);
   expect(before.densityColorMode).toBe('density');
   expect(before.densityCount).toBeGreaterThan(0);
+  await openPage(page, 'results');
 
   const reply = page.waitForResponse((r) => /\/api\/runs\/[^/]+\/stress$/.test(r.url()));
   await page.getByTestId('color-stress').check();
@@ -646,6 +656,7 @@ test('16. facet list: the 12 mm hole is a cylinder facet (radius ~6) and its hig
 test('17. translate the design mesh by (10, 0, 0): the voxel grid origin follows by ~10 and the pose reaches the server', async () => {
   await expect.poll(() => state(page, (s) => s.voxel.stats?.origin[0] ?? null), { timeout: 60_000 }).not.toBeNull();
   const x0 = (await state(page, (s) => s.voxel.stats!.origin[0]))!;
+  await openPage(page, 'part');
   await expect(page.getByTestId('design-transform')).toBeVisible();
   await page.getByTestId('design-pos-x').fill('10');
   await expect.poll(() => state(page, (s) => s.voxel.stats!.origin[0]!), { timeout: 60_000 }).toBeGreaterThan(x0 + 9);
