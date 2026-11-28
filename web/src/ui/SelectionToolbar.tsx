@@ -54,6 +54,7 @@ function PrimitiveFields({ prim }: { prim: Prim }) {
           <NumField
             key={a}
             value={pos[k]!}
+            label={`Region position ${a}`}
             testId={`prim-pos-${a}`}
             onChange={(v) =>
               setPrimitive({
@@ -74,6 +75,7 @@ function PrimitiveFields({ prim }: { prim: Prim }) {
             key={a}
             value={rot[k]!}
             step={5}
+            label={`Region rotation ${a} (degrees)`}
             testId={`prim-rot-${a}`}
             onChange={(v) =>
               setPrimitive({
@@ -90,7 +92,15 @@ function PrimitiveFields({ prim }: { prim: Prim }) {
       <div className="prim-row">
         <span>size</span>
         {sizeFields.map((f) => (
-          <NumField key={f.label} value={prim.size[f.idx]!} min={1e-6} testId={`prim-size-${f.label}`} title={f.label} onChange={(v) => setSize(f.idx, v)} />
+          <NumField
+            key={f.label}
+            value={prim.size[f.idx]!}
+            min={1e-6}
+            label={`Region size ${f.label}`}
+            testId={`prim-size-${f.label}`}
+            title={f.label}
+            onChange={(v) => setSize(f.idx, v)}
+          />
         ))}
       </div>
     </div>
@@ -144,7 +154,8 @@ export function SelectionToolbar() {
               onClick={() => setTool(m.id)}
               data-testid={`mode-${m.id}`}
               title={`${m.label}: ${m.hint} [${m.key}]`}
-              aria-label={m.label}
+              aria-label={`${m.label} ${m.key}`}
+              aria-keyshortcuts={m.key}
               disabled={!hasDesign && m.id !== 'orbit' && m.id !== 'gizmo'}
             >
               <Icon name={m.icon} size={15} />
@@ -199,6 +210,7 @@ export function SelectionToolbar() {
                   onClick={() => setGizmoMode(m)}
                   data-testid={`toolbar-gizmo-${m}`}
                   title={`Key ${m[0]}`}
+                  aria-keyshortcuts={m[0]}
                 >
                   {m} <kbd>{m[0]}</kbd>
                 </button>

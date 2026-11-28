@@ -21,6 +21,8 @@ export interface ContextMenuState {
   x: number;
   y: number;
   items: { label: string; testId?: string; danger?: boolean; disabled?: boolean; run: () => void }[];
+  /** where focus goes back when the menu closes (the row or button that opened it) */
+  returnFocus?: HTMLElement | null;
 }
 
 interface UiState {
@@ -35,6 +37,9 @@ interface UiState {
   /** item id being renamed inline in the tree */
   renaming: string | null;
   menu: ContextMenuState | null;
+  /** single-character hotkeys (1-5, g/r/s, f); WCAG 2.1.4 wants a way to turn them off */
+  shortcuts: boolean;
+  setShortcuts: (on: boolean) => void;
   setThemePref: (t: ThemePref) => void;
   setTab: (t: RibbonTab) => void;
   /** Open a property page: clears the active item (its page would win otherwise) and follows with the ribbon tab. */
@@ -47,6 +52,15 @@ interface UiState {
 }
 
 const THEME_KEY = 'topop.ui.theme';
+const SHORTCUTS_KEY = 'topop.ui.shortcuts';
+
+function readShortcuts(): boolean {
+  try {
+    return localStorage.getItem(SHORTCUTS_KEY) !== 'off';
+  } catch {
+    return true;
+  }
+}
 
 function readThemePref(): ThemePref {
   try {
@@ -94,6 +108,16 @@ export const useUi = create<UiState>()((set) => ({
   folded: {},
   renaming: null,
   menu: null,
+  shortcuts: readShortcuts(),
+  setShortcuts: (shortcuts) => {
+    try {
+      if (shortcuts) localStorage.removeItem(SHORTCUTS_KEY);
+      else localStorage.setItem(SHORTCUTS_KEY, 'off');
+    } catch {
+      // storage blocked: the choice lasts for this page only
+    }
+    set({ shortcuts });
+  },
   setThemePref: (themePref) => {
     try {
       if (themePref === 'system') localStorage.removeItem(THEME_KEY);

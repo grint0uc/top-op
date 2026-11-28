@@ -47,6 +47,11 @@ function useViewportUi(vp: Viewport | null): void {
 function Welcome() {
   const hasDesign = useStore((s) => !!s.project.design_mesh?.mesh_id);
   const busy = useStore((s) => s.busy);
+  // the welcome card (and the button that imported) goes away: keep keyboard focus on the page, on the Design body page
+  useEffect(() => {
+    if (hasDesign && (document.activeElement === document.body || document.activeElement === null))
+      document.querySelector<HTMLElement>('[data-testid="pm-title"]')?.focus();
+  }, [hasDesign]);
   if (hasDesign) return null;
   return (
     <div className="welcome" data-testid="welcome">
@@ -107,7 +112,13 @@ export function ViewportHost({ dropping }: { dropping: boolean }) {
 
   return (
     <div className="viewport">
-      <canvas id="viewport" ref={ref} />
+      <canvas id="viewport" ref={ref} role="img" aria-label="3D viewport" aria-describedby="viewport-help" />
+      <p id="viewport-help" className="visually-hidden">
+        {hasMesh ? HINTS[tool] : 'Import an STL or STEP file to begin.'} Without a mouse: the View toolbar (fit, standard
+        views, display style, section) and the view cube's Isometric button change the view; the selection toolbar's Query
+        tool (normal, plane or facet selections) and its Box, Sphere and Cylinder regions select faces and nodes for loads
+        and supports.
+      </p>
       <SelectionToolbar />
       <NoticeBar />
       {!missing && <Welcome />}

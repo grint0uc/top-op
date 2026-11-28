@@ -1,6 +1,20 @@
 // Specification tree: the project as features. Group nodes open their property page; item rows (loads, supports,
 // reference bodies) activate the item. Right-click (or the row's menu button) opens a context menu; double-click renames.
-import { type MouseEvent, type ReactNode, useEffect, useRef } from 'react';
+// Keyboard: the WAI-ARIA tree pattern (one tab stop, arrows move / fold, Enter or Space opens, F2 renames, Shift+F10 or
+// the Menu key opens the row's actions).
+import {
+  createContext,
+  type KeyboardEvent,
+  type MouseEvent,
+  type ReactNode,
+  useCallback,
+  useContext,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import type { Selection } from '../api/client';
 import { reselect, resolvePreview } from '../state/actions';
 import { designEntry } from '../state/derived';
@@ -10,7 +24,24 @@ import { caseColor, SUPPORT_COLOR, selectionLabel } from './ItemRows';
 import { fixLabel } from './SupportsPanel';
 import { RefIcon, modeLabel } from './RefModelsPanel';
 import { cssHex } from '../state/derived';
+import { menuKeys, trapTab } from './a11y';
 import { type ContextMenuState, type PageId, useUi } from './uiStore';
+
+/** Roving tabindex: the key of the one treeitem in the tab order. */
+const TreeFocus = createContext<{ current: string | null; set: (k: string) => void }>({ current: null, set: () => {} });
+
+function useTreeItem(key: string, level: number) {
+  const f = useContext(TreeFocus);
+  return {
+    role: 'treeitem',
+    'aria-level': level,
+    'data-key': key,
+    tabIndex: f.current === key ? 0 : -1,
+    onFocus: (e: { target: EventTarget; currentTarget: EventTarget }) => {
+      if (e.target === e.currentTarget) f.set(key);
+    },
+  } as const;
+}
 
 function GroupNode({
   id,
@@ -32,14 +63,29 @@ function GroupNode({
   const hasItem = useStore((s) => s.activeItem !== null && s.activeItem.kind !== 'design');
   const { openPage, toggleFold } = useUi.getState();
   const selected = page === id && !hasItem;
+  const item = useTreeItem(`group:${id}`, 1);
+  const groupId = useId();
+  const open = !!children && !folded;
+  // the row is the treeitem (its name is the row's text only) and owns the child group next to it
   return (
-    <li className="tree-group" role="treeitem" aria-expanded={children ? !folded : undefined} aria-selected={selected}>
-      <div className={`tree-row group-row ${selected ? 'selected' : ''}`} data-testid={`tree-${id}`} onClick={() => openPage(id)}>
+    <li className="tree-group" role="none">
+      <div
+        className={`tree-row group-row ${selected ? 'selected' : ''}`}
+        {...item}
+        aria-expanded={children ? !folded : undefined}
+        aria-selected={selected}
+        aria-owns={open ? groupId : undefined}
+        data-fold={children ? id : undefined}
+        data-testid={`tree-${id}`}
+        onClick={() => openPage(id)}
+      >
         {children ? (
           <button
             type="button"
+            tabIndex={-1}
+            aria-hidden="true" // mouse affordance: keyboard users fold with the arrow keys, aria-expanded tells the state
             className={`tree-caret ${folded ? '' : 'open'}`}
-            aria-label={folded ? 'Expand' : 'Collapse'}
+            aria-label={`${folded ? 'Expand' : 'Collapse'} ${label}`}
             data-testid={`tree-fold-${id}`}
             onClick={(e) => {
               e.stopPropagation();
@@ -58,8 +104,8 @@ function GroupNode({
         {detail}
         {count !== undefined && <span className="count">{count}</span>}
       </div>
-      {children && !folded && (
-        <ul className="tree-children" role="group">
+      {open && (
+        <ul className="tree-children" role="group" id={groupId}>
           {children}
         </ul>
       )}
@@ -67,26 +113,33 @@ function GroupNode({
   );
 }
 
-function InfoRow({ children, page, testId }: { children: ReactNode; page: PageId; testId?: string }) {
+function InfoRow({ children, page, testId, itemKey }: { children: ReactNode; page: PageId; testId?: string; itemKey: string }) {
+  const item = useTreeItem(itemKey, 2);
   return (
-    <li className="tree-row info-row" role="treeitem" onClick={() => useUi.getState().openPage(page)} data-testid={testId}>
+    <li className="tree-row info-row" {...item} onClick={() => useUi.getState().openPage(page)} data-testid={testId}>
       {children}
     </li>
   );
 }
 
 /** Inline rename: Enter or blur commits, Esc cancels. */
-function RenameInput({ value, onCommit }: { value: string; onCommit: (v: string) => void }) {
+function RenameInput({ value, onCommit, label }: { value: string; onCommit: (v: string) => void; label: string }) {
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => {
     ref.current?.focus();
     ref.current?.select();
   }, []);
-  const done = () => useUi.getState().setRenaming(null);
+  // focus goes back to the row (Enter / Esc), not to the page body
+  const done = (refocus: boolean) => {
+    const li = ref.current?.closest<HTMLElement>('[role="treeitem"]');
+    useUi.getState().setRenaming(null);
+    if (refocus) li?.focus({ preventScroll: true });
+  };
   return (
     <input
       ref={ref}
       className="text tree-rename"
+      aria-label={label}
       defaultValue={value}
       data-testid="tree-rename"
       onClick={(e) => e.stopPropagation()}
@@ -94,12 +147,13 @@ function RenameInput({ value, onCommit }: { value: string; onCommit: (v: string)
         e.stopPropagation();
         if (e.key === 'Enter') {
           onCommit(e.currentTarget.value);
-          done();
-        } else if (e.key === 'Escape') done();
+          done(true);
+        } else if (e.key === 'Escape') done(true);
       }}
       onBlur={(e) => {
+        if (!useUi.getState().renaming) return; // Enter / Esc already finished
         onCommit(e.currentTarget.value);
-        done();
+        done(false);
       }}
     />
   );
@@ -123,17 +177,38 @@ interface ItemRowProps {
 
 function ItemRow({ id, testId, name, active, glyph, detail, tag, onActivate, onRename, menu, extra, warn }: ItemRowProps) {
   const renaming = useUi((s) => s.renaming === id);
-  const openMenu = (e: MouseEvent, x?: number, y?: number) => {
+  const item = useTreeItem(`item:${id}`, 2);
+  const row = useRef<HTMLLIElement>(null);
+  const openMenu = (e: MouseEvent | KeyboardEvent, x?: number, y?: number) => {
     e.preventDefault();
     e.stopPropagation();
-    useUi.getState().setMenu({ x: x ?? e.clientX, y: y ?? e.clientY, items: menu() });
+    const at = 'clientX' in e ? { x: e.clientX, y: e.clientY } : { x: 0, y: 0 };
+    useUi.getState().setMenu({ x: x ?? at.x, y: y ?? at.y, items: menu(), returnFocus: row.current });
+  };
+  const onKey = (e: KeyboardEvent<HTMLLIElement>) => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key === 'F2') {
+      e.preventDefault();
+      useUi.getState().setRenaming(id);
+    } else if (e.key === 'Delete') {
+      // the focused row, not whichever item happens to be active
+      e.preventDefault();
+      menu()
+        .find((m) => m.testId === 'ctx-delete')
+        ?.run();
+    } else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+      const r = e.currentTarget.getBoundingClientRect();
+      openMenu(e, r.left + 24, r.bottom);
+    }
   };
   return (
     <li
+      ref={row}
       className={`tree-row item-row ${active ? 'selected' : ''}`}
-      role="treeitem"
+      {...item}
       aria-selected={active}
       data-testid={testId}
+      onKeyDown={onKey}
       onClick={onActivate}
       onDoubleClick={(e) => {
         e.stopPropagation();
@@ -145,7 +220,11 @@ function ItemRow({ id, testId, name, active, glyph, detail, tag, onActivate, onR
       <span className="tree-caret" />
       {glyph}
       <span className="tree-text grow">
-        {renaming ? <RenameInput value={name} onCommit={(v) => v.trim() && onRename(v.trim())} /> : <span className="tree-label ellipsis">{name}</span>}
+        {renaming ? (
+          <RenameInput value={name} label={`Rename ${name}`} onCommit={(v) => v.trim() && onRename(v.trim())} />
+        ) : (
+          <span className="tree-label ellipsis">{name}</span>
+        )}
         <span className="tree-detail ellipsis">{detail}</span>
       </span>
       {warn && (
@@ -155,10 +234,13 @@ function ItemRow({ id, testId, name, active, glyph, detail, tag, onActivate, onR
       )}
       {tag}
       {extra}
+      {/* mouse affordances (hidden from the name): keyboard users press Shift+F10 / Menu on the row */}
       <button
         type="button"
+        tabIndex={-1}
+        aria-hidden="true"
         className="tree-more"
-        aria-label="More actions"
+        aria-label={`More actions for ${name}`}
         data-testid="tree-more"
         onClick={(e) => {
           const r = e.currentTarget.getBoundingClientRect();
@@ -208,6 +290,73 @@ export function FeatureTree() {
   const setRenaming = useUi((s) => s.setRenaming);
   const isActive = (kind: string, id: string) => active?.kind === kind && active.id === id;
   const memoName = designRef?.mesh_id ? memo[designRef.mesh_id]?.name : undefined;
+  const list = useRef<HTMLUListElement>(null);
+  const [focusKey, setFocusKey] = useState<string | null>(null);
+  const lastFocused = useRef<string | null>(null);
+  const setKey = useCallback((k: string) => {
+    lastFocused.current = k;
+    setFocusKey(k);
+  }, []);
+
+  // keep exactly one treeitem in the tab order (the focused one, else the selected one, else the first); when the
+  // focused row went away (deleted, folded), focus moves to that fallback instead of dropping to <body>
+  useLayoutEffect(() => {
+    const ul = list.current;
+    if (!ul) return;
+    if (ul.querySelector('[role="treeitem"][tabindex="0"]')) return;
+    const pick = ul.querySelector<HTMLElement>('[role="treeitem"][aria-selected="true"]') ?? ul.querySelector<HTMLElement>('[role="treeitem"]');
+    const key = pick?.dataset.key;
+    if (!pick || !key) return;
+    const lost = lastFocused.current !== null && !ul.querySelector(`[data-key="${CSS.escape(lastFocused.current)}"]`);
+    setFocusKey(key);
+    if (lost && (document.activeElement === document.body || document.activeElement === null)) {
+      lastFocused.current = key;
+      pick.focus({ preventScroll: true });
+    }
+  });
+
+  const onKeyDown = (e: KeyboardEvent<HTMLUListElement>) => {
+    const t = e.target as HTMLElement;
+    if (e.defaultPrevented || t.getAttribute('role') !== 'treeitem' || e.altKey || e.ctrlKey || e.metaKey) return;
+    const items = [...(list.current?.querySelectorAll<HTMLElement>('[role="treeitem"]') ?? [])];
+    const i = items.indexOf(t);
+    const expanded = t.getAttribute('aria-expanded');
+    const fold = t.dataset.fold as PageId | undefined;
+    const go = (el: HTMLElement | null | undefined) => el?.focus();
+    switch (e.key) {
+      case 'ArrowDown':
+        go(items[i + 1]);
+        break;
+      case 'ArrowUp':
+        go(items[i - 1]);
+        break;
+      case 'Home':
+        go(items[0]);
+        break;
+      case 'End':
+        go(items[items.length - 1]);
+        break;
+      case 'ArrowRight': {
+        const owned = t.getAttribute('aria-owns');
+        if (expanded === 'false' && fold) useUi.getState().toggleFold(fold);
+        else if (expanded === 'true' && owned) go(document.getElementById(owned)?.querySelector<HTMLElement>('[role="treeitem"]'));
+        break;
+      }
+      case 'ArrowLeft': {
+        const group = t.closest<HTMLElement>('[role="group"]');
+        if (expanded === 'true' && fold) useUi.getState().toggleFold(fold);
+        else if (group) go(list.current?.querySelector<HTMLElement>(`[aria-owns="${CSS.escape(group.id)}"]`));
+        break;
+      }
+      case 'Enter':
+      case ' ':
+        t.click();
+        break;
+      default:
+        return;
+    }
+    e.preventDefault();
+  };
 
   return (
     <nav className="tree" aria-label="Feature tree" data-testid="feature-tree">
@@ -215,169 +364,187 @@ export function FeatureTree() {
         <Icon name="project" size={15} />
         <span className="ellipsis grow">{name || 'untitled'}</span>
       </div>
-      <ul className="tree-list" role="tree">
-        <GroupNode id="part" icon="part" label="Design body">
-          {design ? (
-            <InfoRow page="part" testId="tree-design">
+      <p className="visually-hidden" id="tree-help">
+        Arrow keys move and fold, Enter opens, F2 renames, Shift+F10 opens the actions menu, Delete removes the row's item.
+      </p>
+      <TreeFocus.Provider value={{ current: focusKey, set: setKey }}>
+        <ul className="tree-list" role="tree" aria-label="Feature tree" aria-describedby="tree-help" ref={list} onKeyDown={onKeyDown}>
+          <GroupNode id="part" icon="part" label="Design body">
+            {design ? (
+              <InfoRow page="part" testId="tree-design" itemKey="info:design">
+                <span className="tree-caret" />
+                <span className="tree-glyph accent">
+                  <Icon name="part" size={14} />
+                </span>
+                <span className="tree-text grow">
+                  <span className="tree-label ellipsis">{design.info.name}</span>
+                  <span className="tree-detail">
+                    {design.info.n_faces.toLocaleString()} faces{design.info.source === 'step' ? ' · STEP' : ''}
+                  </span>
+                </span>
+              </InfoRow>
+            ) : (
+              <InfoRow page="part" itemKey="info:design">
+                <span className="tree-caret" />
+                <span className="tree-detail">{designRef?.mesh_id ? `${memoName ?? designRef.mesh_id} (not loaded)` : 'not imported'}</span>
+              </InfoRow>
+            )}
+          </GroupNode>
+          <GroupNode id="refs" icon="ref" label="Reference bodies" count={refs.length}>
+            {refs.map((r) => (
+              <ItemRow
+                key={r.id}
+                id={r.id}
+                testId="ref-row"
+                name={r.name || r.id}
+                active={isActive('ref', r.id)}
+                glyph={<RefIcon r={r} />}
+                detail={modeLabel(r)}
+                warn={r.mesh_id && meshes[r.mesh_id] ? undefined : 'Geometry missing: re-upload'}
+                onActivate={() => {
+                  st.setActiveItem({ kind: 'ref', id: r.id });
+                  st.setTool('gizmo');
+                }}
+                onRename={(n) => st.updateRef(r.id, { name: n })}
+                extra={
+                  <label
+                    className={`tree-eye ${r.visible ? '' : 'off'}`}
+                    title={r.visible ? 'Hide' : 'Show'}
+                    aria-hidden="true"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    {/* mouse shortcut; keyboard users get Hide / Show in the row's menu (Shift+F10) */}
+                    <input
+                      type="checkbox"
+                      tabIndex={-1}
+                      aria-label={`Visible: ${r.name || r.id}`}
+                      checked={r.visible}
+                      data-testid="ref-visible"
+                      onChange={(e) => st.updateRef(r.id, { visible: e.target.checked })}
+                    />
+                    <Icon name={r.visible ? 'eye' : 'hide'} size={14} />
+                  </label>
+                }
+                menu={() => [
+                  { label: 'Rename', testId: 'ctx-rename', run: () => setRenaming(r.id) },
+                  { label: r.visible ? 'Hide' : 'Show', testId: 'ctx-visibility', run: () => st.updateRef(r.id, { visible: !r.visible }) },
+                  {
+                    label: r.mode === 'keep_in' ? 'Make keep-out' : 'Make keep-in',
+                    testId: 'ctx-mode',
+                    run: () => st.updateRef(r.id, { mode: r.mode === 'keep_in' ? 'keep_out' : 'keep_in' }),
+                  },
+                  { label: 'Delete', testId: 'ctx-delete', danger: true, run: () => st.removeRef(r.id) },
+                ]}
+              />
+            ))}
+          </GroupNode>
+          <GroupNode id="loads" icon="force" label="Loads" count={loads.length}>
+            {loads.map((l) => (
+              <ItemRow
+                key={l.id}
+                id={l.id}
+                testId="load-row"
+                name={l.name || l.id}
+                active={isActive('load', l.id)}
+                glyph={
+                  <span className="tree-glyph" style={{ color: cssHex(caseColor(l.case)) }}>
+                    <Icon name="force" size={14} />
+                  </span>
+                }
+                detail={selectionLabel(l.selection)}
+                tag={<span className="tree-tag">C{l.case}</span>}
+                onActivate={() => st.setActiveItem({ kind: 'load', id: l.id })}
+                onRename={(n) => st.updateLoad(l.id, { name: n })}
+                menu={() => [
+                  { label: 'Rename', testId: 'ctx-rename', run: () => setRenaming(l.id) },
+                  ...selectionMenu(l.selection, l.name || l.id, (selection) => st.updateLoad(l.id, { selection })),
+                  { label: 'Delete', testId: 'ctx-delete', danger: true, run: () => st.removeLoad(l.id) },
+                ]}
+              />
+            ))}
+          </GroupNode>
+          <GroupNode id="supports" icon="support" label="Supports" count={supports.length}>
+            {supports.map((sp) => (
+              <ItemRow
+                key={sp.id}
+                id={sp.id}
+                testId="support-row"
+                name={sp.name || sp.id}
+                active={isActive('support', sp.id)}
+                glyph={
+                  <span className="tree-glyph" style={{ color: cssHex(SUPPORT_COLOR) }}>
+                    <Icon name="support" size={14} />
+                  </span>
+                }
+                detail={selectionLabel(sp.selection)}
+                tag={<span className="tree-tag">{fixLabel(sp)}</span>}
+                onActivate={() => st.setActiveItem({ kind: 'support', id: sp.id })}
+                onRename={(n) => st.updateSupport(sp.id, { name: n })}
+                menu={() => [
+                  { label: 'Rename', testId: 'ctx-rename', run: () => setRenaming(sp.id) },
+                  ...selectionMenu(sp.selection, sp.name || sp.id, (selection) => st.updateSupport(sp.id, { selection })),
+                  { label: 'Delete', testId: 'ctx-delete', danger: true, run: () => st.removeSupport(sp.id) },
+                ]}
+              />
+            ))}
+          </GroupNode>
+          <GroupNode id="domain" icon="domain" label="Domain / Mesh">
+            <InfoRow page="domain" itemKey="info:domain">
               <span className="tree-caret" />
-              <span className="tree-glyph accent">
-                <Icon name="part" size={14} />
-              </span>
-              <span className="tree-text grow">
-                <span className="tree-label ellipsis">{design.info.name}</span>
-                <span className="tree-detail">
-                  {design.info.n_faces.toLocaleString()} faces{design.info.source === 'step' ? ' · STEP' : ''}
-                </span>
-              </span>
-            </InfoRow>
-          ) : (
-            <InfoRow page="part">
-              <span className="tree-caret" />
-              <span className="tree-detail">{designRef?.mesh_id ? `${memoName ?? designRef.mesh_id} (not loaded)` : 'not imported'}</span>
-            </InfoRow>
-          )}
-        </GroupNode>
-        <GroupNode id="refs" icon="ref" label="Reference bodies" count={refs.length}>
-          {refs.map((r) => (
-            <ItemRow
-              key={r.id}
-              id={r.id}
-              testId="ref-row"
-              name={r.name || r.id}
-              active={isActive('ref', r.id)}
-              glyph={<RefIcon r={r} />}
-              detail={modeLabel(r)}
-              warn={r.mesh_id && meshes[r.mesh_id] ? undefined : 'Geometry missing: re-upload'}
-              onActivate={() => {
-                st.setActiveItem({ kind: 'ref', id: r.id });
-                st.setTool('gizmo');
-              }}
-              onRename={(n) => st.updateRef(r.id, { name: n })}
-              extra={
-                <label className={`tree-eye ${r.visible ? '' : 'off'}`} title={r.visible ? 'Hide' : 'Show'} onClick={(e) => e.stopPropagation()}>
-                  <input type="checkbox" checked={r.visible} data-testid="ref-visible" onChange={(e) => st.updateRef(r.id, { visible: e.target.checked })} />
-                  <Icon name={r.visible ? 'eye' : 'hide'} size={14} />
-                </label>
-              }
-              menu={() => [
-                { label: 'Rename', testId: 'ctx-rename', run: () => setRenaming(r.id) },
-                { label: r.visible ? 'Hide' : 'Show', testId: 'ctx-visibility', run: () => st.updateRef(r.id, { visible: !r.visible }) },
-                {
-                  label: r.mode === 'keep_in' ? 'Make keep-out' : 'Make keep-in',
-                  testId: 'ctx-mode',
-                  run: () => st.updateRef(r.id, { mode: r.mode === 'keep_in' ? 'keep_out' : 'keep_in' }),
-                },
-                { label: 'Delete', testId: 'ctx-delete', danger: true, run: () => st.removeRef(r.id) },
-              ]}
-            />
-          ))}
-        </GroupNode>
-        <GroupNode id="loads" icon="force" label="Loads" count={loads.length}>
-          {loads.map((l) => (
-            <ItemRow
-              key={l.id}
-              id={l.id}
-              testId="load-row"
-              name={l.name || l.id}
-              active={isActive('load', l.id)}
-              glyph={
-                <span className="tree-glyph" style={{ color: cssHex(caseColor(l.case)) }}>
-                  <Icon name="force" size={14} />
-                </span>
-              }
-              detail={selectionLabel(l.selection)}
-              tag={<span className="tree-tag">C{l.case}</span>}
-              onActivate={() => st.setActiveItem({ kind: 'load', id: l.id })}
-              onRename={(n) => st.updateLoad(l.id, { name: n })}
-              menu={() => [
-                { label: 'Rename', testId: 'ctx-rename', run: () => setRenaming(l.id) },
-                ...selectionMenu(l.selection, l.name || l.id, (selection) => st.updateLoad(l.id, { selection })),
-                { label: 'Delete', testId: 'ctx-delete', danger: true, run: () => st.removeLoad(l.id) },
-              ]}
-            />
-          ))}
-        </GroupNode>
-        <GroupNode id="supports" icon="support" label="Supports" count={supports.length}>
-          {supports.map((sp) => (
-            <ItemRow
-              key={sp.id}
-              id={sp.id}
-              testId="support-row"
-              name={sp.name || sp.id}
-              active={isActive('support', sp.id)}
-              glyph={
-                <span className="tree-glyph" style={{ color: cssHex(SUPPORT_COLOR) }}>
-                  <Icon name="support" size={14} />
-                </span>
-              }
-              detail={selectionLabel(sp.selection)}
-              tag={<span className="tree-tag">{fixLabel(sp)}</span>}
-              onActivate={() => st.setActiveItem({ kind: 'support', id: sp.id })}
-              onRename={(n) => st.updateSupport(sp.id, { name: n })}
-              menu={() => [
-                { label: 'Rename', testId: 'ctx-rename', run: () => setRenaming(sp.id) },
-                ...selectionMenu(sp.selection, sp.name || sp.id, (selection) => st.updateSupport(sp.id, { selection })),
-                { label: 'Delete', testId: 'ctx-delete', danger: true, run: () => st.removeSupport(sp.id) },
-              ]}
-            />
-          ))}
-        </GroupNode>
-        <GroupNode id="domain" icon="domain" label="Domain / Mesh">
-          <InfoRow page="domain">
-            <span className="tree-caret" />
-            <span className="tree-detail">
-              {voxel ? `${voxel.nx} × ${voxel.ny} × ${voxel.nz} · h ${voxel.h.toPrecision(3)}` : `${grid.elements_along_longest} elements along longest`}
-            </span>
-          </InfoRow>
-        </GroupNode>
-        <GroupNode id="study" icon="study" label="Study settings">
-          <InfoRow page="study">
-            <span className="tree-caret" />
-            <span className="tree-detail">
-              Compliance · V {params.volfrac.toFixed(2)} · {params.stress_limit != null ? 'MMA, stress' : params.optimizer.toUpperCase()}
-              {(params.symmetry?.length ?? 0) > 0 ? ` · sym ${params.symmetry!.map((p) => p.axis).join('')}` : ''}
-              {params.overhang ? ` · AM ${params.overhang}` : ''}
-            </span>
-          </InfoRow>
-        </GroupNode>
-        <GroupNode
-          id="material"
-          icon="material"
-          label="Material"
-          detail={
-            <span className="tree-detail inline">
-              E {+material.E.toPrecision(4)} · ν {material.nu}
-            </span>
-          }
-        />
-        <GroupNode id="results" icon="results" label="Results">
-          <InfoRow page="results" testId="tree-run">
-            <span className="tree-caret" />
-            <span className={`dot status-${run.status}`} />
-            <span className="tree-text grow">
-              <span className="tree-label ellipsis">{run.id ? `Run ${run.id}` : 'No run yet'}</span>
               <span className="tree-detail">
-                {run.status}
-                {run.history.length > 0 ? ` · ${run.history.length} it` : ''}
+                {voxel ? `${voxel.nx} × ${voxel.ny} × ${voxel.nz} · h ${voxel.h.toPrecision(3)}` : `${grid.elements_along_longest} elements along longest`}
               </span>
-            </span>
-          </InfoRow>
-          {loadedRun && (
-            <InfoRow page="results" testId="tree-loaded-run">
+            </InfoRow>
+          </GroupNode>
+          <GroupNode id="study" icon="study" label="Study settings">
+            <InfoRow page="study" itemKey="info:study">
               <span className="tree-caret" />
-              <span className="tree-glyph">
-                <Icon name="open" size={14} />
+              <span className="tree-detail">
+                Compliance · V {params.volfrac.toFixed(2)} · {params.stress_limit != null ? 'MMA, stress' : params.optimizer.toUpperCase()}
+                {(params.symmetry?.length ?? 0) > 0 ? ` · sym ${params.symmetry!.map((p) => p.axis).join('')}` : ''}
+                {params.overhang ? ` · AM ${params.overhang}` : ''}
               </span>
+            </InfoRow>
+          </GroupNode>
+          <GroupNode
+            id="material"
+            icon="material"
+            label="Material"
+            detail={
+              <span className="tree-detail inline">
+                E {+material.E.toPrecision(4)} · ν {material.nu}
+              </span>
+            }
+          />
+          <GroupNode id="results" icon="results" label="Results">
+            <InfoRow page="results" testId="tree-run" itemKey="info:run">
+              <span className="tree-caret" />
+              <span className={`dot status-${run.status}`} />
               <span className="tree-text grow">
-                <span className="tree-label ellipsis">{loadedRun.fileName}</span>
+                <span className="tree-label ellipsis">{run.id ? `Run ${run.id}` : 'No run yet'}</span>
                 <span className="tree-detail">
-                  {loadedRun.run.status} · {loadedRun.run.history?.length ?? 0} it
+                  {run.status}
+                  {run.history.length > 0 ? ` · ${run.history.length} it` : ''}
                 </span>
               </span>
             </InfoRow>
-          )}
-        </GroupNode>
-      </ul>
+            {loadedRun && (
+              <InfoRow page="results" testId="tree-loaded-run" itemKey="info:loaded-run">
+                <span className="tree-caret" />
+                <span className="tree-glyph">
+                  <Icon name="open" size={14} />
+                </span>
+                <span className="tree-text grow">
+                  <span className="tree-label ellipsis">{loadedRun.fileName}</span>
+                  <span className="tree-detail">
+                    {loadedRun.run.status} · {loadedRun.run.history?.length ?? 0} it
+                  </span>
+                </span>
+              </InfoRow>
+            )}
+          </GroupNode>
+        </ul>
+      </TreeFocus.Provider>
     </nav>
   );
 }
@@ -386,6 +553,15 @@ export function FeatureTree() {
 export function ContextMenu() {
   const menu = useUi((s) => s.menu);
   const ref = useRef<HTMLDivElement>(null);
+  // focus moves into the menu when it opens and back to what opened it when it closes
+  useEffect(() => {
+    if (!menu) return;
+    const back = menu.returnFocus ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    ref.current?.querySelector<HTMLElement>('[role="menuitem"]:not(:disabled)')?.focus();
+    return () => {
+      if (back?.isConnected) back.focus({ preventScroll: true });
+    };
+  }, [menu]);
   useEffect(() => {
     if (!menu) return;
     const close = (e: Event) => {
@@ -409,12 +585,23 @@ export function ContextMenu() {
   const x = Math.min(menu.x, window.innerWidth - 200);
   const y = Math.min(menu.y, window.innerHeight - 28 * menu.items.length - 12);
   return (
-    <div className="ctx-menu" role="menu" ref={ref} style={{ left: x, top: y }} data-testid="context-menu">
+    <div
+      className="ctx-menu"
+      role="menu"
+      aria-label="Actions"
+      ref={ref}
+      style={{ left: x, top: y }}
+      data-testid="context-menu"
+      onKeyDown={(e) => {
+        if (menuKeys(e, ref.current) || trapTab(e, ref.current)) e.stopPropagation();
+      }}
+    >
       {menu.items.map((it) => (
         <button
           key={it.label}
           type="button"
           role="menuitem"
+          tabIndex={-1}
           className={`ctx-item ${it.danger ? 'danger' : ''}`}
           disabled={it.disabled}
           data-testid={it.testId}

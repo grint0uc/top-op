@@ -1,5 +1,6 @@
 // Bottom status bar: busy state, units, grid, element count and memory estimate, run status, iteration, compliance.
 import { useStore } from '../state/store';
+import { Announcer } from './Announcer';
 import { voxelLevel } from './DomainPanel';
 import { Icon } from './icons';
 
@@ -65,6 +66,7 @@ export function StatusBar() {
       <span className="sb-item" title="Volume fraction">
         V <b>{last ? last.volume.toFixed(3) : '–'}</b>
       </span>
+      <Announcer />
     </footer>
   );
 }

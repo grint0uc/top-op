@@ -13,15 +13,20 @@
   --border-strong: #b3bdca;
   --fg: #1b2430;
   --fg-dim: #5b6676;
-  --fg-faint: #8b95a4;
+  --fg-faint: #5d6878; /* text: >= 4.5:1 on every light panel and on --accent-soft */
   --accent: #0a66d8;
   --accent-strong: #0855b4;
+  --accent-text: #0855b4; /* accent as text, >= 4.5:1 on --accent-soft too */
+  --accent-solid: #0a66d8; /* filled backgrounds under --accent-fg text */
+  --accent-solid-hover: #0855b4;
+  --focus: #0a66d8; /* focus ring, >= 3:1 against every panel */
+  --control-border: #7d8899; /* input / select boundaries, >= 3:1 (WCAG 1.4.11) */
   --accent-fg: #ffffff;
   --accent-soft: #dce9fb;
   --accent-ring: rgba(10, 102, 216, 0.35);
-  --ok: #18884a;
-  --amber: #a86b00;
-  --red: #cc2f35;
+  --ok: #137a40;
+  --amber: #8f5b00;
+  --red: #b8262c;
   --ok-soft: #e1f3e8;
   --amber-soft: #fdf1d8;
   --red-soft: #fbe4e5;
@@ -30,9 +35,12 @@
   --support: #12a594;
   --keep-in: #2f7bf6;
   --keep-out: #e5484d;
-  --axis-x: #d9363e;
-  --axis-y: #1f9446;
-  --axis-z: #2b67d8;
+  --axis-x: #b3242a; /* triad letters: >= 4.5:1 on the light end of the viewport gradient */
+  --axis-y: #0f6e38;
+  --axis-z: #1f5fc8;
+  --series-c: #1f62d0;
+  --series-v: #a35c00;
+  --series-s: #c4262c;
   --vp-top: #c3cfdd;
   --vp-mid: #e4eaf1;
   --vp-bottom: #ffffff;
@@ -72,9 +80,14 @@
   --border-strong: #3d4858;
   --fg: #e2e8f0;
   --fg-dim: #9ba6b5;
-  --fg-faint: #6b7788;
+  --fg-faint: #94a0b2;
   --accent: #3b8cff;
   --accent-strong: #5c9fff;
+  --accent-text: #5c9fff;
+  --accent-solid: #2b6ad0;
+  --accent-solid-hover: #2259b0;
+  --focus: #5c9fff;
+  --control-border: #6b7a8e;
   --accent-fg: #ffffff;
   --accent-soft: #1b3150;
   --accent-ring: rgba(59, 140, 255, 0.45);
@@ -88,6 +101,9 @@
   --axis-x: #ff6066;
   --axis-y: #43cf72;
   --axis-z: #5c98ff;
+  --series-c: #5c9fff;
+  --series-v: #e8930c;
+  --series-s: #ff6b70;
   --vp-top: #2c3a4d;
   --vp-mid: #1e2734;
   --vp-bottom: #121820;
@@ -99,7 +115,7 @@
   --title-dim: #7f8c9e;
   --title-hover: rgba(255, 255, 255, 0.08);
   --cube-face: rgba(44, 55, 70, 0.94);
-  --cube-face-top: rgba(60, 73, 92, 0.95);
+  --cube-face-top: rgba(46, 57, 73, 0.95); /* its label (--fg-dim) keeps 4.5:1 */
   --cube-face-side: rgba(34, 43, 56, 0.94);
   --cube-edge: #5d6c82;
 }
@@ -159,7 +175,6 @@ code {
 kbd {
   font: inherit;
   font-size: 9px;
-  opacity: 0.65;
   font-variant-numeric: tabular-nums;
 }
 
@@ -198,6 +213,7 @@ kbd {
 
 /* ================================================================ title bar + quick access */
 .titlebar {
+  --focus: #6aa8ff; /* the title bar is dark in both themes */
   display: flex;
   align-items: center;
   gap: 14px;
@@ -215,6 +231,7 @@ kbd {
 }
 
 .brand-name {
+  margin: 0;
   font-weight: 700;
   font-size: 13px;
   letter-spacing: 0.02em;
@@ -249,7 +266,11 @@ kbd {
 }
 
 .qat-btn:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus);
+}
+
+.qat-btn[aria-pressed='false'] {
+  color: var(--title-dim);
 }
 
 .qat-btn:disabled {
@@ -292,7 +313,7 @@ kbd {
 }
 
 .doc-input:focus {
-  border-color: var(--accent);
+  border-color: var(--focus);
   background: rgba(0, 0, 0, 0.25);
 }
 
@@ -355,7 +376,7 @@ kbd {
 }
 
 .ribbon-tab:focus-visible {
-  outline: 2px solid var(--accent-ring);
+  outline: 2px solid var(--focus);
 }
 
 .ribbon-tab.on {
@@ -432,11 +453,11 @@ kbd {
 }
 
 .cmd:hover:not(:disabled) .icon {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .cmd:focus-visible {
-  outline: 2px solid var(--accent-ring);
+  outline: 2px solid var(--focus);
 }
 
 .cmd:disabled {
@@ -450,7 +471,7 @@ kbd {
 }
 
 .cmd.on .icon {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .cmd-lg {
@@ -576,7 +597,7 @@ kbd {
 }
 
 .tree-glyph.accent {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .tree-label {
@@ -661,7 +682,7 @@ kbd {
 }
 
 .tree-eye:hover {
-  color: var(--accent);
+  color: var(--accent-text);
   background: var(--bg-hover);
 }
 
@@ -744,7 +765,7 @@ kbd {
 }
 
 .ctx-item:hover:not(:disabled) {
-  background: var(--accent);
+  background: var(--accent-solid);
   color: var(--accent-fg);
 }
 
@@ -776,6 +797,13 @@ kbd {
   color: var(--fg-dim);
   background: var(--bg-sunken);
   border-bottom: 1px solid var(--border);
+}
+
+.monitor-title,
+.pm-name {
+  margin: 0;
+  font: inherit;
+  letter-spacing: inherit;
 }
 
 .monitor-body {
@@ -821,7 +849,7 @@ kbd {
 
 .status-running,
 .status-queued {
-  color: var(--accent);
+  color: var(--accent-text);
   border-color: var(--accent);
 }
 
@@ -873,7 +901,7 @@ kbd {
   padding: 8px 10px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-raised);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .pm-title {
@@ -890,7 +918,7 @@ kbd {
   color: var(--fg-faint);
 }
 
-.pm-name {
+.pm-title .pm-name {
   font-size: 13px;
   font-weight: 600;
 }
@@ -955,7 +983,9 @@ kbd {
   font-feature-settings: 'zero', 'tnum';
   padding: 3px 8px;
   border-radius: var(--radius);
-  color: #fff;
+  border: 2px solid var(--case);
+  background: color-mix(in srgb, var(--case) 22%, var(--bg-raised));
+  color: var(--fg);
   font-weight: 700;
   font-size: 11px;
   margin-bottom: 1px;
@@ -1031,7 +1061,7 @@ kbd {
 }
 
 .group-toggle .icon:not(.caret) {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .group-toggle .caret {
@@ -1044,7 +1074,7 @@ kbd {
 }
 
 .group-toggle:focus-visible {
-  outline: 2px solid var(--accent-ring);
+  outline: 2px solid var(--focus);
 }
 
 .group:has(.group-toggle[aria-expanded='false']) .group-head {
@@ -1137,7 +1167,7 @@ kbd {
   height: 24px;
   background: var(--bg-input);
   color: var(--fg);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--control-border);
   border-radius: 2px;
   padding: 2px 6px;
   font: inherit;
@@ -1161,7 +1191,7 @@ kbd {
 .num:focus,
 .text:focus,
 .select:focus {
-  outline: 2px solid var(--accent-ring);
+  outline: 2px solid var(--focus);
   outline-offset: -1px;
   border-color: var(--accent);
 }
@@ -1245,15 +1275,15 @@ input[type='range'] {
 
 .btn:hover:not(:disabled):not(.disabled) {
   border-color: var(--accent);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .btn:hover:not(:disabled):not(.disabled) .icon {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .btn:focus-visible {
-  outline: 2px solid var(--accent-ring);
+  outline: 2px solid var(--focus);
   outline-offset: 1px;
 }
 
@@ -1264,8 +1294,8 @@ input[type='range'] {
 }
 
 .btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--accent-solid);
+  border-color: var(--accent-solid);
   color: var(--accent-fg);
 }
 
@@ -1274,7 +1304,7 @@ input[type='range'] {
 }
 
 .btn.primary:hover:not(:disabled) {
-  background: var(--accent-strong);
+  background: var(--accent-solid-hover);
   color: var(--accent-fg);
 }
 
@@ -1303,11 +1333,11 @@ input[type='range'] {
 .btn.active {
   background: var(--accent-soft);
   border-color: var(--accent);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .btn.active .icon {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 a.btn {
@@ -1341,7 +1371,7 @@ a.btn {
 }
 
 .banner-info .banner-icon {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .banner-warn {
@@ -1511,7 +1541,7 @@ a.btn {
 }
 
 .seg-btn.on {
-  background: var(--accent);
+  background: var(--accent-solid);
   color: var(--accent-fg);
 }
 
@@ -1521,7 +1551,7 @@ a.btn {
 }
 
 .seg-btn:focus-visible {
-  outline: 2px solid var(--accent-ring);
+  outline: 2px solid var(--focus);
   outline-offset: -2px;
 }
 
@@ -1675,7 +1705,7 @@ a.btn {
 }
 
 .sel-summary.has {
-  color: var(--accent);
+  color: var(--accent-text);
   font-weight: 600;
 }
 
@@ -1747,6 +1777,7 @@ a.btn {
 }
 
 .facet-kind {
+  background: var(--bg-raised);
   font-size: 10px;
   padding: 0 5px;
   border-radius: 8px;
@@ -1756,8 +1787,8 @@ a.btn {
 }
 
 .facet-kind.kind-cylinder {
-  color: var(--keep-in);
-  border-color: var(--keep-in);
+  color: var(--accent-text);
+  border-color: var(--accent-text);
 }
 
 .facet-kind.kind-plane {
@@ -1773,7 +1804,7 @@ a.btn {
 
 .badge-step {
   background: var(--info-soft);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 /* notices over the top of the viewport */
@@ -1869,7 +1900,7 @@ a.btn {
   border: 2px dashed var(--accent);
   border-radius: 6px;
   background: color-mix(in srgb, var(--accent-soft) 70%, transparent);
-  color: var(--accent);
+  color: var(--accent-text);
   font-weight: 600;
   pointer-events: none;
 }
@@ -1934,7 +1965,7 @@ a.btn {
 .viewcube-face.face-right:hover,
 .viewcube-face.face-bottom:hover,
 .viewcube-face:hover {
-  background: var(--accent);
+  background: var(--accent-solid);
   color: var(--accent-fg);
   border-color: var(--accent);
 }
@@ -1954,7 +1985,7 @@ a.btn {
 }
 
 .viewcube-home:hover {
-  color: var(--accent);
+  color: var(--accent-text);
   background: var(--overlay);
 }
 
@@ -1999,12 +2030,12 @@ a.btn {
 }
 
 .hud-btn:hover:not(:disabled) {
-  color: var(--accent);
+  color: var(--accent-text);
   background: var(--bg-hover);
 }
 
 .hud-btn.on {
-  color: var(--accent);
+  color: var(--accent-text);
   background: var(--accent-soft);
 }
 
@@ -2014,7 +2045,7 @@ a.btn {
 }
 
 .hud-btn:focus-visible {
-  outline: 2px solid var(--accent-ring);
+  outline: 2px solid var(--focus);
 }
 
 .hud-sep {
@@ -2055,7 +2086,7 @@ a.btn {
 }
 
 .hud-pop-item:hover {
-  background: var(--accent);
+  background: var(--accent-solid);
   color: var(--accent-fg);
 }
 
@@ -2144,7 +2175,7 @@ a.btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .spinner {
@@ -2206,5 +2237,159 @@ a.btn {
     flex-wrap: wrap;
     justify-content: center;
     max-width: calc(100% - 20px);
+  }
+}
+
+/* ================================================================ accessibility */
+::placeholder {
+  color: var(--fg-dim);
+  opacity: 1;
+}
+
+/* One visible focus indicator for every control (WCAG 2.4.7, 3:1 per 1.4.11). Component rules above that use
+   `all: unset` would otherwise drop the outline. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.seg-btn:focus-visible,
+.ctx-item:focus-visible,
+.hud-pop-item:focus-visible,
+.pm-list-row:focus-visible,
+.group-toggle:focus-visible {
+  outline-offset: -2px;
+}
+
+/* on a filled accent background the ring turns white */
+.seg-btn.on:focus-visible,
+.ctx-item:focus-visible,
+.hud-pop-item:focus-visible {
+  outline-color: var(--accent-fg);
+}
+
+.ctx-item:focus-visible:not(:disabled),
+.hud-pop-item:focus-visible {
+  background: var(--accent-solid);
+  color: var(--accent-fg);
+}
+
+/* tree rows are the treeitems */
+.tree .tree-row[role='treeitem']:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.tree [role='treeitem']:focus-visible .tree-more,
+.tree-row:focus-within .tree-more {
+  opacity: 1;
+}
+
+.tree-eye:has(input:focus-visible) {
+  outline: 2px solid var(--focus);
+}
+
+.facet-row:has(input:focus-visible) {
+  background: var(--accent-soft);
+}
+
+.facet-row input:focus-visible {
+  outline-offset: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Reflow (WCAG 1.4.10): at 320 CSS px, or 200 % zoom on a small window, the panes stack and the page scrolls
+   vertically instead of clipping. The viewport keeps a usable height. */
+@media (max-width: 900px), (max-height: 560px) {
+  body {
+    overflow: auto;
+  }
+
+  .app {
+    height: auto;
+    min-height: 100%;
+    grid-template-rows: auto auto auto auto;
+  }
+
+  .titlebar {
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    padding: 4px 10px;
+  }
+
+  .doc-name {
+    order: 3;
+    flex-basis: 100%;
+  }
+
+  .ribbon-tabs {
+    flex-wrap: wrap;
+    height: auto;
+  }
+
+  .ribbon-body {
+    flex-wrap: wrap;
+    height: auto;
+    row-gap: 4px;
+    padding-bottom: 4px;
+  }
+
+  .rgroup {
+    min-height: 68px;
+  }
+
+  .workspace {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .left-pane {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .tree {
+    max-height: 50vh;
+  }
+
+  .center {
+    height: max(420px, 70vh);
+  }
+
+  .pm {
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .pm-body {
+    overflow: visible;
+  }
+
+  .statusbar {
+    flex-wrap: wrap;
+    white-space: normal;
+    padding: 2px 4px;
+  }
+
+  .sb-item {
+    height: 20px;
+  }
+
+  .statusbar .grow {
+    display: none;
+  }
+
+  .grid2 {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
 }

@@ -1,8 +1,10 @@
+import { useRef } from 'react';
 import type { IterationRecord, ParamsSpec } from '../api/client';
 import { startRun, stopRun } from '../state/actions';
 import { designBox } from '../state/derived';
 import { useStore } from '../state/store';
 import { Btn, Field, Group, NumField, OptNumField } from './controls';
+import { useFocusHandoff } from './a11y';
 import { Icon } from './icons';
 import { Sparkline, SERIES_COLORS } from './Sparkline';
 
@@ -34,6 +36,7 @@ function SymmetryEditor({ planes }: { planes: NonNullable<ParamsSpec['symmetry']
             className="select"
             value={p.axis}
             data-testid="sym-axis"
+            aria-label={`Symmetry plane ${i + 1} axis`}
             title="The plane is perpendicular to this axis"
             onChange={(e) => {
               const axis = e.target.value as Axis;
@@ -56,7 +59,7 @@ function SymmetryEditor({ planes }: { planes: NonNullable<ParamsSpec['symmetry']
             center
           </label>
           {p.position != null && (
-            <NumField value={p.position} testId="sym-pos" title={`${p.axis} coordinate of the plane`} onChange={(v) => edit(i, { position: v })} />
+            <NumField value={p.position} testId="sym-pos" label={`Symmetry plane ${i + 1} ${p.axis} position`} title={`${p.axis} coordinate of the plane`} onChange={(v) => edit(i, { position: v })} />
           )}
           <span className="grow" />
           <Btn variant="danger" icon="trash" onClick={() => set(planes.filter((_, k) => k !== i))} testId="sym-remove" title="Remove this plane" />
@@ -215,22 +218,25 @@ export function JobMonitor() {
   const max = run.maxIter || params.max_iter;
   const stressMax = lastNumber(run.history, 'stress_max');
   const constraint = lastNumber(run.history, 'constraint');
+  const runBtn = useRef<HTMLButtonElement>(null);
+  const stopBtn = useRef<HTMLButtonElement>(null);
+  useFocusHandoff(active, runBtn, stopBtn);
 
   return (
     <section className="monitor" data-testid="panel-run" aria-label="Job monitor">
       <header className="monitor-head">
         <Icon name="results" size={14} />
-        <span className="grow">Job monitor</span>
+        <h2 className="grow monitor-title">Job monitor</h2>
         <span className={`status status-${run.status}`} data-testid="run-status" title={run.status === 'queued' ? 'Waiting for the previous run to finish' : undefined}>
           {run.status}
         </span>
       </header>
       <div className="monitor-body">
         <div className="row">
-          <Btn variant="primary" icon="run" onClick={() => void startRun()} disabled={active || !hasDesign} testId="run-start" title="Run the optimization">
+          <Btn variant="primary" icon="run" btnRef={runBtn} onClick={() => void startRun()} disabled={active || !hasDesign} testId="run-start" title="Run the optimization">
             Run
           </Btn>
-          <Btn variant="danger" icon="stop" onClick={() => void stopRun()} disabled={!active} testId="run-stop" title="Stop the running job">
+          <Btn variant="danger" icon="stop" btnRef={stopBtn} onClick={() => void stopRun()} disabled={!active} testId="run-stop" title="Stop the running job">
             Stop
           </Btn>
           <span className="grow" />
@@ -238,7 +244,7 @@ export function JobMonitor() {
             it {last?.it ?? 0} / {max}
           </span>
         </div>
-        <progress className="meter" max={max} value={last?.it ?? 0} />
+        <progress className="meter" max={max} value={last?.it ?? 0} aria-label="Run progress" />
         {hasDesign && (nLoads === 0 || nSupports === 0) && (
           <p className="amber" data-testid="run-hint">
             {nLoads === 0 ? 'No load defined. ' : ''}
@@ -248,10 +254,14 @@ export function JobMonitor() {
         <Sparkline history={run.history} height={64} />
         {last && (
           <div className="legend">
-            <span style={{ color: SERIES_COLORS.compliance }}>C {last.compliance.toPrecision(5)}</span>
-            <span style={{ color: SERIES_COLORS.volume }}>V {last.volume.toFixed(3)}</span>
+            <span style={{ color: SERIES_COLORS.compliance }} title="Compliance">
+              C {last.compliance.toPrecision(5)}
+            </span>
+            <span style={{ color: SERIES_COLORS.volume }} title="Volume fraction">
+              V {last.volume.toFixed(3)}
+            </span>
             {stressMax !== null && (
-              <span style={{ color: SERIES_COLORS.stress }} data-testid="run-stress">
+              <span style={{ color: SERIES_COLORS.stress }} data-testid="run-stress" title="Max von Mises stress">
                 stress {stressMax.toPrecision(4)}
               </span>
             )}

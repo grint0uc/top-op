@@ -7,7 +7,9 @@ interface Props {
   height?: number;
 }
 
-export const SERIES_COLORS = { compliance: '#2f7bf6', volume: '#e8930c', stress: '#e5484d' };
+/** Theme tokens (styles.css): each series reads >= 4.5:1 as legend text on the panel, in both themes. */
+export const SERIES_COLORS = { compliance: 'var(--series-c)', volume: 'var(--series-v)', stress: 'var(--series-s)' };
+const SERIES_VARS = { compliance: '--series-c', volume: '--series-v', stress: '--series-s' } as const;
 
 function series(g: CanvasRenderingContext2D, vals: readonly number[], color: string, w: number, h: number, log: boolean): [number, number] {
   const v = log ? vals.map((x) => Math.log10(Math.max(x, 1e-12))) : [...vals];
@@ -58,8 +60,11 @@ export function Sparkline({ history, height = 90 }: Props) {
       g.setTransform(dpr, 0, 0, dpr, 0, 0);
       g.clearRect(0, 0, w, h);
       const css = getComputedStyle(c);
+      const v = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
       const COLORS = {
-        ...SERIES_COLORS,
+        compliance: v(SERIES_VARS.compliance, '#1f62d0'),
+        volume: v(SERIES_VARS.volume, '#a35c00'),
+        stress: v(SERIES_VARS.stress, '#c4262c'),
         grid: css.getPropertyValue('--border').trim() || '#c9d1dc',
         text: css.getPropertyValue('--fg-dim').trim() || '#6b7686',
       };
@@ -118,9 +123,17 @@ export function Sparkline({ history, height = 90 }: Props) {
     return () => ro.disconnect();
   }, [history, height, hasStress, dark]);
 
+  const first = history[0];
+  const last = history[history.length - 1];
+  const summary =
+    first && last
+      ? `Convergence plot, ${history.length} iterations: compliance ${first.compliance.toPrecision(4)} to ${last.compliance.toPrecision(4)}, volume ${last.volume.toFixed(3)}`
+      : 'Convergence plot: no iterations yet';
   return (
     <canvas
       ref={ref}
+      role="img"
+      aria-label={summary}
       className="sparkline"
       style={{ height }}
       data-testid="sparkline"

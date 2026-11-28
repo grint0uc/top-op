@@ -106,6 +106,7 @@ export function RefPage({ r }: { r: RefModel }) {
             <input
               type="file"
               accept=".stl"
+              aria-label={`Re-upload ${r.name || r.id}`}
               data-testid="ref-reupload-input"
               onChange={(e) => {
                 const f = e.target.files?.[0];

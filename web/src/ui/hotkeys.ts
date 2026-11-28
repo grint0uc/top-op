@@ -14,11 +14,14 @@ function isTyping(t: EventTarget | null): boolean {
   return t instanceof HTMLInputElement && TEXT_INPUT.has(t.type);
 }
 
-/** 1-5 modes, g/r/s gizmo mode, f fit all, Esc clears the selection, Delete removes the active load/support/reference. */
+/**
+ * 1-5 modes, g/r/s gizmo mode, f fit all (these single-key ones can be turned off in the title bar), Esc clears the
+ * selection, Delete removes the active load/support/reference.
+ */
 export function useHotkeys(): void {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (isTyping(e.target)) return;
+      if (e.defaultPrevented || isTyping(e.target)) return; // a menu or popover already handled it
       const s = useStore.getState();
       if (e.key === 'Escape') {
         if (useUi.getState().menu) return; // the context menu takes this Esc
@@ -35,6 +38,7 @@ export function useHotkeys(): void {
         return;
       }
       if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (!useUi.getState().shortcuts) return; // single-key shortcuts turned off (WCAG 2.1.4)
       const mode = MODE_KEYS[e.key];
       if (mode) {
         s.setTool(mode);

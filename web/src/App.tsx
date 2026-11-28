@@ -25,11 +25,11 @@ export function App() {
         </aside>
         <main className="center">
           <ViewportHost dropping={dropping} />
+          <FileInputs />
         </main>
         <PropertyManager />
       </div>
       <StatusBar />
-      <FileInputs />
       <ContextMenu />
     </div>
   );

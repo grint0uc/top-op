@@ -20,15 +20,16 @@ const TOP_FACETS = 12;
 const edit = (fn: (f: QueryForm) => QueryForm) => useStore.getState().editQueryForm(fn);
 
 /** Three number fields editing one component each of a vector. */
-function VecFields({ value, onChange, testId }: { value: readonly number[]; onChange: (v: Vec3) => void; testId: string }) {
+function VecFields({ value, onChange, testId, label }: { value: readonly number[]; onChange: (v: Vec3) => void; testId: string; label: string }) {
   return (
-    <div className="vec3">
+    <div className="vec3" role="group" aria-label={label}>
       {AXES.map((a, k) => (
         <NumField
           key={a}
           value={value[k] ?? 0}
           testId={`${testId}-${a}`}
           title={a}
+          label={`${label} ${a}`}
           onChange={(v) => onChange(value.map((x, i) => (i === k ? v : x)) as Vec3)}
         />
       ))}
@@ -36,10 +37,10 @@ function VecFields({ value, onChange, testId }: { value: readonly number[]; onCh
   );
 }
 
-function DirPresets({ value, onPick, testId }: { value: readonly number[]; onPick: (v: Vec3) => void; testId: string }) {
+function DirPresets({ value, onPick, testId, label }: { value: readonly number[]; onPick: (v: Vec3) => void; testId: string; label: string }) {
   const current = dirName(value);
   return (
-    <div className="toolbar-row">
+    <div className="toolbar-row" role="group" aria-label={label}>
       {AXIS_PRESETS.map((p) => (
         <Btn key={p.label} active={current === p.label} onClick={() => onPick([...p.v])} testId={`${testId}-${p.label}`}>
           {p.label}
@@ -54,8 +55,8 @@ function NormalForm({ form }: { form: QueryForm['normal'] }) {
   return (
     <div className="query-form" data-testid="query-normal">
       <span className="dim">Direction</span>
-      <DirPresets value={form.dir} onPick={(dir) => edit((f) => ({ ...f, normal: { ...f.normal, dir } }))} testId="normal-dir" />
-      <VecFields value={form.dir} onChange={(dir) => edit((f) => ({ ...f, normal: { ...f.normal, dir } }))} testId="normal-vec" />
+      <DirPresets value={form.dir} label="Direction presets" onPick={(dir) => edit((f) => ({ ...f, normal: { ...f.normal, dir } }))} testId="normal-dir" />
+      <VecFields value={form.dir} label="Direction" onChange={(dir) => edit((f) => ({ ...f, normal: { ...f.normal, dir } }))} testId="normal-vec" />
       <Field label="Angle (degrees from the direction)">
         <NumField
           value={form.angle}
@@ -75,12 +76,14 @@ function NormalForm({ form }: { form: QueryForm['normal'] }) {
           <span className="dim">min</span>
           <VecFields
             value={form.within.min}
+            label="Box min"
             testId="within-min"
             onChange={(min) => edit((f) => ({ ...f, normal: { ...f.normal, within: f.normal.within && { ...f.normal.within, min } } }))}
           />
           <span className="dim">max</span>
           <VecFields
             value={form.within.max}
+            label="Box max"
             testId="within-max"
             onChange={(max) => edit((f) => ({ ...f, normal: { ...f.normal, within: f.normal.within && { ...f.normal.within, max } } }))}
           />
@@ -99,10 +102,10 @@ function PlaneForm({ form }: { form: QueryForm['plane'] }) {
   return (
     <div className="query-form" data-testid="query-plane">
       <span className="dim">Point on the plane</span>
-      <VecFields value={form.point} testId="plane-point" onChange={(point) => edit((f) => ({ ...f, plane: { ...f.plane, point } }))} />
+      <VecFields value={form.point} label="Point on the plane" testId="plane-point" onChange={(point) => edit((f) => ({ ...f, plane: { ...f.plane, point } }))} />
       <span className="dim">Normal</span>
-      <DirPresets value={form.normal} onPick={(normal) => edit((f) => ({ ...f, plane: { ...f.plane, normal } }))} testId="plane-dir" />
-      <VecFields value={form.normal} testId="plane-normal" onChange={(normal) => edit((f) => ({ ...f, plane: { ...f.plane, normal } }))} />
+      <DirPresets value={form.normal} label="Normal presets" onPick={(normal) => edit((f) => ({ ...f, plane: { ...f.plane, normal } }))} testId="plane-dir" />
+      <VecFields value={form.normal} label="Plane normal" testId="plane-normal" onChange={(normal) => edit((f) => ({ ...f, plane: { ...f.plane, normal } }))} />
       <Field label="Tolerance (0 = the single node layer nearest the plane, +-h/2)">
         <NumField value={form.tol} min={0} step={0.5} testId="plane-tol" onChange={(tol) => edit((f) => ({ ...f, plane: { ...f.plane, tol } }))} />
       </Field>
@@ -122,7 +125,16 @@ function FacetRow({ facet, picked }: { facet: FacetInfo; picked: boolean }) {
       onMouseLeave={() => hoverFacet(null)}
       onClick={() => toggleFacet(facet.id)}
     >
-      <input type="checkbox" checked={picked} readOnly tabIndex={-1} aria-label={`facet ${facet.id}`} />
+      {/* the checkbox is the keyboard control (Space toggles, focus highlights the facet like hovering) */}
+      <input
+        type="checkbox"
+        checked={picked}
+        aria-label={`facet ${facet.id}, ${facet.kind}, area ${facet.area.toPrecision(4)}`}
+        onClick={(e) => e.stopPropagation()}
+        onChange={() => toggleFacet(facet.id)}
+        onFocus={() => hoverFacet(facet)}
+        onBlur={() => hoverFacet(null)}
+      />
       <span className="facet-id">#{facet.id}</span>
       <span className="facet-area" title="area">
         {facet.area.toPrecision(4)}
@@ -228,7 +240,7 @@ export function QueryPanel() {
 
   return (
     <div className="query-panel" data-testid="query-panel">
-      <div className="toolbar-row">
+      <div className="toolbar-row" role="group" aria-label="Query kind">
         {KINDS.map((k) => (
           <Btn key={k.id} active={form.kind === k.id} onClick={() => setQueryKind(k.id)} testId={`query-tab-${k.id}`} title={k.hint} disabled={!hasDesign}>
             {k.label}
@@ -242,7 +254,7 @@ export function QueryPanel() {
         <Btn onClick={commitQueryForm} disabled={!valid} testId="query-apply" title="Make this query the current selection (it already follows edits)">
           Select
         </Btn>
-        <span className={valid ? 'dim' : 'amber'} data-testid="query-status">
+        <span className={valid ? 'dim' : 'amber'} data-testid="query-status" role="status">
           {query ? queryLabel(query) : valid ? 'not selected yet' : form.kind === 'facets' ? 'pick at least one facet' : 'incomplete'}
         </span>
       </div>
