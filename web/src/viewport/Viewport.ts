@@ -12,6 +12,8 @@ import { Picker, type PickerDeps } from './Picker';
 import { Primitives } from './Primitives';
 import { SelectionPainter, type PainterDeps } from './SelectionPainter';
 
+const prefersReducedMotion = (): boolean => typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+
 export const BASE_HEX = 0xb4bdc8;
 export const SELECT_HEX = 0x1f78ff;
 export const HOVER_HEX = 0x7cc8ff;
@@ -554,8 +556,8 @@ export class Viewport {
     this.fitView(dir.normalize(), this.camera.up.clone(), false);
   }
 
-  /** Snap (with a short animation) to a standard view of everything on screen. */
-  setView(view: StandardView, animate = true): void {
+  /** Snap (with a short animation, unless the user asked for reduced motion) to a standard view of everything on screen. */
+  setView(view: StandardView, animate = !prefersReducedMotion()): void {
     const v = VIEWS[view];
     this.fitView(new THREE.Vector3(...v.dir).normalize(), new THREE.Vector3(...v.up), animate);
   }

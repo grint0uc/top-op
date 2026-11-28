@@ -1,8 +1,9 @@
 // Heads-up view toolbar at the bottom of the viewport: fit, standard views, display style, section plane, ghosting
 // of the design body and the density threshold.
-import { useEffect, useState } from 'react';
+import { type KeyboardEvent, type Ref, useEffect, useRef, useState } from 'react';
 import { useStore } from '../state/store';
 import type { StandardView, Viewport } from '../viewport/Viewport';
+import { menuKeys, trapTab } from './a11y';
 import { Icon, type IconName } from './icons';
 import { type DisplayStyle, useUi } from './uiStore';
 
@@ -29,6 +30,9 @@ function HudBtn({
   active,
   disabled,
   testId,
+  popup,
+  expanded,
+  btnRef,
 }: {
   icon: IconName;
   label: string;
@@ -36,16 +40,23 @@ function HudBtn({
   active?: boolean;
   disabled?: boolean;
   testId?: string;
+  /** a button that opens a menu / dialog reports aria-haspopup + aria-expanded */
+  popup?: 'menu' | 'dialog';
+  expanded?: boolean;
+  btnRef?: Ref<HTMLButtonElement>;
 }) {
   return (
     <button
+      ref={btnRef}
       type="button"
       className={`hud-btn ${active ? 'on' : ''}`}
       onClick={onClick}
       disabled={disabled}
       title={label}
       aria-label={label}
-      aria-pressed={active}
+      aria-pressed={popup === 'menu' ? undefined : active}
+      aria-haspopup={popup}
+      aria-expanded={popup ? !!expanded : undefined}
       data-testid={testId}
     >
       <Icon name={icon} size={18} />
@@ -62,6 +73,28 @@ export function ViewToolbar({ vp }: { vp: Viewport }) {
   const hasDensity = useStore((s) => !!s.run.densityFrame || !!s.resultStl);
   const hasDesign = useStore((s) => !!(s.project.design_mesh?.mesh_id && s.meshes[s.project.design_mesh.mesh_id]));
   const [open, setOpen] = useState<'views' | 'section' | null>(null);
+  const viewsBtn = useRef<HTMLButtonElement>(null);
+  const sectionBtn = useRef<HTMLButtonElement>(null);
+  const pop = useRef<HTMLDivElement>(null);
+
+  // focus goes into the menu / popover when it opens (first item, or the active axis)
+  useEffect(() => {
+    if (!open) return;
+    const el = pop.current;
+    (el?.querySelector<HTMLElement>('[role="menuitem"], .seg-btn.on') ?? el?.querySelector<HTMLElement>('button, input'))?.focus();
+  }, [open]);
+  /** Esc closes and returns focus to the button that opened it; Tab stays inside (arrows too in the menu). */
+  const popKeys = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      const back = open === 'views' ? viewsBtn.current : sectionBtn.current;
+      setOpen(null);
+      back?.focus();
+      return;
+    }
+    if ((open === 'views' && menuKeys(e, pop.current, true)) || trapTab(e, pop.current)) e.stopPropagation();
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -76,19 +109,30 @@ export function ViewToolbar({ vp }: { vp: Viewport }) {
     <div className="hud" data-testid="view-toolbar" role="toolbar" aria-label="View">
       <HudBtn icon="fit" label="Fit all (F)" onClick={() => vp.fitAll()} testId="hud-fit" />
       <div className="hud-pop-wrap">
-        <HudBtn icon="iso" label="Standard views" onClick={() => setOpen(open === 'views' ? null : 'views')} active={open === 'views'} testId="hud-views" />
+        <HudBtn
+          icon="iso"
+          label="Standard views"
+          onClick={() => setOpen(open === 'views' ? null : 'views')}
+          active={open === 'views'}
+          popup="menu"
+          expanded={open === 'views'}
+          btnRef={viewsBtn}
+          testId="hud-views"
+        />
         {open === 'views' && (
-          <div className="hud-pop hud-views" role="menu">
+          <div className="hud-pop hud-views" role="menu" aria-label="Standard views" ref={pop} onKeyDown={popKeys}>
             {VIEWS.map((v) => (
               <button
                 key={v.id}
                 type="button"
                 role="menuitem"
+                tabIndex={-1}
                 className="hud-pop-item"
                 data-testid={`hud-view-${v.id}`}
                 onClick={() => {
                   vp.setView(v.id);
                   setOpen(null);
+                  viewsBtn.current?.focus();
                 }}
               >
                 {v.label}
@@ -114,16 +158,21 @@ export function ViewToolbar({ vp }: { vp: Viewport }) {
           }}
           active={section.on}
           disabled={!hasDesign}
+          popup="dialog"
+          expanded={open === 'section'}
+          btnRef={sectionBtn}
           testId="hud-section"
         />
         {open === 'section' && (
-          <div className="hud-pop hud-section" data-testid="section-pop">
-            <div className="seg">
+          <div className="hud-pop hud-section" data-testid="section-pop" role="dialog" aria-label="Section plane" ref={pop} onKeyDown={popKeys}>
+            <div className="seg" role="group" aria-label="Section axis">
               {(['x', 'y', 'z'] as const).map((a) => (
                 <button
                   key={a}
                   type="button"
                   className={`seg-btn ${section.axis === a ? 'on' : ''}`}
+                  aria-pressed={section.axis === a}
+                  aria-label={`${a.toUpperCase()} axis`}
                   onClick={() => setSection({ axis: a })}
                   data-testid={`section-axis-${a}`}
                 >
@@ -147,6 +196,7 @@ export function ViewToolbar({ vp }: { vp: Viewport }) {
               onClick={() => {
                 setSection({ on: false });
                 setOpen(null);
+                sectionBtn.current?.focus();
               }}
               data-testid="section-off"
             >

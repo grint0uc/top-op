@@ -158,6 +158,7 @@ export function FileInputs() {
     <div className="visually-hidden">
       <input
         id="file-mesh"
+        aria-label="Import design body (STL or STEP)"
         type="file"
         accept={MESH_ACCEPT}
         data-testid="mesh-file-input"
@@ -169,6 +170,7 @@ export function FileInputs() {
       />
       <input
         id="file-project"
+        aria-label="Open project.json"
         type="file"
         accept=".json,application/json"
         data-testid="project-file-input"
@@ -181,6 +183,7 @@ export function FileInputs() {
       />
       <input
         id="file-ref"
+        aria-label="Reference body STL"
         type="file"
         accept={MESH_ACCEPT}
         data-testid="ref-file-input"

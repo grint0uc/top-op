@@ -17,19 +17,19 @@ export function PoseFields({ prefix, transform, onChange }: { prefix: string; tr
       <div className="prim-row">
         <span>pos</span>
         {AXES.map((a, k) => (
-          <NumField key={a} value={pos[k]!} testId={`${prefix}-pos-${a}`} onChange={(v) => set(put(pos, k, v))} />
+          <NumField key={a} value={pos[k]!} label={`Position ${a}`} testId={`${prefix}-pos-${a}`} onChange={(v) => set(put(pos, k, v))} />
         ))}
       </div>
       <div className="prim-row">
         <span>rot&deg;</span>
         {AXES.map((a, k) => (
-          <NumField key={a} value={rot[k]!} step={5} testId={`${prefix}-rot-${a}`} onChange={(v) => set(pos, put(rot, k, v))} />
+          <NumField key={a} value={rot[k]!} step={5} label={`Rotation ${a} (degrees)`} testId={`${prefix}-rot-${a}`} onChange={(v) => set(pos, put(rot, k, v))} />
         ))}
       </div>
       <div className="prim-row">
         <span>scale</span>
         {AXES.map((a, k) => (
-          <NumField key={a} value={scale[k]!} min={1e-6} testId={`${prefix}-scale-${a}`} onChange={(v) => set(pos, rot, put(scale, k, v))} />
+          <NumField key={a} value={scale[k]!} min={1e-6} label={`Scale ${a}`} testId={`${prefix}-scale-${a}`} onChange={(v) => set(pos, rot, put(scale, k, v))} />
         ))}
       </div>
     </div>

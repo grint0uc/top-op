@@ -1,6 +1,6 @@
 // Property manager: the page of the selected feature-tree node. Group pages stay mounted (hidden) so their local
 // state survives switching; an active load/support/reference body shows its own page instead.
-import type { ReactNode } from 'react';
+import { type ReactNode, useEffect, useRef } from 'react';
 import { useStore } from '../state/store';
 import { DomainPage } from './DomainPanel';
 import { Icon, type IconName } from './icons';
@@ -50,6 +50,15 @@ export function PropertyManager() {
   const meta = PAGES.find((p) => p.id === page)!;
   const icon: IconName = item ? (item.kind === 'load' ? 'force' : item.kind === 'support' ? 'support' : 'ref') : meta.icon;
   const kindLabel = item ? (item.kind === 'load' ? 'Force' : item.kind === 'support' ? 'Fixture' : 'Reference body') : null;
+  const title = useRef<HTMLHeadingElement>(null);
+  const itemKey = item ? `${item.kind}:${item.id}` : null;
+  const prevKey = useRef(itemKey);
+  // the item page unmounts when it is released (Done, Esc, delete): if focus was in it, keep it in the panel
+  useEffect(() => {
+    const was = prevKey.current;
+    prevKey.current = itemKey;
+    if (was && was !== itemKey && (document.activeElement === document.body || document.activeElement === null)) title.current?.focus();
+  }, [itemKey]);
 
   return (
     <aside className="pm" aria-label="Property manager" data-testid="property-manager" data-page={item ? item.kind : page}>
@@ -57,9 +66,9 @@ export function PropertyManager() {
         <Icon name={icon} size={18} />
         <div className="pm-title grow">
           <span className="pm-kicker">{kindLabel ?? 'Properties'}</span>
-          <span className="pm-name ellipsis" data-testid="pm-title">
+          <h2 className="pm-name ellipsis" data-testid="pm-title" tabIndex={-1} ref={title}>
             {item ? itemName : meta.title}
-          </span>
+          </h2>
         </div>
         {item && (
           <button

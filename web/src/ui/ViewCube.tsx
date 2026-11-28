@@ -63,7 +63,7 @@ export function ViewCube({ vp }: { vp: Viewport }) {
         const t = g.querySelector('text')!;
         t.setAttribute('x', (32 + it.sx * 29).toFixed(2));
         t.setAttribute('y', (32 - it.sy * 29 + 3.5).toFixed(2));
-        g.style.opacity = it.sz < -0.6 ? '0.55' : '1';
+        line.style.opacity = it.sz < -0.6 ? '0.55' : '1'; // the letter stays at full contrast
         svg.appendChild(g); // re-append in depth order
       });
     };
@@ -73,7 +73,7 @@ export function ViewCube({ vp }: { vp: Viewport }) {
 
   return (
     <>
-      <div className="viewcube" data-testid="view-cube">
+      <div className="viewcube" data-testid="view-cube" role="group" aria-label="View cube">
         <div className="viewcube-stage">
           <div className="viewcube-cube" ref={cube}>
             {FACES.map((f) => (
@@ -83,6 +83,7 @@ export function ViewCube({ vp }: { vp: Viewport }) {
                 className={`viewcube-face face-${f.view}`}
                 style={{ transform: faceMatrix(f) }}
                 onClick={() => vp.setView(f.view)}
+                tabIndex={-1} // faces turned away are hidden but focusable: keyboard users use the Standard views menu
                 data-testid={`viewcube-${f.view}`}
                 title={`${f.label} view`}
               >
@@ -99,13 +100,13 @@ export function ViewCube({ vp }: { vp: Viewport }) {
           data-testid="viewcube-iso"
           aria-label="Isometric view"
         >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
+          <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
             <path d="M12 4 5 8v8l7 4 7-4V8z" />
             <path d="m5 8 7 4 7-4M12 12v8" />
           </svg>
         </button>
       </div>
-      <svg className="triad" ref={triad} width="64" height="64" viewBox="0 0 64 64" data-testid="triad" aria-label="Orientation triad">
+      <svg className="triad" ref={triad} width="64" height="64" viewBox="0 0 64 64" data-testid="triad" role="img" aria-label="Orientation triad (X, Y, Z axes)">
         <circle cx="32" cy="32" r="2.4" className="triad-origin" />
         {AXES.map((a) => (
           <g key={a.k} data-axis={a.k} style={{ color: a.color }}>

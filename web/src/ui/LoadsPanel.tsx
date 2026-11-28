@@ -1,3 +1,4 @@
+import type { CSSProperties } from 'react';
 import type { LoadSpec } from '../api/client';
 import { addLoadFromSelection } from '../state/actions';
 import { cssHex, hasSelection, selectionSummary } from '../state/derived';
@@ -56,7 +57,8 @@ export function LoadPage({ load: l }: { load: LoadSpec }) {
           <Field label="Load case" hint="Loads with the same case act together; cases are optimized for the sum of compliances">
             <NumField value={l.case} min={0} step={1} testId="load-case" onChange={(v) => updateLoad(l.id, { case: Math.round(v) })} />
           </Field>
-          <span className="case-chip" style={{ background: cssHex(caseColor(l.case)) }} title="Case colour in the viewport">
+          {/* tinted chip with the case colour as its border: dark text reads on every case colour (WCAG 1.4.3) */}
+          <span className="case-chip" style={{ '--case': cssHex(caseColor(l.case)) } as CSSProperties} title="Case colour in the viewport">
             C{l.case}
           </span>
         </div>

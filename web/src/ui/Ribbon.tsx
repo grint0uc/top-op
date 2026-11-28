@@ -1,6 +1,6 @@
 // Title bar (quick access toolbar, document name, theme) and the command ribbon. Ribbon commands call the same
 // actions as the property pages and the selection toolbar; choosing a tab opens that workflow stage's page.
-import type { ReactNode } from 'react';
+import { type KeyboardEvent, type ReactNode, type Ref, useRef } from 'react';
 import { api } from '../api/client';
 import {
   addLoadFromSelection,
@@ -21,6 +21,7 @@ import {
 import { designEntry, hasSelection } from '../state/derived';
 import { type ToolMode, useStore } from '../state/store';
 import { getViewport } from '../viewport/mount';
+import { useFocusHandoff } from './a11y';
 import { AppMark, Icon, type IconName } from './icons';
 import { IS_MOCK, loadExample, pickFile } from './ImportPanel';
 import { PAGE_TAB, type PageId, type RibbonTab, TAB_PAGE, useUi } from './uiStore';
@@ -43,11 +44,13 @@ interface CmdProps {
   title?: string;
   size?: 'lg' | 'sm';
   tone?: 'run' | 'stop';
+  btnRef?: Ref<HTMLButtonElement>;
 }
 
-function Cmd({ icon, label, onClick, disabled, active, testId, title, size = 'lg', tone }: CmdProps) {
+function Cmd({ icon, label, onClick, disabled, active, testId, title, size = 'lg', tone, btnRef }: CmdProps) {
   return (
     <button
+      ref={btnRef}
       type="button"
       className={`cmd cmd-${size} ${active ? 'on' : ''} ${tone ? `tone-${tone}` : ''}`}
       onClick={onClick}
@@ -242,6 +245,9 @@ function OptimizeTab({ hasDesign }: { hasDesign: boolean }) {
   const status = useStore((s) => s.run.status);
   const active = status === 'queued' || status === 'running';
   const st = useStore.getState();
+  const runBtn = useRef<HTMLButtonElement>(null);
+  const stopBtn = useRef<HTMLButtonElement>(null);
+  useFocusHandoff(active, runBtn, stopBtn);
   return (
     <>
       <RGroup label="Study">
@@ -262,8 +268,8 @@ function OptimizeTab({ hasDesign }: { hasDesign: boolean }) {
         </Stack>
       </RGroup>
       <RGroup label="Solve">
-        <Cmd icon="run" label="Run" tone="run" onClick={() => void startRun()} disabled={active || !hasDesign} testId="rb-run" />
-        <Cmd icon="stop" label="Stop" tone="stop" onClick={() => void stopRun()} disabled={!active} testId="rb-stop" />
+        <Cmd icon="run" label="Run" tone="run" btnRef={runBtn} onClick={() => void startRun()} disabled={active || !hasDesign} testId="rb-run" />
+        <Cmd icon="stop" label="Stop" tone="stop" btnRef={stopBtn} onClick={() => void stopRun()} disabled={!active} testId="rb-stop" />
       </RGroup>
     </>
   );
@@ -343,21 +349,36 @@ function ResultsTab() {
 export function Ribbon() {
   const tab = useUi((s) => s.tab);
   const hasDesign = useStore((s) => designEntry(s) !== null);
+  const list = useRef<HTMLDivElement>(null);
   // the tab follows the workflow stage: it opens that stage's page unless one of its pages is already open
   const choose = (t: RibbonTab) => {
     const ui = useUi.getState();
     if (PAGE_TAB[ui.page] !== t) ui.openPage(TAB_PAGE[t]);
     ui.setTab(t);
   };
+  // tablist pattern: one tab stop, arrows / Home / End move and select (automatic activation)
+  const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
+    const i = TABS.findIndex((t) => t.id === tab);
+    const n = TABS.length;
+    const next =
+      e.key === 'ArrowRight' ? (i + 1) % n : e.key === 'ArrowLeft' ? (i - 1 + n) % n : e.key === 'Home' ? 0 : e.key === 'End' ? n - 1 : -1;
+    if (next < 0) return;
+    e.preventDefault();
+    choose(TABS[next]!.id);
+    list.current?.querySelector<HTMLElement>(`#ribbon-tab-${TABS[next]!.id}`)?.focus();
+  };
   return (
-    <div className="ribbon" data-testid="ribbon">
-      <div className="ribbon-tabs" role="tablist" aria-label="Ribbon">
+    <section className="ribbon" data-testid="ribbon" aria-label="Command ribbon">
+      <div className="ribbon-tabs" role="tablist" aria-label="Ribbon" ref={list} onKeyDown={onKey}>
         {TABS.map((t) => (
           <button
             key={t.id}
+            id={`ribbon-tab-${t.id}`}
             type="button"
             role="tab"
             aria-selected={tab === t.id}
+            aria-controls="ribbon-panel"
+            tabIndex={tab === t.id ? 0 : -1}
             className={`ribbon-tab ${tab === t.id ? 'on' : ''}`}
             onClick={() => choose(t.id)}
             data-testid={`ribbon-tab-${t.id}`}
@@ -366,14 +387,14 @@ export function Ribbon() {
           </button>
         ))}
       </div>
-      <div className="ribbon-body" role="tabpanel" aria-label={TABS.find((t) => t.id === tab)!.label}>
+      <div className="ribbon-body" role="tabpanel" id="ribbon-panel" aria-labelledby={`ribbon-tab-${tab}`}>
         {tab === 'model' && <ModelTab hasDesign={hasDesign} />}
         {tab === 'bc' && <BcTab hasDesign={hasDesign} />}
         {tab === 'domain' && <DomainTab hasDesign={hasDesign} />}
         {tab === 'optimize' && <OptimizeTab hasDesign={hasDesign} />}
         {tab === 'results' && <ResultsTab />}
       </div>
-    </div>
+    </section>
   );
 }
 
@@ -382,6 +403,7 @@ export function TitleBar() {
   const hasDesign = useStore((s) => designEntry(s) !== null);
   const busy = useStore((s) => s.busy);
   const dark = useUi((s) => s.dark);
+  const shortcuts = useUi((s) => s.shortcuts);
   const st = useStore.getState();
   const q = (icon: IconName, label: string, onClick: () => void, testId: string, disabled?: boolean) => (
     <button type="button" className="qat-btn" title={label} aria-label={label} onClick={onClick} disabled={disabled} data-testid={testId}>
@@ -392,7 +414,7 @@ export function TitleBar() {
     <header className="titlebar">
       <div className="brand">
         <AppMark size={20} />
-        <span className="brand-name">top-op</span>
+        <h1 className="brand-name">top-op</h1>
         <span className="brand-sub">Topology Optimization</span>
       </div>
       <div className="qat" role="toolbar" aria-label="Quick access">
@@ -426,6 +448,17 @@ export function TitleBar() {
             MOCK API
           </span>
         )}
+        <button
+          type="button"
+          className={`qat-btn ${shortcuts ? '' : 'off'}`}
+          onClick={() => useUi.getState().setShortcuts(!shortcuts)}
+          title={`Single-key shortcuts (1-5, g / r / s, f): ${shortcuts ? 'on' : 'off'}`}
+          aria-label="Single-key shortcuts"
+          aria-pressed={shortcuts}
+          data-testid="shortcuts-toggle"
+        >
+          <Icon name="keyboard" size={16} />
+        </button>
         <button
           type="button"
           className="qat-btn"

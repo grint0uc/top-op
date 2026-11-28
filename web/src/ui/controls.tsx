@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { type ReactNode, type Ref, useEffect, useRef, useState } from 'react';
 import { Icon, type IconName } from './icons';
 
 /** Property-manager group box (collapsible). Children stay mounted when folded so local input state survives. */
@@ -48,10 +48,12 @@ interface NumFieldProps {
   testId?: string;
   title?: string;
   className?: string;
+  /** accessible name when the field has no wrapping <Field> label */
+  label?: string;
 }
 
 /** Number input that keeps its own text while focused, so typing "0." or "-" does not fight the store. */
-export function NumField({ value, onChange, min, max, step = 'any', disabled, testId, title, className }: NumFieldProps) {
+export function NumField({ value, onChange, min, max, step = 'any', disabled, testId, title, className, label }: NumFieldProps) {
   const [text, setText] = useState(fmt(value));
   const focused = useRef(false);
   useEffect(() => {
@@ -67,6 +69,7 @@ export function NumField({ value, onChange, min, max, step = 'any', disabled, te
       step={step}
       disabled={disabled}
       title={title}
+      aria-label={label}
       data-testid={testId}
       onFocus={() => (focused.current = true)}
       onBlur={() => {
@@ -168,9 +171,10 @@ export function Slider({ label, value, min, max, step, onChange, format, testId,
   );
 }
 
-export function Banner({ kind, children, testId }: { kind: 'info' | 'warn' | 'error'; children: ReactNode; testId?: string }) {
+/** `live={false}` when the text is announced elsewhere (the top notice goes through the Announcer). */
+export function Banner({ kind, children, testId, live = true }: { kind: 'info' | 'warn' | 'error'; children: ReactNode; testId?: string; live?: boolean }) {
   return (
-    <div className={`banner banner-${kind}`} role={kind === 'error' ? 'alert' : 'status'} data-testid={testId}>
+    <div className={`banner banner-${kind}`} role={live ? (kind === 'error' ? 'alert' : 'status') : undefined} data-testid={testId}>
       {children}
     </div>
   );
@@ -185,7 +189,9 @@ export function Btn({
   title,
   active,
   icon,
+  btnRef,
 }: {
+  btnRef?: Ref<HTMLButtonElement>;
   children?: ReactNode;
   onClick?: () => void;
   disabled?: boolean;
@@ -197,6 +203,7 @@ export function Btn({
 }) {
   return (
     <button
+      ref={btnRef}
       type="button"
       className={`btn ${variant ?? ''} ${active ? 'active' : ''} ${children ? '' : 'icon-only'}`}
       onClick={onClick}

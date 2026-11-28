@@ -9,10 +9,10 @@ export function NoticeBar() {
   return (
     <div className="notices">
       {notice && (
-        <Banner kind={notice.kind} testId="notice">
+        <Banner kind={notice.kind} testId="notice" live={false}>
           <Icon name={notice.kind === 'info' ? 'info' : 'warn'} size={14} className="banner-icon" />
           <span className="grow">{notice.text}</span>
-          <button type="button" className="banner-close" aria-label="Dismiss" onClick={() => useStore.getState().setNotice(null)}>
+          <button type="button" className="banner-close" aria-label="Dismiss the notice" onClick={() => useStore.getState().setNotice(null)}>
             <Icon name="close" size={12} />
           </button>
         </Banner>

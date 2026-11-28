@@ -318,6 +318,12 @@ const P: Record<string, ReactNode> = {
     </>
   ),
   close: <path d="m7 7 10 10M17 7 7 17" />,
+  keyboard: (
+    <>
+      <rect x="3" y="6" width="18" height="12" rx="1.5" />
+      <path d="M7 10h.01M11 10h.01M15 10h.01M7 14h10" />
+    </>
+  ),
 };
 
 export type IconName = keyof typeof P;
